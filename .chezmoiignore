@@ -1,0 +1,12 @@
+# AI agent runtime directories — managed by agents, not chezmoi
+.claude
+.claude.json
+.codex
+.cursor
+.config/cursor
+.local/share/cursor-agent
+
+# Repository documentation — not deployed to ~/
+README.md
+docs/
+TODO.md

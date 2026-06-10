@@ -1,0 +1,3 @@
+[submodule "dot_agents/skills/bulletproof"]
+	path = dot_agents/skills/bulletproof
+	url = https://github.com/artemiimillier/bulletproof.git
