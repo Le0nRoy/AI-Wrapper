@@ -26,6 +26,142 @@ WRAPPER_DATA_DIR="${WRAPPER_DATA_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && p
 WRAPPER_HELP="${WRAPPER_HELP:-${WRAPPER_DATA_DIR}/wrapper-help.md}"
 ORCHESTRATOR_PROMPT="${WRAPPER_DATA_DIR}/orchestrator-prompt.md"
 
+# ===== OS-AWARE BIND HELPERS =====
+# bubblewrap (Linux) remaps paths: `--bind SRC DST` makes SRC appear at DST
+# inside the sandbox — this is what lets a non-default account directory
+# (e.g. ~/.claude-work) appear as ~/.claude to the Claude CLI running inside
+# the sandbox. sandbox-exec (macOS) has no bind-mount capability; its
+# `--bind` is a single-arg path-based ACL grant (see macos_sandbox_exec.bash
+# header) — there is no remapping, so DST is dropped. Known consequence:
+# path-remapping features (multi-account switching to a differently-named
+# on-disk directory) only work as designed on the Linux backend today; on
+# macOS every account maps to its own on-disk path rather than appearing as
+# ~/.claude. This is a macOS-backend limitation (ai_wrapper_data/
+# macos_sandbox_exec.bash, out of scope here), not a bug in this file.
+#
+# Shared across all three wrappers (Claude/Codex/Cursor) — every wrapper
+# sources this file, so a single `uname -s` check here covers them all.
+_wrapper_os="$(uname -s)"
+
+_wrapper_add_bind() {
+    local src="${1}" dst="${2:-${1}}"
+    if [[ "${_wrapper_os}" == "Darwin" ]]; then
+        WRAPPER_FLAGS+=(--bind "${src}")
+    else
+        WRAPPER_FLAGS+=(--bind "${src}" "${dst}")
+    fi
+}
+
+_wrapper_add_ro_bind() {
+    local src="${1}" dst="${2:-${1}}"
+    if [[ "${_wrapper_os}" == "Darwin" ]]; then
+        WRAPPER_FLAGS+=(--ro-bind "${src}")
+    else
+        WRAPPER_FLAGS+=(--ro-bind "${src}" "${dst}")
+    fi
+}
+
+_wrapper_add_meta_bind() {
+    # Metadata-only (stat, no read/write) binds exist to satisfy Seatbelt's
+    # default-deny read fence while walking intermediate path components
+    # (see macos_sandbox_exec.bash). bwrap's mount-namespace model has no
+    # equivalent requirement — only explicitly bound paths are visible at
+    # all, and path-walk stat() through WORKDIR's own parent chain is not
+    # gated the way Seatbelt gates it — so this is a no-op on Linux.
+    [[ "${_wrapper_os}" == "Darwin" ]] && WRAPPER_FLAGS+=(--meta-bind "${1}")
+}
+
+# ===== PORTABLE PATH-RESOLUTION HELPERS =====
+# _realpath / _check_workdir_breadth normally live in
+# ai_wrapper_data/macos_sandbox_exec.bash, but that file is only sourced
+# lazily inside run_sandboxed_agent() when $(uname -s) == Darwin — it is
+# NOT available here, before the menu, on any OS. Both helpers are
+# OS-generic in their own implementation (realpath(1)/perl/pure-bash
+# fallback chain; plain string comparisons), so they are duplicated here
+# verbatim rather than invented differently, to keep behavior identical to
+# whatever the macOS backend does with the same inputs later in the run.
+_realpath() {
+    local p="${1}" out
+    if command -v realpath >/dev/null 2>&1; then
+        if out="$(realpath "${p}" 2>/dev/null)" && [[ -n "${out}" ]]; then
+            echo "${out}"
+            return 0
+        fi
+    fi
+    if command -v perl >/dev/null 2>&1; then
+        if out="$(perl -MCwd=abs_path -e 'my $r = abs_path($ARGV[0]); print $r if defined $r' "${p}" 2>/dev/null)" && [[ -n "${out}" ]]; then
+            echo "${out}"
+            return 0
+        fi
+    fi
+    # Last-ditch: canonicalize via `cd … && pwd -P`. Works for directories
+    # directly; for files, follow any final-component symlinks via readlink
+    # (capped to a small depth to prevent loops) before resolving the parent
+    # and re-attaching the basename so symlinks in the directory chain are
+    # also resolved.
+    local parent base resolved_parent
+    if [[ -d "${p}" ]]; then
+        if out="$( cd "${p}" 2>/dev/null && pwd -P )" && [[ -n "${out}" ]]; then
+            echo "${out}"
+            return 0
+        fi
+    elif [[ -e "${p}" || -L "${p}" ]]; then
+        local cur="${p}" target depth=0
+        local -a seen=()
+        local _s_i
+        while [[ -L "${cur}" && ${depth} -lt 40 ]]; do
+            seen+=("${cur}")
+            target="$(readlink "${cur}" 2>/dev/null)" || break
+            [[ -z "${target}" ]] && break
+            if [[ "${target}" == /* ]]; then
+                cur="${target}"
+            else
+                cur="$(dirname -- "${cur}")/${target}"
+            fi
+            depth=$((depth + 1))
+            for (( _s_i = 0; _s_i < ${#seen[@]}; _s_i++ )); do
+                if [[ "${seen[$_s_i]}" == "${cur}" ]]; then
+                    return 1
+                fi
+            done
+        done
+        if [[ -d "${cur}" ]]; then
+            if out="$( cd "${cur}" 2>/dev/null && pwd -P )" && [[ -n "${out}" ]]; then
+                echo "${out}"
+                return 0
+            fi
+        fi
+        parent="$(dirname -- "${cur}")"
+        base="$(basename -- "${cur}")"
+        if resolved_parent="$( cd "${parent}" 2>/dev/null && pwd -P )" && [[ -n "${resolved_parent}" ]]; then
+            echo "${resolved_parent%/}/${base}"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# WS3 / U-E: emit a one-line WARN and set $AI_SANDBOX_WORKDIR_WARNING when
+# WORKDIR is a direct $HOME child outside the project-dir allowlist
+# (Workspace/Projects/src/code/bin/work/dev/repos and lowercase variants).
+# Args: TAG RESOLVED_WORKDIR RESOLVED_HOME
+_check_workdir_breadth() {
+    local tag="${1}" wd="${2}" home="${3}"
+    unset AI_SANDBOX_WORKDIR_WARNING || true
+    [[ -z "${home}" || -z "${wd}" ]] && return 0
+    local wd_parent="${wd%/*}"
+    [[ "${wd_parent}" != "${home}" ]] && return 0
+    local wd_leaf="${wd##*/}"
+    case "${wd_leaf}" in
+        Workspace|Projects|src|code|bin|work|dev|repos|workspace|projects)
+            return 0
+            ;;
+    esac
+    echo_log "WARN" "[${tag}] WORKDIR=${wd} is a direct \$HOME child outside the project-dir allowlist (Workspace/Projects/src/code/bin/work/dev/repos). The write fence grants RW on every file under it. cd one level deeper if that's broader than you intend."
+    export AI_SANDBOX_WORKDIR_WARNING="${wd}"
+    return 0
+}
+
 # ===== SETTINGS CATALOG =====
 # Centralised list of env vars that change wrapper runtime behaviour.
 # Drives the startup banner table AND the interactive toggle sub-menu so

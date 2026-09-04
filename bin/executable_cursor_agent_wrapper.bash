@@ -12,13 +12,15 @@ source "$(dirname "${BASH_SOURCE[0]}")/ai_agent_universal_wrapper.bash"
 # Requires `chezmoi apply` to have been run — if source fails, the wrapper is not yet deployed.
 source "$(dirname "${BASH_SOURCE[0]}")/ai_wrapper_data/cursor_wrapper_lib.bash"
 
-# Bubblewrap (sandbox) flags - filesystem bindings
-WRAPPER_FLAGS=(
-    --ro-bind /opt/cursor-agent /opt/cursor-agent
-    --bind "${HOME}/.cursor" "${HOME}/.cursor"
-    --bind "${HOME}/.config/cursor" "${HOME}/.config/cursor"
-    --bind "${HOME}/.local/share/cursor-agent" "${HOME}/.local/share/cursor-agent"
-)
+# Sandbox flags - filesystem bindings. Uses the OS-aware _wrapper_add_bind /
+# _wrapper_add_ro_bind helpers (ai_wrapper_data/ai_wrapper_lib.bash) rather
+# than hardcoding bwrap's 2-arg `--bind SRC DST` shape: sandbox-exec (macOS)
+# takes a single-arg `--bind SRC` and hard-errors on a stray second token.
+WRAPPER_FLAGS=()
+_wrapper_add_ro_bind /opt/cursor-agent
+_wrapper_add_bind "${HOME}/.cursor"
+_wrapper_add_bind "${HOME}/.config/cursor"
+_wrapper_add_bind "${HOME}/.local/share/cursor-agent"
 
 # Cursor Agent CLI flags - full autonomy within sandbox (no approvals needed)
 AGENT_FLAGS=(

@@ -12,10 +12,12 @@ source "$(dirname "${BASH_SOURCE[0]}")/ai_agent_universal_wrapper.bash"
 # Requires `chezmoi apply` to have been run — if source fails, the wrapper is not yet deployed.
 source "$(dirname "${BASH_SOURCE[0]}")/ai_wrapper_data/codex_wrapper_lib.bash"
 
-# Bubblewrap (sandbox) flags - filesystem bindings
-WRAPPER_FLAGS=(
-    --bind "${HOME}/.codex" "${HOME}/.codex"
-)
+# Sandbox flags - filesystem bindings. Uses the OS-aware _wrapper_add_bind /
+# _wrapper_add_ro_bind helpers (ai_wrapper_data/ai_wrapper_lib.bash) rather
+# than hardcoding bwrap's 2-arg `--bind SRC DST` shape: sandbox-exec (macOS)
+# takes a single-arg `--bind SRC` and hard-errors on a stray second token.
+WRAPPER_FLAGS=()
+_wrapper_add_bind "${HOME}/.codex"
 
 # Codex CLI flags - full autonomy within sandbox (no approvals needed)
 AGENT_FLAGS=(
