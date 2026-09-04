@@ -1,24 +1,13 @@
 #!/bin/bash
-# Links ~/.claude/skills -> ~/.agents/skills so Claude Code discovers agent skills
-# Runs on every chezmoi apply
+# Deploys ~/.agents/skills into ~/.claude/skills (via setup_skills.bash) so
+# Claude Code discovers agent skills. Runs on every chezmoi apply.
 
 set -euo pipefail
 
-SKILLS_DIR="${HOME}/.agents/skills"
-CLAUDE_SKILLS="${HOME}/.claude/skills"
-
-# Remove stale link/dir if it exists and isn't already correct
-if [[ -e "${CLAUDE_SKILLS}" || -L "${CLAUDE_SKILLS}" ]]; then
-    if [[ "$(readlink "${CLAUDE_SKILLS}")" != "${SKILLS_DIR}" ]]; then
-        rm -rf "${CLAUDE_SKILLS}"
-    fi
-fi
-
-if [[ ! -L "${CLAUDE_SKILLS}" ]]; then
-    ln -s "${SKILLS_DIR}" "${CLAUDE_SKILLS}"
-    echo "Linked ${CLAUDE_SKILLS} -> ${SKILLS_DIR}"
+if [[ -x "${HOME}/bin/setup_skills.bash" ]]; then
+    "${HOME}/bin/setup_skills.bash"
 else
-    echo "Link already correct: ${CLAUDE_SKILLS} -> ${SKILLS_DIR}"
+    echo "WARNING: ${HOME}/bin/setup_skills.bash not found or not executable — skills not synced." >&2
 fi
 
 # Ensure bulletproof submodule is initialized after a fresh clone
