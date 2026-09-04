@@ -322,12 +322,16 @@ _run_sandboxed_agent_impl() {
     local pass_aws="${AI_SANDBOX_PASS_AWS:-0}"
     local pass_kube="${AI_SANDBOX_PASS_KUBE:-0}"
     local pass_docker="${AI_SANDBOX_PASS_DOCKER:-0}"
+    # PASS_GITLAB gates the glab-cli config file-read rule in claude_wrapper.sb
+    # (companion to the GITLAB_TOKEN / CI_JOB_TOKEN env-scrub bucket below).
+    local pass_gitlab="${AI_SANDBOX_PASS_GITLAB:-0}"
     [[ "${allow_ro_home}"   == "1" ]] || allow_ro_home=0
     [[ "${allow_ro_creds}"  == "1" ]] || allow_ro_creds=0
     [[ "${pass_ssh_agent}"  == "1" ]] || pass_ssh_agent=0
     [[ "${pass_aws}"        == "1" ]] || pass_aws=0
     [[ "${pass_kube}"       == "1" ]] || pass_kube=0
     [[ "${pass_docker}"     == "1" ]] || pass_docker=0
+    [[ "${pass_gitlab}"     == "1" ]] || pass_gitlab=0
 
     # WS4 / S-α: localhost network block. Off by default to keep dev
     # workflows (local DBs, dev servers) working. When set, the SBPL
@@ -472,7 +476,7 @@ _run_sandboxed_agent_impl() {
         [[ -n "${GITHUB_TOKEN:-}" ]] && env_allowlist+=("GITHUB_TOKEN=${GITHUB_TOKEN}")
         [[ -n "${GH_TOKEN:-}" ]]     && env_allowlist+=("GH_TOKEN=${GH_TOKEN}")
     fi
-    if [[ "${AI_SANDBOX_PASS_GITLAB:-0}" == "1" ]]; then
+    if [[ "${pass_gitlab}" == "1" ]]; then
         [[ -n "${GITLAB_TOKEN:-}" ]] && env_allowlist+=("GITLAB_TOKEN=${GITLAB_TOKEN}")
         [[ -n "${CI_JOB_TOKEN:-}" ]] && env_allowlist+=("CI_JOB_TOKEN=${CI_JOB_TOKEN}")
     fi
@@ -621,6 +625,7 @@ _run_sandboxed_agent_impl() {
             -D "PASS_AWS=${pass_aws}"
             -D "PASS_KUBE=${pass_kube}"
             -D "PASS_DOCKER=${pass_docker}"
+            -D "PASS_GITLAB=${pass_gitlab}"
             -D "ENABLE_SIGNPOST=${enable_signpost}"
             -D "BLOCK_LOCALHOST=${block_localhost}"
             -D "ALLOW_DOCKER=${allow_docker}"

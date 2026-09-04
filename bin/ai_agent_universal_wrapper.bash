@@ -97,6 +97,14 @@ _run_sandboxed_agent_linux() {
     local pass_ssh_agent="${AI_SANDBOX_PASS_SSH_AGENT:-0}"; [[ "${pass_ssh_agent}" == "1" ]] || pass_ssh_agent=0
     local pass_docker="${AI_SANDBOX_PASS_DOCKER:-0}"; [[ "${pass_docker}" == "1" ]] || pass_docker=0
     local allow_docker="${AI_SANDBOX_ALLOW_DOCKER:-0}"; [[ "${allow_docker}" == "1" ]] || allow_docker=0
+    local pass_gh="${AI_SANDBOX_PASS_GH:-0}"; [[ "${pass_gh}" == "1" ]] || pass_gh=0
+    local pass_gitlab="${AI_SANDBOX_PASS_GITLAB:-0}"; [[ "${pass_gitlab}" == "1" ]] || pass_gitlab=0
+    local pass_openai="${AI_SANDBOX_PASS_OPENAI:-0}"; [[ "${pass_openai}" == "1" ]] || pass_openai=0
+    local allow_sensitive_workdir="${AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR:-0}"; [[ "${allow_sensitive_workdir}" == "1" ]] || allow_sensitive_workdir=0
+    local allow_ro_credentials="${AI_SANDBOX_ALLOW_RO_CREDENTIALS:-0}"; [[ "${allow_ro_credentials}" == "1" ]] || allow_ro_credentials=0
+    # AI_SANDBOX_PASS_ENV is a str (comma-separated var-name list), not a
+    # bool — no 0/1 normalization, empty is the meaningful default.
+    local pass_env_list="${AI_SANDBOX_PASS_ENV:-}"
 
     # Skip the separator "--" between command and bwrap flags
     if [[ "${1}" == "--" ]]; then
@@ -131,6 +139,38 @@ _run_sandboxed_agent_linux() {
     if [[ ! -d "${WORKDIR}" ]]; then
         echo_log "ERROR" "[$agent_name] Working directory does not exist: ${WORKDIR}"
         exit 1
+    fi
+
+    # Refuse to sandbox with a WORKDIR that's a system root, $HOME itself, or
+    # a dotfile dir directly under $HOME: the WORKDIR bind above grants RW on
+    # (subpath WORKDIR) unconditionally, so a too-broad cwd neutralises the
+    # write fence and can expose credentials the read fence would otherwise
+    # deny. Mirrors macos_sandbox_exec.bash's WORKDIR refusal (see its
+    # AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR handling), adapted to Linux
+    # top-level system directories instead of macOS-specific ones
+    # (/Users, /Library, /Applications, /System don't exist here).
+    # Bypass with AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 when intentional.
+    if [[ "${allow_sensitive_workdir}" != "1" ]]; then
+        local workdir_normalized="${WORKDIR%/}"
+        local home_normalized="${HOME_DIR%/}"
+        case "${workdir_normalized}" in
+            ""|/|/tmp|/var|/etc|/usr|/bin|/sbin|/opt|/home|/root|/proc|/sys|/dev|/boot|/mnt|/media|/srv|/run)
+                echo_log "ERROR" "[$agent_name] Refusing to sandbox with WORKDIR=${WORKDIR} (top-level or system location). cd into a project directory first, or set AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 to override."
+                exit 1
+                ;;
+        esac
+        if [[ -n "${home_normalized}" && "${workdir_normalized}" == "${home_normalized}" ]]; then
+            echo_log "ERROR" "[$agent_name] Refusing to sandbox with WORKDIR=\$HOME (${WORKDIR}); that would grant RW on the entire home directory. cd into a subdirectory first, or set AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 to override."
+            exit 1
+        fi
+        if [[ -n "${home_normalized}" ]]; then
+            case "${workdir_normalized}" in
+                "${home_normalized}"/.*)
+                    echo_log "ERROR" "[$agent_name] Refusing to sandbox with WORKDIR=${WORKDIR} (a dotfile directory directly under \$HOME — granting RW here likely exposes credentials). cd into a non-sensitive project directory, or set AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 to override."
+                    exit 1
+                    ;;
+            esac
+        fi
     fi
 
     # ===== PATH VALIDATION FOR BIND MOUNTS =====
@@ -350,6 +390,82 @@ _run_sandboxed_agent_linux() {
     if [[ "${pass_ssh_agent}" == "1" && -n "${SSH_AUTH_SOCK:-}" && -S "${SSH_AUTH_SOCK}" ]]; then
         bwrap_args+=(--bind "${SSH_AUTH_SOCK}" "${SSH_AUTH_SOCK}" --setenv SSH_AUTH_SOCK "${SSH_AUTH_SOCK}")
         [[ -d "${HOME_DIR}/.ssh" ]] && bwrap_args+=(--ro-bind "${HOME_DIR}/.ssh" "${HOME_DIR}/.ssh")
+    fi
+
+    # Pass through GitHub token env vars if opted in. Mirrors macOS's
+    # AI_SANDBOX_PASS_GH handling (macos_sandbox_exec.bash, PASS_GH block).
+    if [[ "${pass_gh}" == "1" ]]; then
+        [[ -n "${GITHUB_TOKEN:-}" ]] && bwrap_args+=(--setenv GITHUB_TOKEN "${GITHUB_TOKEN}")
+        [[ -n "${GH_TOKEN:-}" ]]     && bwrap_args+=(--setenv GH_TOKEN "${GH_TOKEN}")
+    fi
+
+    # Pass through GitLab token env vars and RO-bind glab's on-disk config if
+    # opted in. Mirrors macOS's AI_SANDBOX_PASS_GITLAB handling (env vars:
+    # macos_sandbox_exec.bash PASS_GITLAB block; glab-cli config bind: added
+    # to claude_wrapper.sb's PASS_GITLAB block in this same change, since the
+    # macOS side previously only passed the env vars and never actually
+    # bound the on-disk config despite documenting that it does). Only the
+    # XDG paths exist on Linux — there's no ~/Library equivalent.
+    if [[ "${pass_gitlab}" == "1" ]]; then
+        [[ -n "${GITLAB_TOKEN:-}" ]] && bwrap_args+=(--setenv GITLAB_TOKEN "${GITLAB_TOKEN}")
+        [[ -n "${CI_JOB_TOKEN:-}" ]] && bwrap_args+=(--setenv CI_JOB_TOKEN "${CI_JOB_TOKEN}")
+        [[ -d "${HOME_DIR}/.config/glab-cli" ]] && bwrap_args+=(--ro-bind "${HOME_DIR}/.config/glab-cli" "${HOME_DIR}/.config/glab-cli")
+        [[ -d "${HOME_DIR}/.local/share/glab-cli" ]] && bwrap_args+=(--ro-bind "${HOME_DIR}/.local/share/glab-cli" "${HOME_DIR}/.local/share/glab-cli")
+    fi
+
+    # Pass through every OPENAI_* env var if opted in. Mirrors macOS's
+    # AI_SANDBOX_PASS_OPENAI handling (macos_sandbox_exec.bash, PASS_OPENAI
+    # block) — same compgen -e loop pattern as the AWS_* passthrough above.
+    if [[ "${pass_openai}" == "1" ]]; then
+        local _e_var _e_val
+        while IFS= read -r _e_var; do
+            case "${_e_var}" in
+                OPENAI_*)
+                    _e_val="${!_e_var:-}"
+                    [[ -n "${_e_val}" ]] && bwrap_args+=(--setenv "${_e_var}" "${_e_val}")
+                    ;;
+            esac
+        done < <(compgen -e 2>/dev/null || true)
+    fi
+
+    # Generic escape hatch: comma-separated list of additional env var names
+    # to pass through. Ported verbatim (trimming + name validation) from
+    # macos_sandbox_exec.bash's AI_SANDBOX_PASS_ENV handling — invalid names
+    # are WARNed and skipped rather than failing the launch; missing vars
+    # are silently skipped.
+    if [[ -n "${pass_env_list}" ]]; then
+        local _e_ifs_save="${IFS}"
+        IFS=','
+        # shellcheck disable=SC2206  # intentional word-splitting on commas
+        local -a _e_extra=(${pass_env_list})
+        IFS="${_e_ifs_save}"
+        local _e_var _e_val
+        for _e_var in "${_e_extra[@]}"; do
+            # Trim surrounding whitespace.
+            _e_var="${_e_var#"${_e_var%%[![:space:]]*}"}"
+            _e_var="${_e_var%"${_e_var##*[![:space:]]}"}"
+            [[ -z "${_e_var}" ]] && continue
+            if [[ ! "${_e_var}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+                echo_log "WARNING" "[$agent_name] AI_SANDBOX_PASS_ENV: ignoring invalid var name '${_e_var}'"
+                continue
+            fi
+            _e_val="${!_e_var:-}"
+            [[ -n "${_e_val}" ]] && bwrap_args+=(--setenv "${_e_var}" "${_e_val}")
+        done
+    fi
+
+    # RO-bind residual credential files/dirs not covered by a dedicated
+    # PASS_* flag, if opted in. Mirrors macOS's AI_SANDBOX_ALLOW_RO_CREDENTIALS
+    # handling (claude_wrapper.sb, ALLOW_RO_CREDENTIALS block) — same path
+    # list, minus the macOS-only paths that have no Linux equivalent. bwrap's
+    # --ro-bind works identically for files and directories, unlike SBPL's
+    # literal-vs-subpath distinction, so no special-casing is needed here.
+    if [[ "${allow_ro_credentials}" == "1" ]]; then
+        [[ -d "${HOME_DIR}/.config/gcloud" ]] && bwrap_args+=(--ro-bind "${HOME_DIR}/.config/gcloud" "${HOME_DIR}/.config/gcloud")
+        [[ -d "${HOME_DIR}/.gnupg" ]]         && bwrap_args+=(--ro-bind "${HOME_DIR}/.gnupg" "${HOME_DIR}/.gnupg")
+        [[ -f "${HOME_DIR}/.netrc" ]]         && bwrap_args+=(--ro-bind "${HOME_DIR}/.netrc" "${HOME_DIR}/.netrc")
+        [[ -f "${HOME_DIR}/.npmrc" ]]         && bwrap_args+=(--ro-bind "${HOME_DIR}/.npmrc" "${HOME_DIR}/.npmrc")
+        [[ -f "${HOME_DIR}/.pypirc" ]]        && bwrap_args+=(--ro-bind "${HOME_DIR}/.pypirc" "${HOME_DIR}/.pypirc")
     fi
 
     # ===== EXECUTE — no more setpriv/prlimit wrapper =====

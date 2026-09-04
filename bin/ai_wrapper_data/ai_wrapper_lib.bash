@@ -202,7 +202,7 @@ _AI_SETTINGS_LIST=(
     "AI_SANDBOX_PROFILE_TRUST_ME|bool|0|red|Skip safety check on custom profile|Bypasses the (version 1) + (deny default) validation. Set only if your profile intentionally relaxes the sandbox.|additional"
 
     # Sensitive directories
-    "AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR|bool|0|red|Allow launch from sensitive dirs|Permits \$HOME dotfiles and ~/Library; agent gets RW on ~/.ssh, ~/.aws, ~/Library/Mail, ~/Library/Messages, ~/.gnupg, etc.|sensitive"
+    "AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR|bool|0|red|Allow launch from sensitive dirs|Permits launching from \$HOME itself, a dotfile dir directly under \$HOME, or a top-level system directory (plus ~/Library on macOS) — the write fence then grants RW there, which likely exposes credentials|sensitive"
     "AI_SANDBOX_ALLOW_RO_HOMEDIR|bool|0|yellow|Share home directory (read-only)|(macOS only) Agent can read everything in \$HOME except credentials|sensitive|darwin"
 
     # Credentials

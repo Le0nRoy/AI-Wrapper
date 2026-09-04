@@ -51,6 +51,13 @@
 ;;   PASS_DOCKER             — "1" enables RO on ~/.docker (companion to the
 ;;                              DOCKER_* env var pass-through). Redundant
 ;;                              when ALLOW_DOCKER=1 (which RW-binds ~/.docker).
+;;   PASS_GITLAB             — "1" enables RO on glab's on-disk config
+;;                              (~/Library/Application Support/glab-cli, plus
+;;                              the XDG fallbacks ~/.config/glab-cli and
+;;                              ~/.local/share/glab-cli), companion to the
+;;                              GITLAB_TOKEN / CI_JOB_TOKEN env var
+;;                              pass-through so `glab` also works when it
+;;                              reads its token from disk instead of the env.
 ;;   BLOCK_LOCALHOST         — "1" emits (deny network-* (… ip "localhost:*"))
 ;;                              pair; any other value leaves localhost reachable.
 ;;                              NOTE: this only covers IP loopback. Unix-domain
@@ -307,6 +314,21 @@
 (when (equal? (param "PASS_DOCKER") "1")
     (allow file-read*
         (subpath (string-append (param "HOME_DIR") "/.docker"))))
+
+;; glab (GitLab CLI) on-disk config — companion to the GITLAB_TOKEN /
+;; CI_JOB_TOKEN env var pass-through (macos_sandbox_exec.bash, PASS_GITLAB
+;; env-scrub bucket) so `glab` also works when it reads its token from disk
+;; instead of the env. macOS path first; XDG fallbacks for users who set
+;; XDG_CONFIG_HOME / XDG_DATA_HOME to relocate. Previously this flag only
+;; passed the env vars and never actually granted read on the on-disk
+;; config despite the catalog/help docs claiming it did — this closes that
+;; gap (see the Linux backend's matching PASS_GITLAB bind in
+;; ai_agent_universal_wrapper.bash for the equivalent bwrap-side fix).
+(when (equal? (param "PASS_GITLAB") "1")
+    (allow file-read*
+        (subpath (string-append (param "HOME_DIR") "/Library/Application Support/glab-cli"))
+        (subpath (string-append (param "HOME_DIR") "/.config/glab-cli"))
+        (subpath (string-append (param "HOME_DIR") "/.local/share/glab-cli"))))
 
 ;; Residual credential dirs without a dedicated PASS_* flag.
 (when (equal? (param "ALLOW_RO_CREDENTIALS") "1")
