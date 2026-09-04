@@ -1,31 +1,46 @@
 #!/bin/bash
-# Universal bubblewrap + prlimit wrapper for AI agents
-# This function provides sandboxing with minimal privileges and resource limits.
+# Universal sandbox wrapper for AI agents. Dispatches to the OS-appropriate
+# backend: bubblewrap on Linux, sandbox-exec (Seatbelt) on macOS.
 #
-# Required environment variables (set by caller):
-#   RLIMIT_AS      - Address space limit in bytes
-#   RLIMIT_CPU     - CPU time limit in seconds
-#   RLIMIT_NOFILE  - File descriptor limit
-#   RLIMIT_NPROC   - Process limit
-#
-# Optional environment variables:
-#   BWRAP_STRICT   - If set to 1, fail on missing bind paths (default: warn only)
+# Rlimit enforcement (RLIMIT_AS/CPU/NOFILE/NPROC via prlimit) was removed
+# 2026-09 — the maintainer isn't using it and wants it deferred to a
+# separate tracked issue rather than carried as dead weight here. See
+# docs/plans/2026-09-04-macos-sandbox-and-wrapper-unification-context.md
+# "Deferred: rlimits" for the reasoning and what re-adding it would need.
 #
 # Usage:
-#   run_sandboxed_agent COMMAND -- [BWRAP_FLAGS...] -- [CMD_ARGS...]
+#   run_sandboxed_agent COMMAND -- [BIND_FLAGS...] -- [CMD_ARGS...]
 #
-# Example:
-#   RLIMIT_AS=$((4*1024*1024*1024)) RLIMIT_CPU=60 RLIMIT_NOFILE=1024 RLIMIT_NPROC=60 \
-#   run_sandboxed_agent "codex" -- --bind "${HOME}/.codex" "${HOME}/.codex" -- "$@"
+# BIND_FLAGS on Linux are bwrap-shaped: --bind SRC DST / --ro-bind SRC DST.
+# BIND_FLAGS on macOS are single-arg (see macos_sandbox_exec.bash header):
+# --bind SRC / --ro-bind SRC / --meta-bind SRC.
+# Callers that need to run on both OSes must branch on `uname -s` themselves
+# when building BIND_FLAGS, same as executable_claude_wrapper.bash does.
 
 function echo_log() {
     local log_level="${1}"
     shift
-    local message="$*"
-    echo -e "[$(date "+%F %T")] ${log_level}: ${message}" >&2
+    echo -e "[$(date "+%F %T")] ${log_level}: $*" >&2
 }
 
 run_sandboxed_agent() {
+    case "$(uname -s)" in
+        Linux)
+            _run_sandboxed_agent_linux "$@"
+            ;;
+        Darwin)
+            # shellcheck source=ai_wrapper_data/macos_sandbox_exec.bash
+            source "$(dirname "${BASH_SOURCE[0]}")/ai_wrapper_data/macos_sandbox_exec.bash"
+            _run_sandboxed_agent_impl "$@"
+            ;;
+        *)
+            echo_log "ERROR" "Unsupported OS: $(uname -s). This wrapper supports Linux (bubblewrap) and macOS (sandbox-exec) only."
+            return 78
+            ;;
+    esac
+}
+
+_run_sandboxed_agent_linux() {
     local agent_name="${1}"
     local command="${1}"
     shift
@@ -34,7 +49,7 @@ run_sandboxed_agent() {
 
     # Check required commands exist
     local missing_commands=()
-    for cmd in bwrap prlimit setpriv sysctl; do
+    for cmd in bwrap sysctl; do
         if ! command -v "${cmd}" &>/dev/null; then
             missing_commands+=("${cmd}")
         fi
@@ -42,15 +57,8 @@ run_sandboxed_agent() {
 
     if [[ ${#missing_commands[@]} -gt 0 ]]; then
         echo_log "ERROR" "[$agent_name] Required commands not found: ${missing_commands[*]}"
-        echo_log "ERROR" "Please install: bubblewrap, util-linux, util-linux-core (or equivalent)"
+        echo_log "ERROR" "Please install: bubblewrap, util-linux (or equivalent)"
         exit 127
-    fi
-
-    # Validate required environment variables
-    if [[ -z "${RLIMIT_AS}" || -z "${RLIMIT_CPU}" || -z "${RLIMIT_NOFILE}" || -z "${RLIMIT_NPROC}" ]]; then
-        echo_log "ERROR" "[$agent_name] Required environment variables not set."
-        echo_log "ERROR" "Please set: RLIMIT_AS, RLIMIT_CPU, RLIMIT_NOFILE, RLIMIT_NPROC"
-        exit 1
     fi
 
     # Check if user namespaces are enabled
@@ -304,17 +312,9 @@ run_sandboxed_agent() {
     [[ -n "${KUBECONFIG}" ]] && bwrap_args+=(--setenv KUBECONFIG "${KUBECONFIG}")
     [[ -n "${KIND_EXPERIMENTAL_PROVIDER}" ]] && bwrap_args+=(--setenv KIND_EXPERIMENTAL_PROVIDER "${KIND_EXPERIMENTAL_PROVIDER}")
 
-    # ===== EXECUTE WITH EXIT CODE TRANSLATION =====
+    # ===== EXECUTE — no more setpriv/prlimit wrapper =====
 
-    # Execute with reduced privileges and resource limits
-    setpriv --no-new-privs --inh-caps=-all \
-        bwrap "${bwrap_args[@]}" \
-        /usr/bin/env prlimit \
-            --as="${RLIMIT_AS}" \
-            --cpu="${RLIMIT_CPU}" \
-            --nofile="${RLIMIT_NOFILE}" \
-            --nproc="${RLIMIT_NPROC}" \
-            "${command}" "${cmd_args[@]}"
+    bwrap "${bwrap_args[@]}" "${command}" "${cmd_args[@]}"
 
     local exit_code=$?
 
@@ -324,16 +324,8 @@ run_sandboxed_agent() {
         return 0
     fi
 
-    # Translate common prlimit/signal exit codes
+    # Translate common signal exit codes
     case ${exit_code} in
-        137)
-            echo_log "ERROR" "[$agent_name] Process killed (exit code 137)"
-            echo_log "ERROR" "Possible causes:"
-            echo_log "ERROR" "  - CPU time limit exceeded (RLIMIT_CPU=${RLIMIT_CPU}s)"
-            echo_log "ERROR" "  - Process limit exceeded (RLIMIT_NPROC=${RLIMIT_NPROC})"
-            echo_log "ERROR" "  - Out of memory or address space (RLIMIT_AS=$((RLIMIT_AS / 1024 / 1024))MB)"
-            echo_log "ERROR" "Consider increasing resource limits if legitimate usage."
-            ;;
         139)
             echo_log "ERROR" "[$agent_name] Segmentation fault (exit code 139)"
             echo_log "ERROR" "The process crashed. This may indicate:"
@@ -344,7 +336,6 @@ run_sandboxed_agent() {
         143)
             echo_log "ERROR" "[$agent_name] Process terminated (SIGTERM, exit code 143)"
             echo_log "ERROR" "The process was terminated, possibly due to:"
-            echo_log "ERROR" "  - Resource limits (RLIMIT_CPU=${RLIMIT_CPU}s)"
             echo_log "ERROR" "  - External termination signal"
             ;;
         127)
@@ -374,10 +365,5 @@ run_sandboxed_agent() {
 # If script is executed directly (not sourced), show usage
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     echo_log "ERROR" "This script is meant to be sourced, not executed directly."
-    echo_log "ERROR" ""
-    echo_log "ERROR" "Usage example:"
-    echo_log "ERROR" "  source ai_agent_universal_wrapper.bash"
-    echo_log "ERROR" "  RLIMIT_AS=\$((4*1024*1024*1024)) RLIMIT_CPU=60 RLIMIT_NOFILE=1024 RLIMIT_NPROC=60 \\"
-    echo_log "ERROR" "    run_sandboxed_agent \"mycommand\" -- --bind \"\${HOME}/.config\" \"\${HOME}/.config\" -- arg1 arg2"
     exit 1
 fi
