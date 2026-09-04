@@ -15,9 +15,10 @@ These rules apply to **Claude Code** (and any other AI agents) working on **any 
 |----------|----------|
 | User-level skills | `~/.agents/skills/` (symlinked from `~/.claude/skills/`) |
 | Orchestrator prompt | `~/bin/ai_wrapper_data/orchestrator-prompt.md` |
-| Bulletproof prompt | `~/bin/ai_wrapper_data/bulletproof-prompt.md` |
 | Installed plugins | `~/.claude/settings.json` → `enabledPlugins` |
 | Plugin marketplace | `~/.claude/plugins/marketplaces/claude-plugins-official/plugins/` |
+| Sandbox settings / account switching | `s) Settings` in the wrapper's main menu — toggles `AI_SANDBOX_*` flags and (Claude wrapper only) the active `CLAUDE_ACCOUNT` profile; persists per-workdir |
+| macOS sandbox backend | `sandbox-exec` (Seatbelt), auto-selected via `uname -s` — see `bin/ai_wrapper_data/macos_sandbox_exec.bash` and `claude_wrapper.sb` |
 
 **Key skills (always relevant):**
 - `coding-standards` — naming, nesting, no magic numbers, no race conditions
@@ -60,7 +61,9 @@ See **`ai-sandboxing`** skill for sandbox architecture details.
 
 **When working in this repo (chezmoi wrappers):**
 - Never weaken bubblewrap security restrictions — see `ai-sandboxing` skill
-- Never bypass resource limits (RLIMIT_*)
+- Rlimit enforcement is currently disabled (dropped 2026-09, both Linux and
+  macOS backends) — don't reintroduce it ad hoc; re-adding it is tracked as
+  a separate follow-up issue
 - Preserve all path validation logic
 
 ---
