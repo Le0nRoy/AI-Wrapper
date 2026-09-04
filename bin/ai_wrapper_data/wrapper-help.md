@@ -227,10 +227,14 @@ Shows this help document.
 
 ## Skills
 
-Skills shipped with this wrapper live in `<wrapper-dir>/skills/`. The setup
-script `setup_skills.bash` symlinks each one into `~/.claude/skills/<name>`
-so Claude Code discovers them. Existing entries in `~/.claude/skills/` are
-preserved — only missing entries are added.
+Skills live in `~/.agents/skills/`. The setup script `setup_skills.bash`
+copies each one into `~/.claude/skills/<name>` so Claude Code discovers
+them (copies, not symlinks — sandbox-exec on macOS resolves file rules
+against the canonical real path, and the sandbox binds `~/.claude` RW but
+not `~/.agents`, so a symlink there would be read-denied). Each managed
+copy carries a `.setup_skills_managed` marker file recording its source
+path, so reruns refresh the copy in place; non-managed entries already in
+`~/.claude/skills/` are left untouched.
 
 Run setup with:
 ```sh

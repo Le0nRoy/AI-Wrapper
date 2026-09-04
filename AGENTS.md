@@ -13,7 +13,7 @@ These rules apply to **Claude Code** (and any other AI agents) working on **any 
 
 | Resource | Location |
 |----------|----------|
-| User-level skills | `~/.agents/skills/` (symlinked from `~/.claude/skills/`) |
+| User-level skills | `~/.agents/skills/` (copied into `~/.claude/skills/` by `setup_skills.bash`; each managed copy carries a `.setup_skills_managed` marker so reruns refresh it in place) |
 | Orchestrator prompt | `~/bin/ai_wrapper_data/orchestrator-prompt.md` |
 | Installed plugins | `~/.claude/settings.json` → `enabledPlugins` |
 | Plugin marketplace | `~/.claude/plugins/marketplaces/claude-plugins-official/plugins/` |
