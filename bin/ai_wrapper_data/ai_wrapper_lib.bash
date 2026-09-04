@@ -167,7 +167,7 @@ _check_workdir_breadth() {
 # Drives the startup banner table AND the interactive toggle sub-menu so
 # the two views never drift. Adding a new tunable is a one-line change here.
 #
-# Format: NAME|TYPE|DEFAULT|SEVERITY|HEADLINE|DETAIL|CATEGORY
+# Format: NAME|TYPE|DEFAULT|SEVERITY|HEADLINE|DETAIL|CATEGORY|OS_SCOPE
 #   TYPE     - bool (0/1), str (free text), path (free text, path-shaped)
 #   DEFAULT  - value substituted when the var is unset/empty (bools only;
 #              str/path treat empty as meaningful)
@@ -180,6 +180,14 @@ _check_workdir_breadth() {
 #              credentials, networking. Entries with the same CATEGORY
 #              render under a shared header in both the banner and
 #              toggle views.
+#   OS_SCOPE - optional 8th field: "darwin" (macOS-only, hidden on Linux),
+#              "linux" (Linux-only, hidden on macOS), or empty/omitted
+#              (shown on every OS — the default). Entries without a
+#              trailing "|OS_SCOPE" parse with an empty 8th field via the
+#              `read` splitting below, so existing 7-field rows need no
+#              changes. Used for settings whose backend is only
+#              implemented on one OS today (see _AI_SETTINGS_LIST filtering
+#              right after this array literal).
 # Order here is the display order in both views; categories are
 # arranged so the most frequently used (networking) sits closest to the
 # input prompt at the bottom, and rarer ones (debug) are at the top.
@@ -195,7 +203,7 @@ _AI_SETTINGS_LIST=(
 
     # Sensitive directories
     "AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR|bool|0|red|Allow launch from sensitive dirs|Permits \$HOME dotfiles and ~/Library; agent gets RW on ~/.ssh, ~/.aws, ~/Library/Mail, ~/Library/Messages, ~/.gnupg, etc.|sensitive"
-    "AI_SANDBOX_ALLOW_RO_HOMEDIR|bool|0|yellow|Share home directory (read-only)|Agent can read everything in \$HOME except credentials|sensitive"
+    "AI_SANDBOX_ALLOW_RO_HOMEDIR|bool|0|yellow|Share home directory (read-only)|(macOS only) Agent can read everything in \$HOME except credentials|sensitive|darwin"
 
     # Credentials
     "AI_SANDBOX_ALLOW_RO_CREDENTIALS|bool|0|red|Let agent read residual credential files|Includes ~/.config/gcloud, ~/.gnupg, ~/.netrc, ~/.npmrc, ~/.pypirc. ~/.ssh, ~/.aws, ~/.kube, ~/.docker are gated by their matching PASS_* setting instead.|credentials"
@@ -207,10 +215,32 @@ _AI_SETTINGS_LIST=(
     "AI_SANDBOX_PASS_OPENAI|bool|0|red|Share OpenAI credentials|Passes all OPENAI_* env vars (advanced)|credentials"
 
     # Networking (localhost, local docker)
-    "AI_SANDBOX_BLOCK_LOCALHOST|bool|0|info|Block localhost network access|Denies network access to services running on your own machine|networking"
+    "AI_SANDBOX_BLOCK_LOCALHOST|bool|0|info|Block localhost network access|(macOS only) Denies network access to services running on your own machine|networking|darwin"
     "AI_SANDBOX_ALLOW_DOCKER|bool|0|red|Mount Docker / Colima socket|RW on /var/run/docker.sock, ~/.colima, ~/.docker. With the daemon running this is a full sandbox escape: agent can launch privileged containers and obtain host root. Off by default — opt in only when the session needs docker.|networking"
     "AI_SANDBOX_PASS_DOCKER|bool|0|red|Share Docker client env vars + ~/.docker|Passes DOCKER_HOST, DOCKER_CONFIG, DOCKER_CERT_PATH, DOCKER_BUILDKIT and RO-grants ~/.docker (registry auth tokens). Pair with 'Mount Docker / Colima socket' to actually talk to the daemon.|networking"
 )
+
+# OS-scope filtering: drop catalog rows whose trailing OS_SCOPE field
+# doesn't match the current OS, so a setting with no backend on this OS
+# (e.g. AI_SANDBOX_BLOCK_LOCALHOST / AI_SANDBOX_ALLOW_RO_HOMEDIR, macOS-only
+# today) is hidden from the menu entirely rather than shown-but-nonfunctional.
+# Runs once at source-time, before any function iterates _AI_SETTINGS_LIST
+# and before agent-specific libs (e.g. claude_wrapper_lib.bash) `+=` onto it.
+# `IFS='|' read -r ... <<<"${entry}"` naturally yields an empty 8th field
+# for 7-field rows, so existing rows need no trailing "|" added.
+_ai_settings_os="$(uname -s)"
+_ai_settings_filtered=()
+for _ai_settings_entry in "${_AI_SETTINGS_LIST[@]}"; do
+    IFS='|' read -r _ai_n _ai_t _ai_d _ai_sev _ai_hl _ai_det _ai_cat _ai_scope <<<"${_ai_settings_entry}"
+    case "${_ai_scope}" in
+        darwin) [[ "${_ai_settings_os}" == "Darwin" ]] && _ai_settings_filtered+=("${_ai_settings_entry}") ;;
+        linux)  [[ "${_ai_settings_os}" == "Linux"  ]] && _ai_settings_filtered+=("${_ai_settings_entry}") ;;
+        *)      _ai_settings_filtered+=("${_ai_settings_entry}") ;;
+    esac
+done
+_AI_SETTINGS_LIST=("${_ai_settings_filtered[@]}")
+unset _ai_settings_os _ai_settings_filtered _ai_settings_entry _ai_scope
+unset _ai_n _ai_t _ai_d _ai_sev _ai_hl _ai_det _ai_cat
 
 # Bump only when the load logic needs version-conditional handling.
 # Today: written into the preset file header for forward-compat
@@ -219,9 +249,12 @@ _AI_SETTINGS_LIST=(
 _AI_WRAPPER_PRESET_FORMAT_VERSION="2026-05-28"
 
 # Parse one catalog entry into globals: _set_name _set_type _set_default
-# _set_severity _set_headline _set_detail _set_category. Globals because
-# bash 3.2 lacks namerefs and returning a 7-tuple via stdout would force
-# the caller to split it again.
+# _set_severity _set_headline _set_detail _set_category _set_os_scope.
+# Globals because bash 3.2 lacks namerefs and returning an 8-tuple via
+# stdout would force the caller to split it again. _set_os_scope is the
+# optional 8th field — a 7-field entry (no trailing "|OS_SCOPE") yields an
+# empty string here, same backward-compatible contract as the filtering
+# step above.
 _parse_setting_entry() {
     local entry="${1}"
     _set_name="${entry%%|*}"; entry="${entry#*|}"
@@ -230,7 +263,13 @@ _parse_setting_entry() {
     _set_severity="${entry%%|*}"; entry="${entry#*|}"
     _set_headline="${entry%%|*}"; entry="${entry#*|}"
     _set_detail="${entry%%|*}"; entry="${entry#*|}"
-    _set_category="${entry}"
+    _set_category="${entry%%|*}"
+    if [[ "${entry}" == *"|"* ]]; then
+        entry="${entry#*|}"
+        _set_os_scope="${entry}"
+    else
+        _set_os_scope=""
+    fi
 }
 
 # Map a category key from the catalog to its user-facing label. Unknown
