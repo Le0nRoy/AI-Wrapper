@@ -88,6 +88,16 @@ _run_sandboxed_agent_linux() {
         exit 127
     fi
 
+    # Opt-in credential/daemon access — same flag names and semantics as the
+    # macOS SBPL profile's (when (equal? (param "...") "1") ...) gates, so a
+    # single Settings-menu toggle controls both backends. Default "0";
+    # normalize any non-"1" value to "0" so a typo doesn't silently widen.
+    local pass_kube="${AI_SANDBOX_PASS_KUBE:-0}"; [[ "${pass_kube}" == "1" ]] || pass_kube=0
+    local pass_aws="${AI_SANDBOX_PASS_AWS:-0}"; [[ "${pass_aws}" == "1" ]] || pass_aws=0
+    local pass_ssh_agent="${AI_SANDBOX_PASS_SSH_AGENT:-0}"; [[ "${pass_ssh_agent}" == "1" ]] || pass_ssh_agent=0
+    local pass_docker="${AI_SANDBOX_PASS_DOCKER:-0}"; [[ "${pass_docker}" == "1" ]] || pass_docker=0
+    local allow_docker="${AI_SANDBOX_ALLOW_DOCKER:-0}"; [[ "${allow_docker}" == "1" ]] || allow_docker=0
+
     # Skip the separator "--" between command and bwrap flags
     if [[ "${1}" == "--" ]]; then
         shift
@@ -222,19 +232,21 @@ _run_sandboxed_agent_linux() {
             bwrap_args+=(--ro-bind /run/systemd/resolve /run/systemd/resolve)
         fi
 
-        # Bind Docker socket with write access if it exists
-        if [[ -S /run/docker.sock ]]; then
-            bwrap_args+=(--bind /run/docker.sock /run/docker.sock)
-        fi
+        if [[ "${allow_docker}" == "1" ]]; then
+            # Bind Docker socket with write access if it exists
+            if [[ -S /run/docker.sock ]]; then
+                bwrap_args+=(--bind /run/docker.sock /run/docker.sock)
+            fi
 
-        # Bind Docker runtime directory for container management
-        if [[ -d /run/docker ]]; then
-            bwrap_args+=(--bind /run/docker /run/docker)
-        fi
+            # Bind Docker runtime directory for container management
+            if [[ -d /run/docker ]]; then
+                bwrap_args+=(--bind /run/docker /run/docker)
+            fi
 
-        # Bind Docker containerd socket if it exists
-        if [[ -S /run/containerd/containerd.sock ]]; then
-            bwrap_args+=(--bind /run/containerd/containerd.sock /run/containerd/containerd.sock)
+            # Bind Docker containerd socket if it exists
+            if [[ -S /run/containerd/containerd.sock ]]; then
+                bwrap_args+=(--bind /run/containerd/containerd.sock /run/containerd/containerd.sock)
+            fi
         fi
 
         # Bind Tailscale socket for read-only query access (status, ip, peers)
@@ -251,14 +263,14 @@ _run_sandboxed_agent_linux() {
     elif [[ -d /var/run ]]; then
         bwrap_args+=(--tmpfs /var/run)
 
-        if [[ -S /var/run/docker.sock ]]; then
+        if [[ "${allow_docker}" == "1" && -S /var/run/docker.sock ]]; then
             bwrap_args+=(--bind /var/run/docker.sock /var/run/docker.sock)
         fi
     fi
 
     # Add Docker data directories for container filesystem access
     # This allows agents to interact with running containers and their volumes
-    if [[ -d /var/lib/docker ]]; then
+    if [[ "${allow_docker}" == "1" && -d /var/lib/docker ]]; then
         # Need to create parent directory structure since /var is tmpfs
         bwrap_args+=(--dir /var/lib)
         bwrap_args+=(--bind /var/lib/docker /var/lib/docker)
@@ -303,14 +315,42 @@ _run_sandboxed_agent_linux() {
     [[ -n "${COLORTERM}" ]] && bwrap_args+=(--setenv COLORTERM "${COLORTERM}")
     [[ -n "${TERM_PROGRAM}" ]] && bwrap_args+=(--setenv TERM_PROGRAM "${TERM_PROGRAM}")
 
-    # Pass through Docker environment variables if set
-    [[ -n "${DOCKER_HOST}" ]] && bwrap_args+=(--setenv DOCKER_HOST "${DOCKER_HOST}")
-    [[ -n "${DOCKER_CONFIG}" ]] && bwrap_args+=(--setenv DOCKER_CONFIG "${DOCKER_CONFIG}")
-    [[ -n "${DOCKER_CERT_PATH}" ]] && bwrap_args+=(--setenv DOCKER_CERT_PATH "${DOCKER_CERT_PATH}")
+    # Pass through Docker environment variables and ~/.docker config if opted in
+    if [[ "${pass_docker}" == "1" ]]; then
+        [[ -n "${DOCKER_HOST:-}" ]]      && bwrap_args+=(--setenv DOCKER_HOST "${DOCKER_HOST}")
+        [[ -n "${DOCKER_CONFIG:-}" ]]    && bwrap_args+=(--setenv DOCKER_CONFIG "${DOCKER_CONFIG}")
+        [[ -n "${DOCKER_CERT_PATH:-}" ]] && bwrap_args+=(--setenv DOCKER_CERT_PATH "${DOCKER_CERT_PATH}")
+        [[ -d "${HOME_DIR}/.docker" ]]   && bwrap_args+=(--ro-bind "${HOME_DIR}/.docker" "${HOME_DIR}/.docker")
+    fi
 
-    # Pass through Kubernetes/kind environment variables if set
-    [[ -n "${KUBECONFIG}" ]] && bwrap_args+=(--setenv KUBECONFIG "${KUBECONFIG}")
+    # Pass through kind environment variable if set (kind itself is unconditional, see .kind/kind_dot_kube binds above)
     [[ -n "${KIND_EXPERIMENTAL_PROVIDER}" ]] && bwrap_args+=(--setenv KIND_EXPERIMENTAL_PROVIDER "${KIND_EXPERIMENTAL_PROVIDER}")
+
+    # Pass through KUBECONFIG and bind ~/.kube if opted in
+    if [[ "${pass_kube}" == "1" ]]; then
+        [[ -n "${KUBECONFIG:-}" ]] && bwrap_args+=(--setenv KUBECONFIG "${KUBECONFIG}")
+        [[ -d "${HOME_DIR}/.kube" ]] && bwrap_args+=(--ro-bind "${HOME_DIR}/.kube" "${HOME_DIR}/.kube")
+    fi
+
+    # Pass through AWS credentials/config if opted in
+    if [[ "${pass_aws}" == "1" ]]; then
+        [[ -d "${HOME_DIR}/.aws" ]] && bwrap_args+=(--ro-bind "${HOME_DIR}/.aws" "${HOME_DIR}/.aws")
+        local _e_var _e_val
+        while IFS= read -r _e_var; do
+            case "${_e_var}" in
+                AWS_*)
+                    _e_val="${!_e_var:-}"
+                    [[ -n "${_e_val}" ]] && bwrap_args+=(--setenv "${_e_var}" "${_e_val}")
+                    ;;
+            esac
+        done < <(compgen -e 2>/dev/null || true)
+    fi
+
+    # Pass through SSH agent socket and ~/.ssh if opted in
+    if [[ "${pass_ssh_agent}" == "1" && -n "${SSH_AUTH_SOCK:-}" && -S "${SSH_AUTH_SOCK}" ]]; then
+        bwrap_args+=(--bind "${SSH_AUTH_SOCK}" "${SSH_AUTH_SOCK}" --setenv SSH_AUTH_SOCK "${SSH_AUTH_SOCK}")
+        [[ -d "${HOME_DIR}/.ssh" ]] && bwrap_args+=(--ro-bind "${HOME_DIR}/.ssh" "${HOME_DIR}/.ssh")
+    fi
 
     # ===== EXECUTE — no more setpriv/prlimit wrapper =====
 
