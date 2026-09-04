@@ -7,9 +7,9 @@ AI_AGENT_COMMAND="cursor-agent"
 # TODO: Set to the correct system prompt injection flag once verified.
 # Common candidates: --instructions, --system-prompt
 AI_SYSTEM_PROMPT_FLAG=""
-AI_RESUME_ARGS=(--resume)
+AI_RESUME_ARGS=()
 
-WRAPPER_DATA_DIR="${WRAPPER_DATA_DIR:-$(dirname "${BASH_SOURCE[0]}")}"
+WRAPPER_DATA_DIR="${WRAPPER_DATA_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)}"
 WRAPPER_HELP="${WRAPPER_DATA_DIR}/cursor-help.md"
 
 source "${WRAPPER_DATA_DIR}/ai_wrapper_lib.bash"
