@@ -17,7 +17,9 @@ source "$(dirname "${BASH_SOURCE[0]}")/ai_wrapper_data/cursor_wrapper_lib.bash"
 # than hardcoding bwrap's 2-arg `--bind SRC DST` shape: sandbox-exec (macOS)
 # takes a single-arg `--bind SRC` and hard-errors on a stray second token.
 WRAPPER_FLAGS=()
-_wrapper_add_ro_bind /opt/cursor-agent
+# /opt/cursor-agent is Linux-specific; macOS uses an app bundle or Homebrew
+# path. macOS backend hard-errors on missing bind sources, so guard it.
+[[ -d /opt/cursor-agent ]] && _wrapper_add_ro_bind /opt/cursor-agent
 _wrapper_add_bind "${HOME}/.cursor"
 _wrapper_add_bind "${HOME}/.config/cursor"
 _wrapper_add_bind "${HOME}/.local/share/cursor-agent"

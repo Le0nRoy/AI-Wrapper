@@ -17,6 +17,9 @@ source "$(dirname "${BASH_SOURCE[0]}")/ai_wrapper_data/codex_wrapper_lib.bash"
 # than hardcoding bwrap's 2-arg `--bind SRC DST` shape: sandbox-exec (macOS)
 # takes a single-arg `--bind SRC` and hard-errors on a stray second token.
 WRAPPER_FLAGS=()
+# macOS backend hard-errors on missing bind sources; create the directory so
+# the first-ever codex run doesn't fail before the CLI can create it itself.
+mkdir -p "${HOME}/.codex"
 _wrapper_add_bind "${HOME}/.codex"
 
 # Codex CLI flags - full autonomy within sandbox (no approvals needed)

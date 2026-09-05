@@ -192,6 +192,19 @@ switch between them without re-authenticating each time.
 - Non-interactive launches respect `CLAUDE_ACCOUNT=<name>` set in the
   environment, or fall back to the workdir's saved preset.
 
+**macOS limitation:** Account switching relies on bind-mount remapping —
+the wrapper makes `~/.claude-<name>` appear as `~/.claude` inside the
+sandbox so the Claude CLI sees its expected config path. On Linux
+(bubblewrap) this works via `--bind SRC DST`. On macOS (sandbox-exec /
+Seatbelt) there is no bind-mount remapping; the path grant is a
+single-argument ACL, so a named account directory is accessible at its
+real path (`~/.claude-<name>`) but cannot be remapped to appear as
+`~/.claude`. As a result, setting `CLAUDE_ACCOUNT=work` on macOS will
+grant read/write access to `~/.claude-work` in the sandbox but Claude
+reads `~/.claude` — the session will silently use the default account
+directory instead of the named one. Account switching is fully
+functional on Linux only.
+
 ### c) Clear saved settings for this workdir
 
 The wrapper automatically saves your current settings when you pick a
@@ -221,6 +234,16 @@ menu from the same directory. This is a silent, per-workdir operation
 The preset file is plain `KEY=VALUE` per line with a comment header;
 you can `grep -r workdir: ~/.config/ai-wrapper/last-preset/` to
 find a file by its workdir path.
+
+**Known limitation — cross-OS preset portability:** The preset file
+stores every catalog key, including OS-specific ones (e.g.
+`AI_SANDBOX_ALLOW_RO_HOMEDIR`, which is macOS-only, and
+`AI_SANDBOX_BLOCK_LOCALHOST`, also macOS-only). If you save a preset on
+macOS with `ALLOW_RO_HOMEDIR=1` and then load it on Linux, the key is
+restored into the environment but silently has no effect — Linux has no
+backend for it. The setting will still appear as `1` in the preset file
+and in the env, which can be misleading. Clear the preset (`c)`) after
+switching OS if you rely on macOS-only settings.
 
 ### h) Help
 Shows this help document.

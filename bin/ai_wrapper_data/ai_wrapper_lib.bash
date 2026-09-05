@@ -78,18 +78,21 @@ _wrapper_add_meta_bind() {
 # NOT available here, before the menu, on any OS. Both helpers are
 # OS-generic in their own implementation (realpath(1)/perl/pure-bash
 # fallback chain; plain string comparisons), so they are duplicated here
-# verbatim rather than invented differently, to keep behavior identical to
-# whatever the macOS backend does with the same inputs later in the run.
+# (structurally equivalent to macos_sandbox_exec.bash) rather than invented
+# differently, to keep behavior identical to whatever the macOS backend does
+# with the same inputs later in the run.
 _realpath() {
     local p="${1}" out
     if command -v realpath >/dev/null 2>&1; then
         if out="$(realpath "${p}" 2>/dev/null)" && [[ -n "${out}" ]]; then
+            [[ "${AI_SANDBOX_DEBUG:-0}" == "1" ]] && echo_log "DEBUG" "_realpath: branch=realpath path=${p}"
             echo "${out}"
             return 0
         fi
     fi
     if command -v perl >/dev/null 2>&1; then
         if out="$(perl -MCwd=abs_path -e 'my $r = abs_path($ARGV[0]); print $r if defined $r' "${p}" 2>/dev/null)" && [[ -n "${out}" ]]; then
+            [[ "${AI_SANDBOX_DEBUG:-0}" == "1" ]] && echo_log "DEBUG" "_realpath: branch=perl-abs_path path=${p}"
             echo "${out}"
             return 0
         fi
@@ -102,6 +105,7 @@ _realpath() {
     local parent base resolved_parent
     if [[ -d "${p}" ]]; then
         if out="$( cd "${p}" 2>/dev/null && pwd -P )" && [[ -n "${out}" ]]; then
+            [[ "${AI_SANDBOX_DEBUG:-0}" == "1" ]] && echo_log "DEBUG" "_realpath: branch=cd-pwd-dir path=${p}"
             echo "${out}"
             return 0
         fi
@@ -121,12 +125,14 @@ _realpath() {
             depth=$((depth + 1))
             for (( _s_i = 0; _s_i < ${#seen[@]}; _s_i++ )); do
                 if [[ "${seen[$_s_i]}" == "${cur}" ]]; then
+                    [[ "${AI_SANDBOX_DEBUG:-0}" == "1" ]] && echo_log "DEBUG" "_realpath: symlink cycle detected path=${p} depth=${depth}"
                     return 1
                 fi
             done
         done
         if [[ -d "${cur}" ]]; then
             if out="$( cd "${cur}" 2>/dev/null && pwd -P )" && [[ -n "${out}" ]]; then
+                [[ "${AI_SANDBOX_DEBUG:-0}" == "1" ]] && echo_log "DEBUG" "_realpath: branch=cd-pwd-symlink-walk-dir path=${p} depth=${depth}"
                 echo "${out}"
                 return 0
             fi
@@ -134,6 +140,7 @@ _realpath() {
         parent="$(dirname -- "${cur}")"
         base="$(basename -- "${cur}")"
         if resolved_parent="$( cd "${parent}" 2>/dev/null && pwd -P )" && [[ -n "${resolved_parent}" ]]; then
+            [[ "${AI_SANDBOX_DEBUG:-0}" == "1" ]] && echo_log "DEBUG" "_realpath: branch=cd-pwd-symlink-walk-file path=${p} depth=${depth}"
             echo "${resolved_parent%/}/${base}"
             return 0
         fi
