@@ -1,0 +1,470 @@
+;; macOS sandbox profile (SBPL) for AI agent CLIs.
+;; Sourced by ai_agent_universal_wrapper.bash via `sandbox-exec -p`.
+;;
+;; Threat model:
+;;   - The agent is trusted by the user to *read* their files (it was invited
+;;     into the session). The sandbox bounds *writes* to the working directory,
+;;     agent config, and tmp.
+;;   - Network is allowed because the Anthropic API call would otherwise fail.
+;;     Consequence: combined with broad file-read, the agent can exfiltrate any
+;;     readable file (~/.ssh, ~/.aws, browser data, etc.). The trust assumption
+;;     is "the agent is invited and not malicious"; if you don't grant that
+;;     trust, this profile is not strong enough.
+;;   - Subprocess spawning is allowed (the agent routinely runs git/npm/node/etc.).
+;;     Combined with the writable WORKDIR, this is a write→exec gadget within
+;;     the sandbox: the agent can drop a binary into WORKDIR and exec it. The
+;;     new process inherits the sandbox, so this isn't an escape — but treat
+;;     "sandboxed" as "confined", not "cannot run code".
+;;   - Keychain item access uses two API families. The modern SecItem API
+;;     routes through securityd over Mach IPC and is gated by (allow mach-lookup).
+;;     The legacy SecKeychain* API (used by /usr/bin/security and by Go's
+;;     go-keyring) writes the keychain DB file
+;;     *directly* from the client process via SQLite atomic-replace — temp file
+;;     `login.keychain-db.sb-<rand>` created in ~/Library/Keychains, then
+;;     renamed. That path needs file-write, not just file-read.
+;;
+;; Required parameters (passed via -D KEY=VALUE):
+;;   HOME_DIR                — user's home directory (literal/subpath rules)
+;;   HOME_DIR_RE             — regex-escaped HOME_DIR (regex rules only)
+;;   WORKDIR                 — current working directory (read-write)
+;;   DARWIN_USER_TEMP_DIR    — per-user temp dir from `getconf`, realpath-resolved
+;;   DARWIN_USER_CACHE_DIR   — per-user cache dir from `getconf`, realpath-resolved
+;;   DARWIN_USER_SIGNPOST_DIR — per-user signpost trace dir (derived from TEMP_DIR;
+;;                              optional — gated by ENABLE_SIGNPOST below)
+;;   ENABLE_SIGNPOST         — "1" if DARWIN_USER_SIGNPOST_DIR was derived
+;;                              successfully (post-B7 / WS2); "0" on the
+;;                              fallback path. Gates the signpost (allow …) rule
+;;                              so a future stricter sandbox-exec doesn't
+;;                              choke on an unbound param.
+;;   ALLOW_RO_HOMEDIR        — "1" enables $HOME-wide read; any other value disables
+;;   ALLOW_RO_CREDENTIALS    — "1" enables RO read on the residual credential
+;;                              dirs without a dedicated PASS_* flag
+;;                              (~/.config/gcloud, ~/.gnupg, ~/.netrc,
+;;                              ~/.npmrc, ~/.pypirc). Per-service cred dirs
+;;                              are gated by their PASS_* flag below.
+;;   PASS_SSH_AGENT          — "1" enables RO on ~/.ssh (companion to the
+;;                              SSH_AUTH_SOCK env var pass-through)
+;;   PASS_AWS                — "1" enables RO on ~/.aws (companion to the
+;;                              AWS_* env var pass-through)
+;;   PASS_KUBE               — "1" enables RO on ~/.kube (companion to the
+;;                              KUBECONFIG env var pass-through)
+;;   PASS_DOCKER             — "1" enables RO on ~/.docker (companion to the
+;;                              DOCKER_* env var pass-through). Redundant
+;;                              when ALLOW_DOCKER=1 (which RW-binds ~/.docker).
+;;   PASS_GITLAB             — "1" enables RO on glab's on-disk config
+;;                              (~/Library/Application Support/glab-cli, plus
+;;                              the XDG fallbacks ~/.config/glab-cli and
+;;                              ~/.local/share/glab-cli), companion to the
+;;                              GITLAB_TOKEN / CI_JOB_TOKEN env var
+;;                              pass-through so `glab` also works when it
+;;                              reads its token from disk instead of the env.
+;;   BLOCK_LOCALHOST         — "1" emits (deny network-* (… ip "localhost:*"))
+;;                              pair; any other value leaves localhost reachable.
+;;                              NOTE: this only covers IP loopback. Unix-domain
+;;                              sockets (/var/run/docker.sock, ~/.colima/*.sock)
+;;                              and link-local addresses (e.g. AWS IMDS at
+;;                              169.254.169.254) are NOT covered.
+;;   ALLOW_DOCKER            — "1" emits the Docker/Colima socket + ~/.docker
+;;                              RW rules. Default "0"; set "1" to opt in when
+;;                              the session needs `docker` from inside the
+;;                              sandbox. WARNING: when on and the
+;;                              Docker/Colima daemon is running, the agent can
+;;                              `docker run -v /:/host` to obtain root on the
+;;                              host filesystem — full sandbox escape.
+;;
+;; The wrapper appends per-call --bind / --ro-bind rules after this base.
+
+(version 1)
+(deny default)
+
+;; --- Process & signal management --------------------------------------------
+(allow process-fork)
+(allow process-exec)
+(allow process-info*)
+(allow signal)
+
+;; --- Mach IPC: narrowed allowlist ------------------------------------------
+;; Each service is annotated with the call-path that requires it. Adding here
+;; is fine; removing requires running the agent through a Mach baseline capture
+;; (see docs/plans/2026-09-04-macos-sandbox-and-wrapper-unification-context.md
+;; — empirical narrowing loop) to confirm nothing in the working test set hits it.
+;;
+;; mach-register: the empty-prefix filter matches *any* local name. The
+;; narrowing here is about scope, not name pattern — local names are
+;; per-process and don't escape the agent's process tree. The agent can
+;; bootstrap_register whatever local name it wants; what it cannot do is
+;; publish into the user bootstrap namespace (global-name), which is the
+;; surface that matters for cross-process IPC capture.
+(allow mach-register (local-name-prefix ""))
+
+(allow mach-lookup
+    ;; Foundation / dyld baseline
+    (global-name "com.apple.system.notification_center")     ; Darwin notify (libnotify)
+    (global-name "com.apple.system.logger")                  ; ASL / unified-logging shim
+    (global-name "com.apple.logd")                           ; unified logging daemon
+    (global-name "com.apple.logd.events")                    ; unified logging XPC
+    (global-name "com.apple.distributed_notifications.@1v3") ; NSDistributedNotificationCenter (Foundation init)
+    (global-name "com.apple.distributed_notifications.@Uv3") ; user-scope variant
+
+    ;; System config (DNS, proxy, network state — used by Node, curl, git)
+    (global-name "com.apple.SystemConfiguration.configd")
+    (global-name "com.apple.SystemConfiguration.SCNetworkReachability")
+    (global-name "com.apple.SystemConfiguration.DNSConfiguration")    ; c-ares DNS discovery (grpc-python, others)
+    (global-name "com.apple.dnssd.service")                  ; mDNSResponder
+
+    ;; Preferences (NSUserDefaults / CFPreferences read paths)
+    (global-name "com.apple.cfprefsd.agent")
+    (global-name "com.apple.cfprefsd.daemon")
+
+    ;; Keychain
+    (global-name "com.apple.SecurityServer")                 ; legacy SecKeychain* path
+    (global-name "com.apple.securityd")                      ; modern securityd
+    (global-name "com.apple.security.cryptoTokenKit")        ; CTK (smart cards / Secure Enclave-backed keys)
+    (global-name "com.apple.trustd")                         ; TLS trust eval — system daemon (Go's Security.framework path)
+    (global-name "com.apple.trustd.agent")                   ; TLS trust eval — per-user agent (matches Aqua-session callers)
+
+    ;; OpenDirectory user/group lookup — required by libc's getpwuid_r /
+    ;; getlogin family. Most languages call this during startup or when
+    ;; resolving the current user (e.g. libpq's psycopg2 connects throw
+    ;; "local user with ID N does not exist" without it; git calls it for
+    ;; committer identity discovery; many other CLIs touch it indirectly).
+    (global-name "com.apple.system.opendirectoryd.libinfo")
+    (global-name "com.apple.system.opendirectoryd.membership")
+
+    ;; TCC (Transparency, Consent, Control) — parent process's grants are
+    ;; inherited; tccd lookup is what Foundation/Security frameworks call.
+    (global-name "com.apple.tccd")
+    (global-name "com.apple.tccd.system"))
+
+;; Services intentionally NOT in the allowlist (high-risk if granted):
+;;   com.apple.coreservices.launchservicesd  → would enable `open -a` escape
+;;   com.apple.lsd.{mapdb,modifydb}          → Launch Services DB (same surface)
+;;   com.apple.coreservicesd                 → LS + filesystem URL APIs
+;;   com.apple.calendar.calendaragent        → user calendar
+;;   com.apple.AddressBook.abd               → user contacts
+;;   com.apple.fseventsd                     → filesystem-wide write notifications
+;;   com.apple.UserNotificationCenter        → UI-banner phishing pivot
+;;
+;; If you add to the allowlist, also update the README threat-model section.
+
+;; --- Read access: explicit allowlist (default-deny + per-path allow) -------
+;; The base allowlist below covers what any CLI must read to launch:
+;; system binaries / libs / frameworks, locale, certs, dyld cache.
+;; HOME-side reads (~/.claude, ~/.claude.json, ~/Library/...) are
+;; granted by per-call --bind rules from the wrapper, *plus* the explicit
+;; HOME literals further down. Per-call --ro-bind paths are appended by the
+;; wrapper as (allow file-read* (subpath/literal "...")) at the bottom of
+;; the rendered profile.
+;;
+;; Reference: /System/Library/Sandbox/Profiles/system.sb is Apple's canonical
+;; baseline for what's required to run an arbitrary process. The Linux
+;; bubblewrap allowlist in this repo's ai_agent_universal_wrapper.bash is the
+;; cross-OS contract this mirrors (see
+;; docs/plans/2026-09-04-macos-sandbox-and-wrapper-unification-context.md).
+
+(allow file-read* file-test-existence
+    ;; System binaries & libs
+    (subpath "/System")
+    (subpath "/usr")
+    (subpath "/bin")
+    (subpath "/sbin")
+    (subpath "/Library/Apple")
+    (subpath "/Library/Frameworks")
+    (subpath "/Library/Developer/CommandLineTools")  ; xcrun, git-shipped-with-CLT
+    (subpath "/opt/homebrew")                         ; Apple Silicon Homebrew prefix
+    (subpath "/opt/local")                            ; MacPorts prefix (rare but harmless)
+    (subpath "/private/etc")                          ; resolv.conf, hosts, ssl certs
+    (subpath "/private/var/db/dyld")                  ; dyld shared cache
+    (subpath "/private/var/db/timezone")
+    (subpath "/private/var/db/mds")                   ; Spotlight metadata (Foundation reads on init)
+    (subpath "/private/var/run")                      ; socket-symlink resolution (docker.sock parent)
+    (subpath "/Library/Preferences")                  ; system-wide CFPrefs (not per-user)
+    (literal "/")
+    (literal "/Applications")                         ; some CLIs probe /Applications/Xcode
+    (literal "/Library")
+    (literal "/Volumes")
+    (literal "/opt")                                  ; realpath/scandir traversal to /opt/homebrew
+    (literal "/private")
+    (literal "/private/var")
+    (literal "/private/var/folders")                  ; readdir/scandir of the per-user temp parent
+    (subpath "/private/var/select")                   ; xcode-select developer_dir symlink target
+    (literal "/private/etc/localtime")
+    (literal "/etc")                                  ; /etc -> /private/etc symlink target
+    (literal "/var")                                  ; /var -> /private/var symlink target
+    (literal "/var/select")                           ; /var/select -> /private/var/select symlink target
+    (literal "/tmp")                                  ; /tmp -> /private/tmp symlink target
+    (literal "/Users"))                               ; `ls /Users`, git path canonicalization through /Users/<user>/...
+
+(allow file-map-executable
+    (subpath "/System")
+    (subpath "/usr/lib")
+    (subpath "/Library/Apple")
+    (subpath "/Library/Frameworks")
+    (subpath "/opt/homebrew"))
+
+;; Standard special files
+(allow file-read*
+    (literal "/dev/null")
+    (literal "/dev/zero")
+    (literal "/dev/random")
+    (literal "/dev/urandom")
+    (literal "/dev/tty")
+    (literal "/dev/stdin")
+    (literal "/dev/stdout")
+    (literal "/dev/stderr")
+    (literal "/dev/fd")
+    (subpath "/dev/fd"))
+
+;; HOMEDIR-anchored read literals that are needed regardless of bind rules.
+;; (~/.claude, ~/.claude.json are still --bind'd RW from the wrapper; these
+;; literals back-stop reads on associated lock/temp files and on per-user
+;; app-support / cache subtrees that Foundation/Claude routinely touches
+;; even with the dotfile credential fence in place.)
+(allow file-read*
+    (literal (param "HOME_DIR"))                                                 ; `ls $HOME`, stat $HOME for tools that probe it
+    (literal (string-append (param "HOME_DIR") "/.CFUserTextEncoding"))
+    (literal (string-append (param "HOME_DIR") "/.gitconfig"))
+    (literal (string-append (param "HOME_DIR") "/.gitignore_global"))
+    ;; System-wide AI agent rule files (parity with the Linux upstream's
+    ;; auto-bind of ~/AGENTS.md + ~/CLAUDE.md). Granted unconditionally via
+    ;; SBPL literal rules — no --ro-bind from the caller required, and a
+    ;; missing file is a no-op rather than a hard failure. The two files are
+    ;; advisory (text rules consumed by the agent), not credential vehicles.
+    (literal (string-append (param "HOME_DIR") "/AGENTS.md"))
+    (literal (string-append (param "HOME_DIR") "/CLAUDE.md"))
+    (subpath (string-append (param "HOME_DIR") "/.config/git"))                  ; git XDG global config (~/.config/git/ignore et al.)
+    (subpath (string-append (param "HOME_DIR") "/Library/Preferences"))
+    (subpath (string-append (param "HOME_DIR") "/Library/Application Support/com.anthropic.claudefordesktop"))
+    (subpath (string-append (param "HOME_DIR") "/Library/Caches/com.apple.HelpViewer"))
+    (subpath (string-append (param "HOME_DIR") "/.nvm"))     ; common Node version managers
+    (subpath (string-append (param "HOME_DIR") "/.nodenv"))
+    (subpath (string-append (param "HOME_DIR") "/.pyenv")))
+
+;; --- Optional read scopes gated by env flags (see README) ------------------
+;; ALLOW_RO_HOMEDIR=1 widens read to all of $HOME except credential subdirs.
+;; ALLOW_RO_CREDENTIALS=1 widens read to credential subdirs.
+;; Both default 0; the wrapper sets the -D value.
+;;
+;; Note the asymmetric overlap: the HOMEDIR rule uses (require-not ...) to
+;; exclude the credential paths, so setting both flags = setting them in
+;; either order yields the union (HOMEDIR + the explicit credential rule).
+
+;; Library exclusions added in WS2 (U-D). The flag was widening reads to
+;; ~/Library/Messages/chat.db (iMessage history + attachments),
+;; ~/Library/Mail/ (full mail bodies), ~/Library/Cookies/ (Safari/system
+;; cookie jar), and the Application Support/Containers entries for the
+;; main browsers and chat apps (Chrome/Firefox cookie + Login Data DBs,
+;; Slack/Discord auth tokens, 1Password sync cache). Each is shaped like
+;; a credential vehicle in practice. Adding them to the (require-not …)
+;; chain keeps the flag useful for "agent reads my code dirs" while
+;; refusing the obvious lateral-movement targets.
+(when (equal? (param "ALLOW_RO_HOMEDIR") "1")
+    (allow file-read*
+        (require-all
+            (subpath (param "HOME_DIR"))
+            (require-not (subpath (string-append (param "HOME_DIR") "/.ssh")))
+            (require-not (subpath (string-append (param "HOME_DIR") "/.aws")))
+            (require-not (subpath (string-append (param "HOME_DIR") "/.kube")))
+            (require-not (subpath (string-append (param "HOME_DIR") "/.config/gcloud")))
+            (require-not (subpath (string-append (param "HOME_DIR") "/.docker")))
+            (require-not (subpath (string-append (param "HOME_DIR") "/.gnupg")))
+            (require-not (literal  (string-append (param "HOME_DIR") "/.netrc")))
+            (require-not (literal  (string-append (param "HOME_DIR") "/.npmrc")))
+            (require-not (literal  (string-append (param "HOME_DIR") "/.pypirc")))
+            (require-not (subpath (string-append (param "HOME_DIR") "/Library/Keychains")))
+            ;; iMessage + Mail
+            (require-not (subpath (string-append (param "HOME_DIR") "/Library/Messages")))
+            (require-not (subpath (string-append (param "HOME_DIR") "/Library/Mail")))
+            ;; System cookie jar
+            (require-not (subpath (string-append (param "HOME_DIR") "/Library/Cookies")))
+            ;; Browser profile data (cookies, login DBs, history)
+            (require-not (subpath (string-append (param "HOME_DIR") "/Library/Application Support/Google/Chrome")))
+            (require-not (subpath (string-append (param "HOME_DIR") "/Library/Application Support/Chromium")))
+            (require-not (subpath (string-append (param "HOME_DIR") "/Library/Application Support/BraveSoftware")))
+            (require-not (subpath (string-append (param "HOME_DIR") "/Library/Application Support/Arc")))
+            (require-not (subpath (string-append (param "HOME_DIR") "/Library/Application Support/Microsoft Edge")))
+            (require-not (subpath (string-append (param "HOME_DIR") "/Library/Application Support/Firefox")))
+            (require-not (subpath (string-append (param "HOME_DIR") "/Library/Application Support/Vivaldi")))
+            (require-not (subpath (string-append (param "HOME_DIR") "/Library/Containers/com.apple.Safari")))
+            ;; Chat / messaging apps with bearer tokens in local SQLite
+            (require-not (subpath (string-append (param "HOME_DIR") "/Library/Application Support/Slack")))
+            (require-not (subpath (string-append (param "HOME_DIR") "/Library/Application Support/discord")))
+            (require-not (subpath (string-append (param "HOME_DIR") "/Library/Application Support/Discord")))
+            ;; 1Password / Bitwarden / KeePassXC sync caches
+            (require-not (regex (string-append "^" (param "HOME_DIR_RE") "/Library/Application Support/com\\.1password\\..*")))
+            (require-not (regex (string-append "^" (param "HOME_DIR_RE") "/Library/Application Support/com\\.agilebits\\..*")))
+            (require-not (subpath (string-append (param "HOME_DIR") "/Library/Application Support/Bitwarden")))
+            (require-not (subpath (string-append (param "HOME_DIR") "/Library/Application Support/KeePassXC"))))))
+
+;; Per-service credential dir RO grants. Each is gated by its companion
+;; PASS_* flag — flipping PASS_SSH_AGENT / PASS_AWS / PASS_KUBE / PASS_DOCKER
+;; both pass-throughs the env var (handled in the wrapper) AND grants RO
+;; on the matching on-disk config. Pulling these out of ALLOW_RO_CREDENTIALS
+;; tightens the per-flag scope: you no longer have to grant every cred dir
+;; just because you need one.
+(when (equal? (param "PASS_SSH_AGENT") "1")
+    (allow file-read*
+        (subpath (string-append (param "HOME_DIR") "/.ssh"))))
+(when (equal? (param "PASS_AWS") "1")
+    (allow file-read*
+        (subpath (string-append (param "HOME_DIR") "/.aws"))))
+(when (equal? (param "PASS_KUBE") "1")
+    (allow file-read*
+        (subpath (string-append (param "HOME_DIR") "/.kube"))))
+(when (equal? (param "PASS_DOCKER") "1")
+    (allow file-read*
+        (subpath (string-append (param "HOME_DIR") "/.docker"))))
+
+;; glab (GitLab CLI) on-disk config — companion to the GITLAB_TOKEN /
+;; CI_JOB_TOKEN env var pass-through (macos_sandbox_exec.bash, PASS_GITLAB
+;; env-scrub bucket) so `glab` also works when it reads its token from disk
+;; instead of the env. macOS path first; XDG fallbacks for users who set
+;; XDG_CONFIG_HOME / XDG_DATA_HOME to relocate. Previously this flag only
+;; passed the env vars and never actually granted read on the on-disk
+;; config despite the catalog/help docs claiming it did — this closes that
+;; gap (see the Linux backend's matching PASS_GITLAB bind in
+;; ai_agent_universal_wrapper.bash for the equivalent bwrap-side fix).
+(when (equal? (param "PASS_GITLAB") "1")
+    (allow file-read*
+        (subpath (string-append (param "HOME_DIR") "/Library/Application Support/glab-cli"))
+        (subpath (string-append (param "HOME_DIR") "/.config/glab-cli"))
+        (subpath (string-append (param "HOME_DIR") "/.local/share/glab-cli"))))
+
+;; Residual credential dirs without a dedicated PASS_* flag.
+(when (equal? (param "ALLOW_RO_CREDENTIALS") "1")
+    (allow file-read*
+        (subpath (string-append (param "HOME_DIR") "/.config/gcloud"))
+        (subpath (string-append (param "HOME_DIR") "/.gnupg"))
+        (literal  (string-append (param "HOME_DIR") "/.netrc"))
+        (literal  (string-append (param "HOME_DIR") "/.npmrc"))
+        (literal  (string-append (param "HOME_DIR") "/.pypirc"))))
+
+;; --- /dev devices commonly needed by CLIs ----------------------------------
+;; /dev/dtracehelper deliberately omitted: SIP gates DTrace probe registration
+;; on shipping macOS, so writes are no-ops; Apple's own narrow profiles
+;; (airlock.sb, blastdoor.sb) only grant it under (system-attribute apple-internal).
+(allow file-write-data file-ioctl
+    (literal "/dev/null")
+    (literal "/dev/tty"))
+
+;; Pseudo-ttys: interactive Node CLIs (Claude included) call setRawMode, which
+;; performs tcsetattr / ioctl on the inherited stdin/stdout fd. That fd points
+;; at the actual pty slave (e.g. /dev/ttys001), not the /dev/tty symlink, so
+;; the broader (allow file-read*) above isn't enough — write + ioctl must be
+;; granted on the slave device itself.
+(allow file-write-data file-ioctl
+    (regex #"^/dev/ttys[0-9]+$")
+    (literal "/dev/ptmx"))
+
+;; --- Tmpfs-like locations (read-write) -------------------------------------
+;; /private/tmp kept for Homebrew/legacy POSIX-tmp tools; macOS frameworks
+;; route through $TMPDIR (== DARWIN_USER_TEMP_DIR), not here. /private/var/tmp
+;; deliberately omitted — empty on shipping macOS; failures are loud (EPERM)
+;; if anything actually needs it later.
+(allow file* (subpath "/private/tmp"))
+
+;; Per-user temp + caches under /private/var/folders/<XX>/<UUID>/{T,C}.
+;; Wrapper resolves the UUID via getconf at launch and emits literal subpaths;
+;; cross-user dirs are excluded by policy (and by 0700 fs perms regardless).
+;; The X/ subdir holds os_signpost trace data on newer macOS releases — it's
+;; not exposed by getconf, so the wrapper derives it from the T/ path.
+(allow file* (subpath (param "DARWIN_USER_TEMP_DIR")))
+(allow file* (subpath (param "DARWIN_USER_CACHE_DIR")))
+;; Signpost rule is gated on ENABLE_SIGNPOST=1. When the wrapper's B7
+;; suffix-based derivation fails (DARWIN_USER_TEMP_DIR not ending in /T),
+;; ENABLE_SIGNPOST is "0" and DARWIN_USER_SIGNPOST_DIR is omitted from
+;; -D entirely. Without this (when …), the unbound param would still
+;; render an (allow file* (subpath "")) rule — harmless today but
+;; fragile if sandbox-exec ever rejects unbound params.
+(when (equal? (param "ENABLE_SIGNPOST") "1")
+    (allow file* (subpath (param "DARWIN_USER_SIGNPOST_DIR"))))
+
+;; --- Working directory (read-write) ----------------------------------------
+(allow file* (subpath (param "WORKDIR")))
+
+;; --- Network: full (required for the Anthropic API) ------------------------
+(allow network*)
+(allow system-socket)
+
+;; WS4 / S-α: optional localhost block. Opt-in via
+;; AI_SANDBOX_BLOCK_LOCALHOST=1. Off by default to keep dev workflows
+;; working (local DBs, dev servers). When set, the agent cannot
+;; connect() or bind() the loopback interface; common targets it cuts off are
+;; postgres/redis/kubectl-proxy on localhost, AWS instance metadata
+;; via VPN, and any localhost-bound dev server.
+;;
+;; sandbox-exec accepts only "*" or "localhost" as the host portion
+;; of (remote ip ...) — literal IPs (127.0.0.1, ::1) are rejected at
+;; parse time. The localhost form covers both IPv4 and IPv6 loopback.
+(when (equal? (param "BLOCK_LOCALHOST") "1")
+    (deny network-outbound (remote ip "localhost:*"))
+    (deny network-inbound  (local  ip "localhost:*")))
+
+;; --- sysctl, system info, IOKit, pseudo-ttys -------------------------------
+(allow sysctl-read)
+(allow system-info)
+(allow iokit-open)
+(allow pseudo-tty)
+
+;; --- POSIX shared memory --------------------------------------------------
+;; Apple's notification center and several Foundation paths use POSIX shm.
+(allow ipc-posix-shm)
+
+;; --- Claude-CLI auxiliary paths outside ~/.claude --------------------------
+;; The ~/.claude directory and ~/.claude.json file are granted RW via per-call
+;; --bind rules from the entry script (which `touch`es ~/.claude.json on first
+;; run so the bind always applies — without that, Claude's atomic-write to
+;; .claude.json fails on a fresh install). Claude also touches:
+;;   - ~/.claude.lock / ~/.claude.json.lock : flock-style lockfiles
+;;   - ~/.claude.json.tmp.<pid>.<ts>        : atomic-write tempfiles (renamed
+;;                                            to ~/.claude.json, which is
+;;                                            covered by the per-call bind)
+;;   - ~/Library/Caches/claude-cli-nodejs/  : Node CLI cache
+;;   - ~/Library/Keychains/                 : macOS Keychain holds the OAuth
+;;                                            credential (item label
+;;                                            "Claude Code-credentials").
+;;                                            Needs RW: the legacy
+;;                                            SecKeychain* API path (used by
+;;                                            `security` CLI and go-keyring)
+;;                                            writes the SQLite DB directly
+;;                                            via atomic-replace.
+;; The tempfile regex deliberately accepts any suffix after `.claude.json.tmp.`
+;; because Claude's atomic-write naming has changed before; tight `<pid>.<ts>`
+;; patterns silently broke writes when the format shifted. Anything matching
+;; this pattern sits in $HOME, which is already trusted user space.
+(allow file*
+    (literal (string-append (param "HOME_DIR") "/.claude.lock"))
+    (literal (string-append (param "HOME_DIR") "/.claude.json.lock"))
+    (regex (string-append "^" (param "HOME_DIR_RE") "/\\.claude\\.json\\.tmp\\..+$"))
+    (subpath (string-append (param "HOME_DIR") "/Library/Caches/claude-cli-nodejs")))
+
+;; --- Container engine sockets / configs (Docker, Colima) -------------------
+;; Required for `docker` CLI inside the sandbox to reach the daemon. On a
+;; Colima setup /var/run/docker.sock is a symlink to ~/.colima/docker.sock,
+;; so the rule allows either path. On Docker Desktop installs the socket
+;; lives directly at /var/run/docker.sock without a symlink — same literal
+;; covers both. (subpath ~/.colima) plus (subpath ~/.docker) cover the
+;; per-profile sockets (~/.colima/default/{docker,containerd}.sock) and the
+;; Docker CLI auth / context TLS material.
+;; Read paths for /private/var/run are not added here — they belong in the
+;; system-read allowlist that the S1 rewrite (T11) will install.
+;;
+;; SECURITY NOTE (S-η): when the Docker/Colima daemon is running, an agent
+;; with these grants can `docker run -v /:/host --privileged` to obtain
+;; root on the host filesystem — a full sandbox escape, conditional on the
+;; daemon being up. Gated on ALLOW_DOCKER=1 (default 0); set
+;; AI_SANDBOX_ALLOW_DOCKER=1 to opt in when the session needs `docker` from
+;; inside the sandbox.
+(when (equal? (param "ALLOW_DOCKER") "1")
+    (allow file*
+        (literal "/var/run/docker.sock")
+        (subpath (string-append (param "HOME_DIR") "/.colima"))
+        (subpath (string-append (param "HOME_DIR") "/.docker"))))
+
+;; Keychains DB: read-write. The SecItem path routes through securityd, but
+;; the legacy SecKeychain* path (which `security` CLI and go-keyring both use)
+;; writes the SQLite DB directly via atomic-replace — it creates a temp file
+;; alongside login.keychain-db, writes it, then renames over the original. The
+;; whole subpath needs file*, not just file-read*.
+(allow file*
+    (subpath (string-append (param "HOME_DIR") "/Library/Keychains")))

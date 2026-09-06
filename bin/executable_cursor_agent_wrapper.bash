@@ -12,41 +12,52 @@ source "$(dirname "${BASH_SOURCE[0]}")/ai_agent_universal_wrapper.bash"
 # Requires `chezmoi apply` to have been run — if source fails, the wrapper is not yet deployed.
 source "$(dirname "${BASH_SOURCE[0]}")/ai_wrapper_data/cursor_wrapper_lib.bash"
 
-export RLIMIT_AS=unlimited                       # Unlimited address space
-export RLIMIT_CPU=unlimited                      # Unlimited CPU time
-export RLIMIT_NOFILE=4096                        # Higher limit for browsers and test files
-export RLIMIT_NPROC=4096                         # High limit for parallel test workers and browser processes
-
-# Bubblewrap (sandbox) flags - filesystem bindings
-WRAPPER_FLAGS=(
-    --ro-bind /opt/cursor-agent /opt/cursor-agent
-    --bind "${HOME}/.cursor" "${HOME}/.cursor"
-    --bind "${HOME}/.config/cursor" "${HOME}/.config/cursor"
-    --bind "${HOME}/.local/share/cursor-agent" "${HOME}/.local/share/cursor-agent"
-)
+# Sandbox flags - filesystem bindings. Uses the OS-aware _wrapper_add_bind /
+# _wrapper_add_ro_bind helpers (ai_wrapper_data/ai_wrapper_lib.bash) rather
+# than hardcoding bwrap's 2-arg `--bind SRC DST` shape: sandbox-exec (macOS)
+# takes a single-arg `--bind SRC` and hard-errors on a stray second token.
+WRAPPER_FLAGS=()
+# /opt/cursor-agent is Linux-specific; macOS uses an app bundle or Homebrew
+# path. macOS backend hard-errors on missing bind sources, so guard it.
+[[ -d /opt/cursor-agent ]] && _wrapper_add_ro_bind /opt/cursor-agent
+_wrapper_add_bind "${HOME}/.cursor"
+_wrapper_add_bind "${HOME}/.config/cursor"
+_wrapper_add_bind "${HOME}/.local/share/cursor-agent"
 
 # Cursor Agent CLI flags - full autonomy within sandbox (no approvals needed)
 AGENT_FLAGS=(
     --force
 )
 
+check_agent_binary
+
 # Interactive session selection (only if no arguments provided and stdin/stdout are terminals)
 if [[ $# -eq 0 && -t 0 && -t 1 ]]; then
-    check_agent_binary
-    action=$(show_main_menu)
+    # Auto-load the per-workdir preset before the menu renders so restored
+    # AI_SANDBOX_* settings are visible in the settings table on first paint.
+    # Silent no-op when no preset file exists (first run).
+    _preset_autoload
+    show_main_menu
+    _preset_autosave
 
-    case "${action}" in
-        orchestrate|bulletproof)
-            run_orchestrated_session "${action}"
-            exit $?
+    case "${WRAPPER_MENU_CHOICE}" in
+        orchestrate)
+            run_orchestrated_session
+            _dispatch_rc=$?
             ;;
         *)
-            run_agent_session "${action}"
-            exit $?
+            run_agent_session "${WRAPPER_MENU_CHOICE}"
+            _dispatch_rc=$?
             ;;
     esac
+
+    exit "${_dispatch_rc}"
 fi
 
-# Non-interactive mode or with arguments
+# Non-interactive or argument pass-through. No menu runs, so load the
+# per-workdir preset (AI_SANDBOX_* flags) directly so a scripted invocation
+# still picks up settings saved from an earlier interactive session in this
+# workdir, instead of silently reverting to catalog defaults.
 # AI rules (AGENTS.md and CLAUDE.md) are bound by default in universal wrapper
+_preset_autoload
 run_sandboxed_agent "${AI_AGENT_COMMAND}" -- "${WRAPPER_FLAGS[@]}" -- "${AGENT_FLAGS[@]}" "$@"

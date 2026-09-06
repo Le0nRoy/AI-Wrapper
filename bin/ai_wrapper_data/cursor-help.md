@@ -9,16 +9,20 @@ optional orchestration workflows.
 Launches Cursor Agent with the `orchestrator-mode` skill pre-loaded as a system prompt.
 Use for multi-phase development workflows: plan → implement → test → review → merge.
 
-### 2) Start bulletproof
-Launches Cursor Agent with the `bulletproof` skill pre-loaded as a system prompt.
-Use for the 12-stage adaptive development workflow (research → spec → plan →
-implement → verify → review → deploy).
-
-### 3) Start new conversation
+### 2) Start new conversation
 Launches a plain Cursor Agent session with no additional system prompt.
 
-### 4) Resume from list
+### 3) Resume from list
 Resumes a previous Cursor Agent session (shows a session picker).
+
+### s) Settings
+Opens the toggle-and-edit sub-menu for the `AI_SANDBOX_*` sandbox flags
+(no "Account" section — account switching is Claude-only). Choices persist
+per-workdir via the same auto-save/auto-load mechanism as `c) Clear` below.
+
+### c) Clear saved settings for this workdir
+Removes the auto-saved settings preset for the current directory, resetting
+the menu to catalog defaults on the next open.
 
 ### h) Help
 Shows this help document.

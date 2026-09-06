@@ -9,7 +9,7 @@ AI_AGENT_COMMAND="codex"
 AI_SYSTEM_PROMPT_FLAG=""
 AI_RESUME_ARGS=(resume)
 
-WRAPPER_DATA_DIR="${WRAPPER_DATA_DIR:-$(dirname "${BASH_SOURCE[0]}")}"
+WRAPPER_DATA_DIR="${WRAPPER_DATA_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)}"
 WRAPPER_HELP="${WRAPPER_DATA_DIR}/codex-help.md"
 
 source "${WRAPPER_DATA_DIR}/ai_wrapper_lib.bash"
