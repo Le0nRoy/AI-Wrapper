@@ -1,0 +1,99 @@
+name: ci
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # Syntax + static analysis on both OSes. Running bash -n on macOS matters
+  # on its own: macOS ships bash 3.2 by default, and a construct that's
+  # valid on Linux's bash 5 (associative arrays, `${var,,}`, etc.) can be a
+  # syntax error there. Several comments across this repo call out bash 3.2
+  # compatibility explicitly — this is what actually enforces it.
+  lint:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      pull-requests: write
+      checks: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4
+
+      - name: Bash syntax check (this OS's native bash)
+        run: |
+          bash --version | head -1
+          find . \( -path './.git' -prune -o -path './worktrees' -prune \) -o \
+            \( \( -name '*.bash' -o -name '*.sh' \) -print \) \
+            | sort \
+            | xargs -I{} bash -n {}
+
+      - name: ShellCheck
+        if: matrix.os == 'ubuntu-latest'
+        uses: reviewdog/action-shellcheck@853366d6a4afe65985b8f9ba43924a4afc0a45c9  # v1.32.0
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          reporter: github-pr-review
+          level: warning
+          fail_level: warning
+          path: "."
+          pattern: "*.bash *.sh"
+          exclude: "./worktrees/*"
+
+  # Pure-logic tests: settings-catalog OS-scope filtering and the
+  # wrapper-help.md OS-conditional doc filter. No real sandbox launch, so
+  # these need no setup — but still run on both OSes since they exercise
+  # real bash string/array handling, not just the app logic.
+  logic-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4
+      - run: bash tests/test_catalog_os_scope.bash
+      - run: bash tests/test_help_doc_os_scope.bash
+
+  # Real bubblewrap smoke tests: actually launches sandboxed processes and
+  # asserts on real security properties (WORKDIR refusal, credential-path
+  # denial by default). This is what caught three real bugs during
+  # development (two unbound-variable crashes under `set -u`, one
+  # documented-vs-actual behavior gap in the SSH credential grant) that
+  # neither shellcheck nor bash -n would ever have found.
+  smoke-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4
+
+      - name: Install bubblewrap
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+
+      - name: Enable unprivileged user namespaces
+        # Some Ubuntu point releases restrict unprivileged userns by
+        # default (kernel.apparmor_restrict_unprivileged_userns=1), which
+        # bubblewrap needs disabled; separately, unprivileged_userns_clone
+        # itself must be 1. The wrapper checks both at launch and errors
+        # clearly if this step didn't take — see run_sandboxed_agent's
+        # pre-flight validation.
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
+          sysctl kernel.unprivileged_userns_clone
+
+      - run: bash tests/test_sandbox_common.bash
+
+  # macOS's built-in sandbox-exec needs no install step. Runs the same
+  # cross-platform smoke tests as Linux (run_sandboxed_agent dispatches on
+  # `uname -s` internally) plus the macOS-only DRYRUN/PROFILE tests.
+  smoke-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4
+      - run: bash tests/test_sandbox_common.bash
+      - run: bash tests/test_sandbox_macos_only.bash

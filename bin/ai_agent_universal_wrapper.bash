@@ -295,8 +295,11 @@ _run_sandboxed_agent_linux() {
             bwrap_args+=(--bind /run/tailscale/tailscaled.sock /run/tailscale/tailscaled.sock)
         fi
 
-        # Bind user runtime directory if it exists
-        if [[ -n "${XDG_RUNTIME_DIR}" && -d "${XDG_RUNTIME_DIR}" ]]; then
+        # Bind user runtime directory if it exists. XDG_RUNTIME_DIR is
+        # usually set by systemd-logind on desktop sessions but isn't
+        # guaranteed (CI runners, containers, non-desktop sessions) — guard
+        # with :- so a caller running under `set -u` doesn't crash here.
+        if [[ -n "${XDG_RUNTIME_DIR:-}" && -d "${XDG_RUNTIME_DIR}" ]]; then
             bwrap_args+=(--bind "${XDG_RUNTIME_DIR}" "${XDG_RUNTIME_DIR}")
             bwrap_args+=(--setenv XDG_RUNTIME_DIR "${XDG_RUNTIME_DIR}")
         fi
@@ -352,8 +355,8 @@ _run_sandboxed_agent_linux() {
     )
 
     # Pass through additional terminal-related variables if set (for better terminal support)
-    [[ -n "${COLORTERM}" ]] && bwrap_args+=(--setenv COLORTERM "${COLORTERM}")
-    [[ -n "${TERM_PROGRAM}" ]] && bwrap_args+=(--setenv TERM_PROGRAM "${TERM_PROGRAM}")
+    [[ -n "${COLORTERM:-}" ]] && bwrap_args+=(--setenv COLORTERM "${COLORTERM}")
+    [[ -n "${TERM_PROGRAM:-}" ]] && bwrap_args+=(--setenv TERM_PROGRAM "${TERM_PROGRAM}")
 
     # Pass through Docker environment variables and ~/.docker config if opted in
     if [[ "${pass_docker}" == "1" ]]; then
@@ -364,7 +367,7 @@ _run_sandboxed_agent_linux() {
     fi
 
     # Pass through kind environment variable if set (kind itself is unconditional, see .kind/kind_dot_kube binds above)
-    [[ -n "${KIND_EXPERIMENTAL_PROVIDER}" ]] && bwrap_args+=(--setenv KIND_EXPERIMENTAL_PROVIDER "${KIND_EXPERIMENTAL_PROVIDER}")
+    [[ -n "${KIND_EXPERIMENTAL_PROVIDER:-}" ]] && bwrap_args+=(--setenv KIND_EXPERIMENTAL_PROVIDER "${KIND_EXPERIMENTAL_PROVIDER}")
 
     # Pass through KUBECONFIG and bind ~/.kube if opted in
     if [[ "${pass_kube}" == "1" ]]; then
@@ -386,9 +389,15 @@ _run_sandboxed_agent_linux() {
         done < <(compgen -e 2>/dev/null || true)
     fi
 
-    # Pass through SSH agent socket and ~/.ssh if opted in
-    if [[ "${pass_ssh_agent}" == "1" && -n "${SSH_AUTH_SOCK:-}" && -S "${SSH_AUTH_SOCK}" ]]; then
-        bwrap_args+=(--bind "${SSH_AUTH_SOCK}" "${SSH_AUTH_SOCK}" --setenv SSH_AUTH_SOCK "${SSH_AUTH_SOCK}")
+    # Pass through SSH agent socket and ~/.ssh if opted in. These are two
+    # independent grants (catalog/help text: "passes SSH_AUTH_SOCK AND
+    # RO-grants ~/.ssh") — ~/.ssh must still be readable for direct
+    # private-key/known_hosts access even when no agent socket happens to
+    # be live, so it's not nested inside the socket-liveness check.
+    if [[ "${pass_ssh_agent}" == "1" ]]; then
+        if [[ -n "${SSH_AUTH_SOCK:-}" && -S "${SSH_AUTH_SOCK}" ]]; then
+            bwrap_args+=(--bind "${SSH_AUTH_SOCK}" "${SSH_AUTH_SOCK}" --setenv SSH_AUTH_SOCK "${SSH_AUTH_SOCK}")
+        fi
         [[ -d "${HOME_DIR}/.ssh" ]] && bwrap_args+=(--ro-bind "${HOME_DIR}/.ssh" "${HOME_DIR}/.ssh")
     fi
 
