@@ -213,7 +213,7 @@ fi
 # input prompt at the bottom, and rarer ones (debug) are at the top.
 _AI_SETTINGS_LIST=(
     # Debug
-    "AI_SANDBOX_DRYRUN|bool|0|info|Dry run — print plan, don't launch|Shows what would run (argv, env, profile) and exits|debug"
+    "AI_SANDBOX_DRYRUN|bool|0|info|Dry run — print plan, don't launch|Shows what would run (argv, env, profile) and exits|debug|darwin"
     "AI_SANDBOX_DEBUG|bool|0|info|Show verbose internal logging|For troubleshooting the wrapper itself — path-resolution details|debug"
 
     # Additional settings (env vars, profiles)
@@ -643,14 +643,52 @@ show_header() {
     fi
 }
 
+# Streams a markdown help file to stdout, dropping blocks wrapped in
+#   <!-- os:darwin --> ... <!-- os:end -->
+#   <!-- os:linux -->  ... <!-- os:end -->
+# whose OS doesn't match _wrapper_os. Lines outside any such block pass
+# through unchanged; the marker lines themselves are always stripped. Lets
+# one help file stay the single source for both platforms instead of
+# duplicating the shared sections, same motivation as the settings
+# catalog's OS_SCOPE field above.
+_render_os_conditional_doc() {
+    local file="${1}" os_want mode="show" line block_os
+    case "${_wrapper_os}" in
+        Darwin) os_want="darwin" ;;
+        Linux)  os_want="linux" ;;
+        *)      os_want="" ;;
+    esac
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        case "${line}" in
+            '<!-- os:end -->')
+                mode="show"
+                continue
+                ;;
+            '<!-- os:'*' -->')
+                block_os="${line#<!-- os:}"
+                block_os="${block_os% -->}"
+                if [[ "${block_os}" == "${os_want}" ]]; then
+                    mode="show"
+                else
+                    mode="hide"
+                fi
+                continue
+                ;;
+        esac
+        [[ "${mode}" == "show" ]] && printf '%s\n' "${line}"
+    done <"${file}"
+}
+
 display_help() {
     show_header
     if [[ -f "${WRAPPER_HELP}" ]]; then
         if command -v less &>/dev/null; then
             # -F: quit if content fits one screen; -X: don't clear the screen on exit.
-            less -FX "${WRAPPER_HELP}" </dev/tty >/dev/tty
+            # Process substitution (not a pipe) so less still gets a file-like
+            # input while its own stdin stays free for </dev/tty keypresses.
+            less -FX <(_render_os_conditional_doc "${WRAPPER_HELP}") </dev/tty >/dev/tty
         else
-            cat "${WRAPPER_HELP}" >/dev/tty
+            _render_os_conditional_doc "${WRAPPER_HELP}" >/dev/tty
         fi
     else
         echo "Wrapper for ${AI_WRAPPER_AGENT_NAME}" >/dev/tty
