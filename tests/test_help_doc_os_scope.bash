@@ -13,6 +13,8 @@ _help_dump() {
     (
         if [[ "${1}" == "darwin" ]]; then
             uname() { if [[ "${1:-}" == "-s" ]]; then echo Darwin; else command uname "$@"; fi; }
+        elif [[ "${1}" == "linux" ]]; then
+            uname() { if [[ "${1:-}" == "-s" ]]; then echo Linux; else command uname "$@"; fi; }
         fi
         # shellcheck source=../bin/ai_wrapper_data/ai_wrapper_lib.bash
         source "${REPO_ROOT}/bin/ai_wrapper_data/ai_wrapper_lib.bash"

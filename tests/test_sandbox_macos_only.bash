@@ -38,6 +38,7 @@ echo "== macOS-only sandbox tests =="
 MARKER="${FAKE_HOME}/should-not-exist"
 out="$(cd "${FAKE_HOME}/project" && AI_SANDBOX_DRYRUN=1 run_sandboxed_agent /usr/bin/touch -- -- "${MARKER}" 2>&1)"
 rc=$?
+echo "  (DRYRUN output: ${out})"
 assert_eq "${rc}" "0" "AI_SANDBOX_DRYRUN=1 exits 0"
 if [[ -e "${MARKER}" ]]; then
     _test_report 0 "AI_SANDBOX_DRYRUN=1 does not actually launch the command"
@@ -51,9 +52,11 @@ BAD_PROFILE="${FAKE_HOME}/bad.sb"
 printf '; a profile missing the required header entirely\n(allow file-read*)\n' >"${BAD_PROFILE}"
 
 out="$(cd "${FAKE_HOME}/project" && AI_SANDBOX_PROFILE="${BAD_PROFILE}" run_sandboxed_agent /bin/echo -- -- hi 2>&1)"
+echo "  (bad-profile launch output: ${out})"
 assert_contains "${out}" "lacks (version 1) and/or (deny default)" "malformed custom profile is rejected with the documented message"
 
 out_trusted="$(cd "${FAKE_HOME}/project" && AI_SANDBOX_PROFILE="${BAD_PROFILE}" AI_SANDBOX_PROFILE_TRUST_ME=1 run_sandboxed_agent /bin/echo -- -- hi 2>&1)"
+echo "  (bad-profile + TRUST_ME launch output: ${out_trusted})"
 assert_not_contains "${out_trusted}" "lacks (version 1) and/or (deny default)" "AI_SANDBOX_PROFILE_TRUST_ME=1 bypasses the header check"
 
 tests_summary_and_exit

@@ -231,11 +231,15 @@ _run_sandboxed_agent_linux() {
         --ro-bind /bin /bin
         --ro-bind /lib /lib
         --ro-bind /lib64 /lib64
+        # /etc is bound wholesale below, which already covers ssl/hosts/
+        # resolv.conf/nsswitch.conf — separate --ro-bind entries for those
+        # used to exist here too. They were pure dead weight when the path
+        # existed (already covered by the /etc bind) and a hard sandbox-
+        # launch failure when it didn't (e.g. a minimal container without
+        # /etc/ssl) — bwrap errors on a missing bind source regardless of
+        # whether a parent directory was already bound. Confirmed via a
+        # real Ubuntu 24.04 + bubblewrap 0.9.0 repro.
         --ro-bind /etc /etc
-        --ro-bind /etc/ssl /etc/ssl
-        --ro-bind /etc/hosts /etc/hosts
-        --ro-bind /etc/resolv.conf /etc/resolv.conf
-        --ro-bind /etc/nsswitch.conf /etc/nsswitch.conf
         # Virtual filesystems
         --tmpfs /tmp
         --tmpfs /var
@@ -347,7 +351,7 @@ _run_sandboxed_agent_linux() {
     bwrap_args+=(
         --clearenv
         --setenv HOME "${HOME_DIR}"
-        --setenv USER "${USER}"
+        --setenv USER "${USER:-$(id -un)}"
         --setenv PATH "${HOME_DIR}/bin:/usr/bin:/usr/sbin:/bin:/sbin"
         --setenv LANG "${LANG:-en_US.UTF-8}"
         --setenv TERM "${TERM:-xterm-256color}"

@@ -33,9 +33,17 @@ trap cleanup EXIT
 
 echo "== sandbox smoke tests ($(uname -s)) =="
 
+# Every real-launch assertion below prints its captured output
+# unconditionally (not just on failure): a bare "expected [0], got [1]"
+# with the actual bwrap/sandbox-exec stderr swallowed makes CI failures
+# opaque — this was the exact gap that made two earlier real bugs on this
+# sandbox path (a redundant, hard-failing bind mount; an unbound $USER
+# under `set -u`) invisible in initial CI runs.
+
 # --- a benign command actually runs inside the sandbox ---
 out="$(cd "${FAKE_HOME}/project" && run_sandboxed_agent /bin/echo -- -- ci-smoke-test-ok 2>&1)"
 rc=$?
+echo "  (benign command output: ${out})"
 assert_eq "${rc}" "0" "benign command exits 0"
 assert_contains "${out}" "ci-smoke-test-ok" "benign command's stdout reaches the caller"
 
@@ -52,6 +60,7 @@ assert_eq "${rc}" "1" "launching from a dotfile dir directly under \$HOME is ref
 # --- the refusal has an escape hatch, and it actually works ---
 out="$(cd "${FAKE_HOME}" && AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 run_sandboxed_agent /bin/echo -- -- hi 2>&1)"
 rc=$?
+echo "  (override-launch output: ${out})"
 assert_eq "${rc}" "0" "AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 overrides the \$HOME refusal"
 
 # --- credentials are denied by default, and the matching PASS_* flag opts back in ---
@@ -62,6 +71,7 @@ out="$(cd "${FAKE_HOME}/project" && run_sandboxed_agent /bin/cat -- -- "${FAKE_H
 assert_not_contains "${out}" "TOTALLY-SECRET-KEY-MATERIAL" "~/.ssh is NOT readable by default"
 
 out="$(cd "${FAKE_HOME}/project" && AI_SANDBOX_PASS_SSH_AGENT=1 run_sandboxed_agent /bin/cat -- -- "${FAKE_HOME}/.ssh/id_rsa" 2>&1)"
+echo "  (PASS_SSH_AGENT launch output: ${out})"
 assert_contains "${out}" "TOTALLY-SECRET-KEY-MATERIAL" "AI_SANDBOX_PASS_SSH_AGENT=1 grants ~/.ssh read access"
 
 tests_summary_and_exit
