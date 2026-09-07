@@ -652,31 +652,18 @@ show_header() {
 # duplicating the shared sections, same motivation as the settings
 # catalog's OS_SCOPE field above.
 _render_os_conditional_doc() {
-    local file="${1}" os_want mode="show" line block_os
+    local os_want
     case "${_wrapper_os}" in
         Darwin) os_want="darwin" ;;
         Linux)  os_want="linux" ;;
         *)      os_want="" ;;
     esac
-    while IFS= read -r line || [[ -n "${line}" ]]; do
-        case "${line}" in
-            '<!-- os:end -->')
-                mode="show"
-                continue
-                ;;
-            '<!-- os:'*' -->')
-                block_os="${line#<!-- os:}"
-                block_os="${block_os% -->}"
-                if [[ "${block_os}" == "${os_want}" ]]; then
-                    mode="show"
-                else
-                    mode="hide"
-                fi
-                continue
-                ;;
-        esac
-        [[ "${mode}" == "show" ]] && printf '%s\n' "${line}"
-    done <"${file}"
+    awk -v os="${os_want}" '
+        BEGIN                        { show=1 }
+        /^<!-- os:end -->$/          { show=1; next }
+        /^<!-- os:[^ ]+ -->$/        { show=($0 == "<!-- os:" os " -->"); next }
+        show                         { print }
+    ' "${1}"
 }
 
 display_help() {
