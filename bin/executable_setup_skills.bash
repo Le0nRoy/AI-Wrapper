@@ -175,4 +175,6 @@ done
 echo ""
 echo "Copied: ${copied}, Updated: ${updated}, Replaced: ${replaced}, Skipped: ${skipped}"
 
-[[ "${dry}" -eq 1 ]] && echo "(dry run — no changes made)"
+if [[ "${dry}" -eq 1 ]]; then
+    echo "(dry run — no changes made)"
+fi
