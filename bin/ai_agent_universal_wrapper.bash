@@ -331,9 +331,9 @@ _run_sandboxed_agent_linux() {
         bwrap_args+=(--bind "${HOME_DIR}/bin" "${HOME_DIR}/bin")
     fi
 
-    # Add ~/bin directory if it exists (for kind, kubectl, and other user binaries)
-    if [[ -d "${HOME_DIR}/.agents" ]]; then
-        bwrap_args+=(--bind "${HOME_DIR}/.agents" "${HOME_DIR}/.agents")
+    # Add ~/ai-wrapper/.agents directory if it exists (agent skills content)
+    if [[ -d "${HOME_DIR}/ai-wrapper/.agents" ]]; then
+        bwrap_args+=(--bind "${HOME_DIR}/ai-wrapper/.agents" "${HOME_DIR}/ai-wrapper/.agents")
     fi
 
 

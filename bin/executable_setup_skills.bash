@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
-# Copy the skills deployed to ~/.agents/skills/ into ~/.claude/skills/ so
-# Claude Code can discover them. Existing entries in ~/.claude/skills/ are
-# left untouched — this script never overwrites a non-managed directory, and
-# only refreshes copies that carry our marker file (.setup_skills_managed).
+# Copy the skills deployed to ~/ai-wrapper/.agents/skills/ into
+# ~/.claude/skills/ so Claude Code can discover them. Existing entries in
+# ~/.claude/skills/ are left untouched — this script never overwrites a
+# non-managed directory, and only refreshes copies that carry our marker
+# file (.setup_skills_managed).
 #
 # Why copies (not symlinks): the sandboxed wrapper binds ~/.claude RW but not
-# ~/.agents. macOS sandbox-exec resolves file rules against the canonical
-# real path, so a symlink at ~/.claude/skills/foo -> ~/.agents/skills/foo is
-# read-denied. Plain copies live inside the already-bound ~/.claude tree and
-# work regardless of sandboxing.
+# ~/ai-wrapper/.agents. macOS sandbox-exec resolves file rules against the
+# canonical real path, so a symlink at
+# ~/.claude/skills/foo -> ~/ai-wrapper/.agents/skills/foo is read-denied.
+# Plain copies live inside the already-bound ~/.claude tree and work
+# regardless of sandboxing.
 #
 # Usage:
 #   ./setup_skills.bash            # copy missing skills, refresh managed ones
@@ -17,14 +19,15 @@
 
 set -u -o pipefail
 
-SKILLS_SRC="${HOME}/.agents/skills"
+SKILLS_SRC="${HOME}/ai-wrapper/.agents/skills"
 SKILLS_DST="${HOME}/.claude/skills"
 MARKER=".setup_skills_managed"
 
 print_help() {
     cat <<'EOF'
-Copy the skills deployed to ~/.agents/skills/ into ~/.claude/skills/ so
-Claude Code can discover them. A marker file (.setup_skills_managed) inside
+Copy the skills deployed to ~/ai-wrapper/.agents/skills/ into
+~/.claude/skills/ so Claude Code can discover them. A marker file
+(.setup_skills_managed) inside
 each copy records its source path so future runs can refresh the copy in
 place without clobbering user-managed directories.
 
