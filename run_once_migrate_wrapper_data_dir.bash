@@ -4,4 +4,6 @@
 # this one-time script cleans it up on the next `chezmoi apply`.
 
 OLD_DIR="${HOME}/bin/claude_wrapper_data"
-[[ -d "${OLD_DIR}" ]] && rm -rf "${OLD_DIR}"
+if [[ -d "${OLD_DIR}" ]]; then
+    rm -rf "${OLD_DIR}"
+fi
