@@ -68,6 +68,7 @@ mkdir -p "${FAKE_HOME}/.ssh"
 echo "TOTALLY-SECRET-KEY-MATERIAL" >"${FAKE_HOME}/.ssh/id_rsa"
 
 out="$(cd "${FAKE_HOME}/project" && run_sandboxed_agent /bin/cat -- -- "${FAKE_HOME}/.ssh/id_rsa" 2>&1)"
+echo "  (default-launch ~/.ssh read attempt output: ${out})"
 assert_not_contains "${out}" "TOTALLY-SECRET-KEY-MATERIAL" "~/.ssh is NOT readable by default"
 
 out="$(cd "${FAKE_HOME}/project" && AI_SANDBOX_PASS_SSH_AGENT=1 run_sandboxed_agent /bin/cat -- -- "${FAKE_HOME}/.ssh/id_rsa" 2>&1)"

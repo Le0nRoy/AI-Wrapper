@@ -164,8 +164,8 @@ _run_sandboxed_agent_impl() {
         resolved_home="$(_realpath "${HOME}")" || resolved_home="${HOME%/}"
         resolved_home="${resolved_home%/}"
     fi
-    if [[ -n "${resolved_home}" && "${resolved_workdir}" == "${resolved_home}" ]]; then
-        echo_log "ERROR" "[${tag}] Refusing to sandbox with WORKDIR=\$HOME (${HOME}); that would grant RW on the entire home directory. cd into a subdirectory first."
+    if [[ "${AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR:-}" != "1" && -n "${resolved_home}" && "${resolved_workdir}" == "${resolved_home}" ]]; then
+        echo_log "ERROR" "[${tag}] Refusing to sandbox with WORKDIR=\$HOME (${HOME}); that would grant RW on the entire home directory. cd into a subdirectory first, or set AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 to override."
         return 1
     fi
     # Refuse WORKDIRs that sit on top of well-known credential / browser-data
