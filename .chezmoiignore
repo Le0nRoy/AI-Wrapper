@@ -10,3 +10,8 @@
 README.md
 docs/
 TODO.md
+
+# Local git worktrees for feature-branch dev work — untracked by git, but
+# chezmoi walks the filesystem, not the git index, so without this it finds
+# and re-executes their run_ scripts as if they were real deployment sources.
+worktrees/
