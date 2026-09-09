@@ -24,7 +24,15 @@ source "${REPO_ROOT}/bin/ai_agent_universal_wrapper.bash"
 # Isolated fake HOME: never touches the real machine, and makes every
 # "if [[ -d "${HOME_DIR}/X" ]]" optional bind in the wrapper a no-op unless
 # a test below explicitly creates that path.
-FAKE_HOME="$(mktemp -d)"
+#
+# Rooted under the real $HOME rather than the default mktemp -d location.
+# On macOS ${TMPDIR:-/tmp} resolves to /private/var/folders/…/T (the
+# DARWIN_USER_TEMP_DIR) or /private/tmp — both of which the SBPL profile
+# grants file* on as subpaths. A fake HOME placed there gets whole-subtree
+# RW inside the sandbox, transitively covering the fake ~/.ssh/id_rsa and
+# defeating the credential-fence assertion below. Real $HOME sits outside
+# every file* subpath grant on both OSes.
+FAKE_HOME="$(mktemp -d "${HOME}/ai-wrapper-test.XXXXXX")"
 export HOME="${FAKE_HOME}"
 mkdir -p "${FAKE_HOME}/project"
 
