@@ -40,6 +40,28 @@ source "$(dirname "${BASH_SOURCE[0]}")/ai_agent_universal_wrapper.bash"
 # Requires `chezmoi apply` to have been run — if source fails, the wrapper is not yet deployed.
 source "$(dirname "${BASH_SOURCE[0]}")/ai_wrapper_data/claude_wrapper_lib.bash"
 
+# Downstream extension hook. If AI_WRAPPER_EXTRA_PROFILE points at a bash
+# file, source it once here so a proprietary / per-machine / corporate-policy
+# integrator can extend the sandbox without patching this file. The plugin
+# can define one or more callbacks that fire later:
+#   _extra_sandbox_setup   — before binds are baked into the SBPL / bwrap
+#                            profile (mutate binds_rw / binds_ro / binds_meta
+#                            on Darwin, bwrap_args on Linux, env_allowlist
+#                            either OS).
+#   _extra_post_menu_setup — after the interactive menu, before dispatch
+#                            (mutate AGENT_FLAGS / AI_SANDBOX_PROFILE / any
+#                            env-var toggle the plugin cares about).
+# Zero behavior change when the env var is unset. Auditable at
+# `env | grep AI_WRAPPER`.
+if [[ -n "${AI_WRAPPER_EXTRA_PROFILE:-}" ]]; then
+    if [[ -f "${AI_WRAPPER_EXTRA_PROFILE}" ]]; then
+        # shellcheck source=/dev/null
+        source "${AI_WRAPPER_EXTRA_PROFILE}"
+    else
+        echo "WARN: AI_WRAPPER_EXTRA_PROFILE=${AI_WRAPPER_EXTRA_PROFILE} not found; ignoring." >&2
+    fi
+fi
+
 # Rlimit enforcement was dropped 2026-09 (see the header comment in
 # ai_agent_universal_wrapper.bash) — the user accepts the risk of unbounded
 # CPU / memory / file-descriptor / process consumption by the sandboxed
@@ -264,6 +286,14 @@ if [[ $# -eq 0 && -t 0 && -t 1 ]]; then
     _bind_claude_account
     _apply_post_menu_binds
 
+    # Plugin post-menu hook: downstream extensions (loaded via
+    # AI_WRAPPER_EXTRA_PROFILE) can mutate AGENT_FLAGS / AI_SANDBOX_PROFILE /
+    # env-var toggles here, after the menu but before dispatch. Runs when
+    # defined; a bare wrapper without the hook is a no-op.
+    if declare -f _extra_post_menu_setup >/dev/null 2>&1; then
+        _extra_post_menu_setup
+    fi
+
     case "${WRAPPER_MENU_CHOICE}" in
         orchestrate)
             run_orchestrated_session
@@ -286,4 +316,9 @@ fi
 _preset_autoload
 _bind_claude_account
 _apply_post_menu_binds
+# Non-interactive plugin hook: same contract as the interactive path above
+# so scripted invocations pick up plugin post-menu mutations too.
+if declare -f _extra_post_menu_setup >/dev/null 2>&1; then
+    _extra_post_menu_setup
+fi
 run_sandboxed_agent "${AI_AGENT_COMMAND}" -- "${WRAPPER_FLAGS[@]}" -- "${AGENT_FLAGS[@]}" "$@"
