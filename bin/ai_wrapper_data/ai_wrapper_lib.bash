@@ -195,22 +195,35 @@ _check_workdir_breadth() {
 #              changes. Used for settings whose backend is only
 #              implemented on one OS today (see _AI_SETTINGS_LIST filtering
 #              right after this array literal).
+# Per-OS text fragments for catalog entries that are shown on every OS but
+# describe an OS-specific mechanic. Computed once here (from the _wrapper_os
+# set above) rather than re-checking `uname` per entry. Entries that are
+# ENTIRELY OS-specific (no backend at all on the other OS) use the OS_SCOPE
+# 8th field instead — see AI_SANDBOX_PROFILE* and the darwin-only rows below.
+if [[ "${_wrapper_os}" == "Darwin" ]]; then
+    _ai_sensitive_workdir_extra=", ~/Library"
+    _ai_gitlab_bind_note="RO-binds ~/Library/Application Support/glab-cli"
+else
+    _ai_sensitive_workdir_extra=""
+    _ai_gitlab_bind_note="RO-binds the XDG glab-cli config paths (~/.config/glab-cli, ~/.local/share/glab-cli)"
+fi
+
 # Order here is the display order in both views; categories are
 # arranged so the most frequently used (networking) sits closest to the
 # input prompt at the bottom, and rarer ones (debug) are at the top.
 _AI_SETTINGS_LIST=(
     # Debug
-    "AI_SANDBOX_DRYRUN|bool|0|info|Dry run — print plan, don't launch|Shows what would run (argv, env, profile) and exits|debug"
+    "AI_SANDBOX_DRYRUN|bool|0|info|Dry run — print plan, don't launch|Shows what would run (argv, env, profile) and exits|debug|darwin"
     "AI_SANDBOX_DEBUG|bool|0|info|Show verbose internal logging|For troubleshooting the wrapper itself — path-resolution details|debug"
 
     # Additional settings (env vars, profiles)
     "AI_SANDBOX_PASS_ENV|str||red|Pass extra env vars by name|Comma-separated list of variable names to share (advanced)|additional"
-    "AI_SANDBOX_PROFILE|path||red|Custom sandbox profile override|Path to a custom SBPL file. Default: ai_wrapper_data/claude_wrapper.sb. Set only if you have a custom restrictions file.|additional"
-    "AI_SANDBOX_PROFILE_TRUST_ME|bool|0|red|Skip safety check on custom profile|Bypasses the (version 1) + (deny default) validation. Set only if your profile intentionally relaxes the sandbox.|additional"
+    "AI_SANDBOX_PROFILE|path||red|Custom sandbox profile override|Path to a custom SBPL file. Default: ai_wrapper_data/claude_wrapper.sb. Set only if you have a custom restrictions file.|additional|darwin"
+    "AI_SANDBOX_PROFILE_TRUST_ME|bool|0|red|Skip safety check on custom profile|Bypasses the (version 1) + (deny default) validation. Set only if your profile intentionally relaxes the sandbox.|additional|darwin"
 
     # Sensitive directories
-    "AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR|bool|0|red|Allow launch from sensitive dirs|Permits launching from \$HOME itself, a dotfile dir directly under \$HOME, or a top-level system directory (plus ~/Library on macOS) — the write fence then grants RW there, which likely exposes credentials|sensitive"
-    "AI_SANDBOX_ALLOW_RO_HOMEDIR|bool|0|yellow|Share home directory (read-only)|(macOS only) Agent can read everything in \$HOME except credentials|sensitive|darwin"
+    "AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR|bool|0|red|Allow launch from sensitive dirs|Permits launching from \$HOME itself, a dotfile dir directly under \$HOME${_ai_sensitive_workdir_extra}, or a top-level system directory — the write fence then grants RW there, which likely exposes credentials|sensitive"
+    "AI_SANDBOX_ALLOW_RO_HOMEDIR|bool|0|yellow|Share home directory (read-only)|Agent can read everything in \$HOME except credentials|sensitive|darwin"
 
     # Credentials
     "AI_SANDBOX_ALLOW_RO_CREDENTIALS|bool|0|red|Let agent read residual credential files|Includes ~/.config/gcloud, ~/.gnupg, ~/.netrc, ~/.npmrc, ~/.pypirc. ~/.ssh, ~/.aws, ~/.kube, ~/.docker are gated by their matching PASS_* setting instead.|credentials"
@@ -218,14 +231,15 @@ _AI_SETTINGS_LIST=(
     "AI_SANDBOX_PASS_KUBE|bool|0|red|Share Kubernetes context + ~/.kube|Passes KUBECONFIG / KUBE_EDITOR and RO-grants ~/.kube; agent reads cluster certs/tokens and can deploy to your clusters|credentials"
     "AI_SANDBOX_PASS_AWS|bool|0|red|Share AWS credentials + ~/.aws|Passes all AWS_* env vars and RO-grants ~/.aws — agent has full AWS account access|credentials"
     "AI_SANDBOX_PASS_GH|bool|0|red|Share GitHub token|Passes GITHUB_TOKEN / GH_TOKEN; agent can push to your repos|credentials"
-    "AI_SANDBOX_PASS_GITLAB|bool|0|red|Share GitLab token + glab config|Passes GITLAB_TOKEN / CI_JOB_TOKEN env vars AND RO-binds ~/Library/Application Support/glab-cli and the XDG glab-cli paths so glab reads its on-disk token. Agent can push to your repos.|credentials"
+    "AI_SANDBOX_PASS_GITLAB|bool|0|red|Share GitLab token + glab config|Passes GITLAB_TOKEN / CI_JOB_TOKEN env vars AND ${_ai_gitlab_bind_note} so glab reads its on-disk token. Agent can push to your repos.|credentials"
     "AI_SANDBOX_PASS_OPENAI|bool|0|red|Share OpenAI credentials|Passes all OPENAI_* env vars (advanced)|credentials"
 
     # Networking (localhost, local docker)
-    "AI_SANDBOX_BLOCK_LOCALHOST|bool|0|info|Block localhost network access|(macOS only) Denies network access to services running on your own machine|networking|darwin"
+    "AI_SANDBOX_BLOCK_LOCALHOST|bool|0|info|Block localhost network access|Denies network access to services running on your own machine|networking|darwin"
     "AI_SANDBOX_ALLOW_DOCKER|bool|0|red|Mount Docker / Colima socket|RW on /var/run/docker.sock, ~/.colima, ~/.docker. With the daemon running this is a full sandbox escape: agent can launch privileged containers and obtain host root. Off by default — opt in only when the session needs docker.|networking"
     "AI_SANDBOX_PASS_DOCKER|bool|0|red|Share Docker client env vars + ~/.docker|Passes DOCKER_HOST, DOCKER_CONFIG, DOCKER_CERT_PATH, DOCKER_BUILDKIT and RO-grants ~/.docker (registry auth tokens). Pair with 'Mount Docker / Colima socket' to actually talk to the daemon.|networking"
 )
+unset _ai_sensitive_workdir_extra _ai_gitlab_bind_note
 
 # OS-scope filtering: drop catalog rows whose trailing OS_SCOPE field
 # doesn't match the current OS, so a setting with no backend on this OS
@@ -629,14 +643,39 @@ show_header() {
     fi
 }
 
+# Streams a markdown help file to stdout, dropping blocks wrapped in
+#   <!-- os:darwin --> ... <!-- os:end -->
+#   <!-- os:linux -->  ... <!-- os:end -->
+# whose OS doesn't match _wrapper_os. Lines outside any such block pass
+# through unchanged; the marker lines themselves are always stripped. Lets
+# one help file stay the single source for both platforms instead of
+# duplicating the shared sections, same motivation as the settings
+# catalog's OS_SCOPE field above.
+_render_os_conditional_doc() {
+    local os_want
+    case "${_wrapper_os}" in
+        Darwin) os_want="darwin" ;;
+        Linux)  os_want="linux" ;;
+        *)      os_want="" ;;
+    esac
+    awk -v os="${os_want}" '
+        BEGIN                        { show=1 }
+        /^<!-- os:end -->$/          { show=1; next }
+        /^<!-- os:[^ ]+ -->$/        { show=($0 == "<!-- os:" os " -->"); next }
+        show                         { print }
+    ' "${1}"
+}
+
 display_help() {
     show_header
     if [[ -f "${WRAPPER_HELP}" ]]; then
         if command -v less &>/dev/null; then
             # -F: quit if content fits one screen; -X: don't clear the screen on exit.
-            less -FX "${WRAPPER_HELP}" </dev/tty >/dev/tty
+            # Process substitution (not a pipe) so less still gets a file-like
+            # input while its own stdin stays free for </dev/tty keypresses.
+            less -FX <(_render_os_conditional_doc "${WRAPPER_HELP}") </dev/tty >/dev/tty
         else
-            cat "${WRAPPER_HELP}" >/dev/tty
+            _render_os_conditional_doc "${WRAPPER_HELP}" >/dev/tty
         fi
     else
         echo "Wrapper for ${AI_WRAPPER_AGENT_NAME}" >/dev/tty

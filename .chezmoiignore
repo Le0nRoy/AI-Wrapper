@@ -10,3 +10,13 @@
 README.md
 docs/
 TODO.md
+LICENSE
+
+# CI / dev infrastructure — not deployed to ~/
+.github/
+tests/
+
+# Local git worktrees for feature-branch dev work — untracked by git, but
+# chezmoi walks the filesystem, not the git index, so without this it finds
+# and re-executes their run_ scripts as if they were real deployment sources.
+worktrees/

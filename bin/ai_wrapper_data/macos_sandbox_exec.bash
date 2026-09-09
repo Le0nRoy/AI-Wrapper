@@ -115,15 +115,19 @@ _run_sandboxed_agent_impl() {
     # Profile selection:
     #   AI_SANDBOX_PROFILE (env)  — explicit override; absolute or relative
     #                               to the universal wrapper's directory.
-    #   default                   — ai_wrapper_data/claude_wrapper.sb
+    #   default                   — claude_wrapper.sb, next to this file
     # The path is canonicalized via _realpath so symlinked wrappers still find
-    # the profile next to the real file.
+    # the profile next to the real file. wrapper_dir already IS
+    # ai_wrapper_data/ (dirname of this file, which lives there) — the
+    # default used to append "ai_wrapper_data/" again on top of that,
+    # producing .../ai_wrapper_data/ai_wrapper_data/claude_wrapper.sb and a
+    # "Sandbox profile not found" hard failure on every launch.
     local wrapper_dir
     if ! wrapper_dir="$(_realpath "$(dirname "${BASH_SOURCE[0]}")")" || [[ -z "${wrapper_dir}" ]]; then
         echo_log "ERROR" "[${tag}] Could not resolve wrapper directory."
         return 1
     fi
-    local profile_path="${AI_SANDBOX_PROFILE:-${wrapper_dir}/ai_wrapper_data/claude_wrapper.sb}"
+    local profile_path="${AI_SANDBOX_PROFILE:-${wrapper_dir}/claude_wrapper.sb}"
     [[ "${profile_path}" != /* ]] && profile_path="${wrapper_dir}/${profile_path}"
     if [[ ! -f "${profile_path}" ]]; then
         echo_log "ERROR" "[${tag}] Sandbox profile not found: ${profile_path}"
@@ -160,8 +164,8 @@ _run_sandboxed_agent_impl() {
         resolved_home="$(_realpath "${HOME}")" || resolved_home="${HOME%/}"
         resolved_home="${resolved_home%/}"
     fi
-    if [[ -n "${resolved_home}" && "${resolved_workdir}" == "${resolved_home}" ]]; then
-        echo_log "ERROR" "[${tag}] Refusing to sandbox with WORKDIR=\$HOME (${HOME}); that would grant RW on the entire home directory. cd into a subdirectory first."
+    if [[ "${AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR:-}" != "1" && -n "${resolved_home}" && "${resolved_workdir}" == "${resolved_home}" ]]; then
+        echo_log "ERROR" "[${tag}] Refusing to sandbox with WORKDIR=\$HOME (${HOME}); that would grant RW on the entire home directory. cd into a subdirectory first, or set AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 to override."
         return 1
     fi
     # Refuse WORKDIRs that sit on top of well-known credential / browser-data

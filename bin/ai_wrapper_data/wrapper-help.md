@@ -24,17 +24,22 @@ The sandbox bounds *writes* — it does not bound *reads* or *network*. Be aware
   the working directory and execute it; the child inherits the sandbox, so this
   is not an escape, but "sandboxed" is not the same as "cannot run code".
 - **WORKDIR is the write fence.** Launch from a project directory. The wrapper
-  refuses `/`, `$HOME`, top-level system paths, dotfile dirs under HOME, and
-  anything under `~/Library`. cd somewhere narrow before starting if you care
-  about the blast radius.
+  refuses `/`, `$HOME`, top-level system paths, and dotfile dirs under HOME.
+<!-- os:darwin -->
+  It also refuses anything under `~/Library`.
+<!-- os:end -->
+  cd somewhere narrow before starting if you care about the blast radius.
 - **`--dangerously-skip-permissions` is on by design** because the sandbox is
   the fence. If you loosen the sandbox profile, reconsider that flag.
 
 ## Environment variables
 
-- `AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1` — override the refusal to launch from
-  HOME dotfile dirs or `~/Library`. Use only when you're deliberately editing
-  one of those locations and accept the wider write fence.
+- `AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1` — override the refusal to launch
+  from HOME dotfile dirs. Use only when you're deliberately editing one of
+  those locations and accept the wider write fence.
+<!-- os:darwin -->
+  Also covers `~/Library`.
+
 - `AI_SANDBOX_ALLOW_RO_HOMEDIR=1` — widen the read allowlist to `$HOME`
   except the credential exclusions in the SBPL profile (the 9 credential
   dotfiles, `~/Library/Keychains`, `~/Library/{Messages, Mail, Cookies}`,
@@ -44,22 +49,25 @@ The sandbox bounds *writes* — it does not bound *reads* or *network*. Be aware
   most of `$HOME`** — see the README's S10.2 entry for the complete
   exclusion list, and add any extra browser/chat vendor you care about
   to the `(require-not …)` chain in `ai_wrapper_data/claude_wrapper.sb`
-  before relying on the flag.
+  before relying on the flag. macOS only — no Linux backend.
+<!-- os:end -->
 - `AI_SANDBOX_ALLOW_RO_CREDENTIALS=1` — widen the read allowlist to the
   residual credential subdirs/files without a dedicated `PASS_*` flag
   (~/.config/gcloud, ~/.gnupg, ~/.netrc, ~/.npmrc, ~/.pypirc). The
   per-service cred dirs (~/.ssh, ~/.aws, ~/.kube, ~/.docker) are
   enabled by their matching `AI_SANDBOX_PASS_*` flag instead. Red banner.
+<!-- os:darwin -->
 - `AI_SANDBOX_PROFILE=<path>` — point at an alternative SBPL profile (absolute
   path, or relative to the universal wrapper's directory). Replaces the base
   profile entirely; per-call `--bind` rules are still appended. The wrapper
   refuses to load a profile that lacks `(version 1)` and `(deny default)` in
   its first 80 non-comment lines (post-WS3 sanity check; closes U-C). Set
   `AI_SANDBOX_PROFILE_TRUST_ME=1` to bypass the check — required only for
-  legitimately permissive profiles, red banner.
+  legitimately permissive profiles, red banner. macOS only — bwrap has no
+  equivalent profile-file mechanism.
 - `AI_SANDBOX_DRYRUN=1` — print the resolved sandbox-exec argv, the post-scrub
   child environment, and the rendered SBPL profile, then exit. Nothing
-  launches.
+  launches. macOS only — not yet implemented on the bwrap backend.
 - `AI_SANDBOX_BLOCK_LOCALHOST=1` — emit SBPL `(deny network-outbound (remote
   ip "localhost:*"))` and the symmetric inbound rule. Blocks IPv4 + IPv6
   loopback (sandbox-exec resolves "localhost" to both). Off by default so
@@ -68,18 +76,28 @@ The sandbox bounds *writes* — it does not bound *reads* or *network*. Be aware
   caveat:** the flag is IP-only. Unix-domain sockets
   (`/var/run/docker.sock`, `~/.colima/*.sock`) and link-local addresses
   (AWS IMDS at `169.254.169.254`) are **not** covered — fence those at
-  the network or firewall layer if they matter.
+  the network or firewall layer if they matter. macOS only — no Linux
+  backend.
+<!-- os:end -->
 - `AI_SANDBOX_ALLOW_DOCKER=1` — emit RW rules for
   `/var/run/docker.sock`, `~/.colima`, `~/.docker`. **Off by default.**
   **WARNING:** when on and the Docker / Colima daemon is running, the
   agent can `docker run -v /:/host --privileged` to obtain root on the
   host filesystem — a full sandbox escape. Set to `1` only when the
   session legitimately needs `docker` from inside the sandbox.
+<!-- os:darwin -->
 - `--ro-bind SRC` adds a read-allowlist rule for SRC (single positional
   argument post-WS1; no DST — sandbox-exec cannot remap paths). The source
   path must exist at launch — a missing source is a hard error (exit 1),
   not a silent skip. This matches `--bind` strictness and prevents
   typo-induced silent failures.
+<!-- os:end -->
+<!-- os:linux -->
+- `--bind SRC DST` / `--ro-bind SRC DST` (two positional arguments) adds a
+  bind mount from SRC to DST inside the sandbox — bubblewrap can remap
+  paths, unlike sandbox-exec. The source path must exist at launch — a
+  missing source is a hard error (exit 1), not a silent skip.
+<!-- os:end -->
 
 ### Env scrubbing (Phase 1, 2026-05-24)
 
@@ -109,17 +127,25 @@ Red-banner opt-ins (raw credential material):
   `~/.aws` (shared credentials file).
 - `AI_SANDBOX_PASS_GH=1` — pass `GITHUB_TOKEN`, `GH_TOKEN`.
 - `AI_SANDBOX_PASS_GITLAB=1` — pass `GITLAB_TOKEN`, `CI_JOB_TOKEN`, AND
-  RO-bind glab's on-disk config dirs (`~/Library/Application Support/glab-cli`
-  on macOS; XDG `~/.config/glab-cli` and `~/.local/share/glab-cli` as
-  fallbacks) so `glab` works even when the env vars are unset.
+  RO-bind glab's on-disk config dir so `glab` works even when the env
+  vars are unset.
+<!-- os:darwin -->
+  Binds `~/Library/Application Support/glab-cli`.
+<!-- os:end -->
+<!-- os:linux -->
+  Binds the XDG paths: `~/.config/glab-cli` and `~/.local/share/glab-cli`.
+<!-- os:end -->
 - `AI_SANDBOX_PASS_OPENAI=1` — pass all `OPENAI_*` env vars.
 - `AI_SANDBOX_PASS_ENV="VAR1,VAR2"` — generic escape hatch for any other
   vars (e.g. `PASS_ENV=ANTHROPIC_API_KEY` to forward an Anthropic key
   when Claude is not authenticated via `~/.claude.json`). Names must
   match `[A-Za-z_][A-Za-z0-9_]*`; whitespace ignored.
 
+<!-- os:darwin -->
 Use `AI_SANDBOX_DRYRUN=1` to inspect the exact child env without launching.
+<!-- os:end -->
 
+<!-- os:darwin -->
   **Behavior change (since v0):** pre-T11, `--ro-bind` was a no-op on macOS
   because the base profile granted `file-read*` everywhere. Post-T11, reads
   are default-deny + allowlist, and `--ro-bind` emits a real
@@ -127,6 +153,7 @@ Use `AI_SANDBOX_DRYRUN=1` to inspect the exact child env without launching.
   gone — we chose hard-fail symmetric with `--bind` to catch typos. Callers
   that want best-effort optional reads must gate the flag at the call site
   (e.g. `[[ -e X ]] && WRAPPER_FLAGS+=(--ro-bind X X)`).
+<!-- os:end -->
 
 ## Menu Options
 
@@ -192,18 +219,21 @@ switch between them without re-authenticating each time.
 - Non-interactive launches respect `CLAUDE_ACCOUNT=<name>` set in the
   environment, or fall back to the workdir's saved preset.
 
-**macOS limitation:** Account switching relies on bind-mount remapping —
-the wrapper makes `~/.claude-<name>` appear as `~/.claude` inside the
-sandbox so the Claude CLI sees its expected config path. On Linux
-(bubblewrap) this works via `--bind SRC DST`. On macOS (sandbox-exec /
-Seatbelt) there is no bind-mount remapping; the path grant is a
-single-argument ACL, so a named account directory is accessible at its
-real path (`~/.claude-<name>`) but cannot be remapped to appear as
-`~/.claude`. As a result, setting `CLAUDE_ACCOUNT=work` on macOS will
+Account switching relies on bind-mount remapping — the wrapper makes
+`~/.claude-<name>` appear as `~/.claude` inside the sandbox so the Claude
+CLI sees its expected config path. On Linux (bubblewrap) this works via
+`--bind SRC DST`.
+<!-- os:darwin -->
+
+**macOS limitation:** sandbox-exec / Seatbelt has no bind-mount remapping;
+the path grant is a single-argument ACL, so a named account directory is
+accessible at its real path (`~/.claude-<name>`) but cannot be remapped to
+appear as `~/.claude`. As a result, setting `CLAUDE_ACCOUNT=work` will
 grant read/write access to `~/.claude-work` in the sandbox but Claude
 reads `~/.claude` — the session will silently use the default account
 directory instead of the named one. Account switching is fully
 functional on Linux only.
+<!-- os:end -->
 
 ### c) Clear saved settings for this workdir
 
@@ -250,18 +280,19 @@ Shows this help document.
 
 ## Skills
 
-Skills live in `~/.agents/skills/`. The setup script `setup_skills.bash`
-copies each one into `~/.claude/skills/<name>` so Claude Code discovers
-them (copies, not symlinks — sandbox-exec on macOS resolves file rules
-against the canonical real path, and the sandbox binds `~/.claude` RW but
-not `~/.agents`, so a symlink there would be read-denied). Each managed
-copy carries a `.setup_skills_managed` marker file recording its source
-path, so reruns refresh the copy in place; non-managed entries already in
+Skills live in `~/ai-wrapper/.agents/skills/`. The setup script
+`setup_skills.bash` copies each one into `~/.claude/skills/<name>` so
+Claude Code discovers them (copies, not symlinks — sandbox-exec on macOS
+resolves file rules against the canonical real path, and the sandbox
+binds `~/.claude` RW but not `~/ai-wrapper/.agents`, so a symlink there
+would be read-denied). Each managed copy carries a
+`.setup_skills_managed` marker file recording its source path, so reruns
+refresh the copy in place; non-managed entries already in
 `~/.claude/skills/` are left untouched.
 
 Run setup with:
 ```sh
-~/bin/setup_skills.bash
+~/ai-wrapper/bin/setup_skills.bash
 ```
 
 Key skills:
