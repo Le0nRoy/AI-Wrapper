@@ -263,6 +263,14 @@ _AI_SETTINGS_LIST=("${_ai_settings_filtered[@]}")
 unset _ai_settings_os _ai_settings_filtered _ai_settings_entry _ai_scope
 unset _ai_n _ai_t _ai_d _ai_sev _ai_hl _ai_det _ai_cat
 
+# Plugin hook: extensions loaded via AI_WRAPPER_EXTRA_PROFILE can append
+# extra entries to _AI_SETTINGS_LIST before the banner/toggle menu reads it.
+# Runs after the OS-filter step so plugin entries survive filtering unchanged
+# (they can carry their own trailing "|OS_SCOPE" field too if they want).
+if declare -f _extra_settings_register >/dev/null 2>&1; then
+    _extra_settings_register
+fi
+
 # Bump only when the load logic needs version-conditional handling.
 # Today: written into the preset file header for forward-compat
 # debugging; not consulted on load (older presets load with a WARN
@@ -304,7 +312,21 @@ _category_label() {
         sensitive)    printf 'Sensitive directories' ;;
         credentials)  printf 'Credentials' ;;
         networking)   printf 'Networking' ;;
-        *)            printf '%s' "${1}" ;;
+        *)
+            # Defer unknown categories to a plugin-provided label function
+            # (loaded via AI_WRAPPER_EXTRA_PROFILE) so plugin-registered
+            # settings can group under their own category header. The
+            # callback must printf the label and return 0 to consume the
+            # key; a non-zero return (or no callback) falls back to the raw
+            # key so a typo in the catalog is visible rather than silently
+            # swallowed.
+            if declare -f _extra_category_label >/dev/null 2>&1 \
+                    && _extra_category_label "${1}"; then
+                :
+            else
+                printf '%s' "${1}"
+            fi
+            ;;
     esac
 }
 
@@ -628,6 +650,12 @@ show_header() {
     # state rows so the header stays short as the catalog grows; the full
     # table is available inside the s) Settings sub-menu.
     _render_settings_table compact
+    # Plugin header hook: extensions loaded via AI_WRAPPER_EXTRA_PROFILE can
+    # render extra status lines under the settings table (e.g. background-
+    # service indicators). Runs when defined; no-op otherwise.
+    if declare -f _extra_header_extras >/dev/null 2>&1; then
+        _extra_header_extras
+    fi
     # Dim "restored from <path>" line when auto-preset was applied.
     # Rendered before the workdir warning so the warning always sits
     # immediately above the menu options.
@@ -712,6 +740,12 @@ show_main_menu() {
         echo "  s) Settings (toggle sandbox flags)" >/dev/tty
         echo "  c) Clear saved settings for this workdir" >/dev/tty
         echo "  h) Help" >/dev/tty
+        # Plugin menu hook: extensions loaded via AI_WRAPPER_EXTRA_PROFILE can
+        # append extra numbered / lettered options here. Pair with
+        # _extra_menu_dispatch below to handle the letters the callback prints.
+        if declare -f _extra_menu_options >/dev/null 2>&1; then
+            _extra_menu_options
+        fi
         echo "" >/dev/tty
         echo -n "Choose an option [1-3, s, c, h]: " >/dev/tty
         # `read` returns non-zero on EOF (e.g. /dev/tty unexpectedly closed,
@@ -738,6 +772,15 @@ show_main_menu() {
                 ;;
             h|H|help) display_help ;;
             *)
+                # Plugin dispatch first: an _extra_menu_dispatch defined by
+                # AI_WRAPPER_EXTRA_PROFILE gets first shot at unknown choices
+                # printed by _extra_menu_options. Returning 0 = handled
+                # (re-render menu). Any non-zero return, or the callback being
+                # undefined, falls through to the invalid-choice re-render.
+                if declare -f _extra_menu_dispatch >/dev/null 2>&1 \
+                        && _extra_menu_dispatch "${choice}"; then
+                    continue
+                fi
                 echo "Invalid choice. Press Enter to continue..." >/dev/tty
                 read -r </dev/tty || return 1
                 ;;
