@@ -141,6 +141,10 @@ Red-banner opt-ins (raw credential material):
   when Claude is not authenticated via `~/.claude.json`). Names must
   match `[A-Za-z_][A-Za-z0-9_]*`; whitespace ignored.
 
+Additional passthrough / bind rules can be registered by a downstream
+plugin's `_extra_sandbox_setup` — see "Extensions via
+AI_WRAPPER_EXTRA_PROFILE" below.
+
 <!-- os:darwin -->
 Use `AI_SANDBOX_DRYRUN=1` to inspect the exact child env without launching.
 <!-- os:end -->
@@ -277,6 +281,42 @@ switching OS if you rely on macOS-only settings.
 
 ### h) Help
 Shows this help document.
+
+## Extensions via AI_WRAPPER_EXTRA_PROFILE
+
+Set `AI_WRAPPER_EXTRA_PROFILE=/path/to/plugin.bash` to have the wrapper
+source a downstream bash file once at startup. Use for site-local or
+proprietary tweaks (extra binds, extra env passthrough, extra menu
+options, per-machine defaults) that don't belong upstream. A single env
+var — not a directory scan — keeps the extension point auditable at
+`env | grep AI_WRAPPER`.
+
+The plugin can define any of these optional callbacks; the wrapper invokes
+each one only when it exists, so an unset env var or a plugin missing a
+particular callback is a zero-behavior-change no-op:
+
+- `_extra_sandbox_setup` — fires in both backends right before binds bake
+  into the SBPL profile (Darwin) / bwrap exec (Linux). Append to
+  `binds_rw` / `binds_ro` / `binds_meta` / `env_allowlist` on macOS or to
+  `bwrap_args` on Linux.
+- `_extra_post_menu_setup` — fires after the interactive menu (and on the
+  non-interactive path) before dispatch. Mutate `AGENT_FLAGS` /
+  `AI_SANDBOX_PROFILE` / any env-var toggle.
+- `_extra_settings_register` — append rows to the `_AI_SETTINGS_LIST`
+  catalog so plugin knobs show up in the `s) Settings` sub-menu and header
+  banner.
+- `_extra_category_label KEY` — render a user-facing label for a plugin-
+  registered category; return 0 to consume, non-zero to fall through.
+- `_extra_header_extras` — render extra status lines under the settings
+  table in the menu header (e.g. a background-service indicator).
+- `_extra_menu_options` — print extra numbered / lettered menu entries
+  right before the "Choose an option" prompt.
+- `_extra_menu_dispatch CHOICE` — first shot at unknown menu choices;
+  return 0 = handled (re-render), non-zero = invalid-choice fallthrough.
+
+Opt-in only: the plugin should early-return unless its own opt-in env var
+is set, so merely pointing `AI_WRAPPER_EXTRA_PROFILE` at a plugin doesn't
+silently activate every knob it ships.
 
 ## Skills
 
