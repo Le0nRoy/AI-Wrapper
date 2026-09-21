@@ -17,6 +17,15 @@ for test_file in tests/test_*.bash; do
     fi
 done
 
+# Preset test suite (macOS only — run-preset-tests.sh exits 2 on non-Darwin).
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    echo ""
+    echo "### tests/run-preset-tests.sh (macOS only)"
+    if ! bash "tests/run-preset-tests.sh"; then
+        failed=1
+    fi
+fi
+
 echo ""
 if [[ "${failed}" -eq 0 ]]; then
     echo "All test files passed."
