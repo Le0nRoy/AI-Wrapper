@@ -25,7 +25,8 @@ CANARY_PATH="AI_SANDBOX_PROFILE"
 
 # --- Paths -----------------------------------------------------------------
 
-_REPO_ROOT="/Users/vadim.trishin/bin"
+_HARNESS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+_REPO_ROOT="$(cd "${_HARNESS_DIR}/../../.." && pwd -P)"
 _SRC_LIB="${_REPO_ROOT}/ai_wrapper_data/ai_wrapper_lib.bash"
 _REAL_HOME="${HOME}"   # remember real home so we can refuse to clobber it
 # Scratch root: prefers $TMPDIR (standard convention), but falls back to
