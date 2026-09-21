@@ -44,13 +44,23 @@ source "$(dirname "${BASH_SOURCE[0]}")/ai_wrapper_data/claude_wrapper_lib.bash"
 # file, source it once here so a proprietary / per-machine / corporate-policy
 # integrator can extend the sandbox without patching this file. The plugin
 # can define one or more callbacks that fire later:
-#   _extra_sandbox_setup   — before binds are baked into the SBPL / bwrap
-#                            profile (mutate binds_rw / binds_ro / binds_meta
-#                            on Darwin, bwrap_args on Linux, env_allowlist
-#                            either OS).
-#   _extra_post_menu_setup — after the interactive menu, before dispatch
-#                            (mutate AGENT_FLAGS / AI_SANDBOX_PROFILE / any
-#                            env-var toggle the plugin cares about).
+#   _extra_sandbox_setup      — before binds are baked into the SBPL / bwrap
+#                               profile (mutate binds_rw / binds_ro /
+#                               binds_meta on Darwin, bwrap_args on Linux,
+#                               env_allowlist either OS).
+#   _extra_post_menu_setup    — after the interactive menu, before dispatch
+#                               (mutate AGENT_FLAGS / AI_SANDBOX_PROFILE /
+#                               any env-var toggle the plugin cares about).
+#   _extra_settings_register  — append entries to _AI_SETTINGS_LIST before
+#                               the banner / toggle menu reads it.
+#   _extra_category_label     — printf a label for an unknown category key
+#                               and return 0; non-zero falls back to raw key.
+#   _extra_header_extras      — render extra status lines below the settings
+#                               table in show_header.
+#   _extra_menu_options       — print extra menu options (echo … >/dev/tty).
+#   _extra_menu_dispatch      — handle an unknown choice; return 0 = handled
+#                               (menu re-renders), non-zero = fall through.
+# See also: docs/wrapper-help.md § "Extensions via AI_WRAPPER_EXTRA_PROFILE".
 # Zero behavior change when the env var is unset. Auditable at
 # `env | grep AI_WRAPPER`.
 if [[ -n "${AI_WRAPPER_EXTRA_PROFILE:-}" ]]; then
