@@ -63,14 +63,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/ai_wrapper_data/claude_wrapper_lib.bash"
 # See also: docs/wrapper-help.md § "Extensions via AI_WRAPPER_EXTRA_PROFILE".
 # Zero behavior change when the env var is unset. Auditable at
 # `env | grep AI_WRAPPER`.
-if [[ -n "${AI_WRAPPER_EXTRA_PROFILE:-}" ]]; then
-    if [[ -f "${AI_WRAPPER_EXTRA_PROFILE}" ]]; then
-        # shellcheck source=/dev/null
-        source "${AI_WRAPPER_EXTRA_PROFILE}"
-    else
-        echo "WARN: AI_WRAPPER_EXTRA_PROFILE=${AI_WRAPPER_EXTRA_PROFILE} not found; ignoring." >&2
-    fi
-fi
+_load_extra_profile
 
 # Rlimit enforcement was dropped 2026-09 (see the header comment in
 # ai_agent_universal_wrapper.bash) — the user accepts the risk of unbounded

@@ -207,7 +207,8 @@ clean_scratch
 
 # ---------------------------------------------------------------------------
 # AI_WRAPPER_EXTRA_PROFILE sourcing guards
-# (tests replicate the guard block from executable_claude_wrapper.bash)
+# Tests call _load_extra_profile (defined in ai_wrapper_lib.bash) directly
+# so regressions in the production guard are caught immediately.
 # ---------------------------------------------------------------------------
 
 # HOOK-EXTRA-PROFILE-01: silent (no stderr) when variable is unset.
@@ -215,17 +216,8 @@ mk_scratch; guard_home
 export XDG_CONFIG_HOME="${TEST_SCRATCH}/config"
 clear_catalog_env
 unset AI_WRAPPER_EXTRA_PROFILE
-err_out="$(
-    if [[ -n "${AI_WRAPPER_EXTRA_PROFILE:-}" ]]; then
-        if [[ -f "${AI_WRAPPER_EXTRA_PROFILE}" ]]; then
-            # shellcheck source=/dev/null
-            source "${AI_WRAPPER_EXTRA_PROFILE}"
-        else
-            echo "WARN: AI_WRAPPER_EXTRA_PROFILE=${AI_WRAPPER_EXTRA_PROFILE} not found; ignoring." >&2
-        fi
-    fi
-    : # ensure subshell returns 0
-) 2>&1"
+source_lib
+err_out="$(_load_extra_profile 2>&1)"
 ok=1
 if [[ -n "${err_out}" ]]; then
     _fail "HOOK-EXTRA-PROFILE-01" "expected silence when unset, got: ${err_out}" "" ""; ok=0
@@ -237,18 +229,9 @@ clean_scratch
 mk_scratch; guard_home
 export XDG_CONFIG_HOME="${TEST_SCRATCH}/config"
 clear_catalog_env
+source_lib
 export AI_WRAPPER_EXTRA_PROFILE="${TEST_SCRATCH}/nonexistent_plugin.bash"
-err_out="$(
-    if [[ -n "${AI_WRAPPER_EXTRA_PROFILE:-}" ]]; then
-        if [[ -f "${AI_WRAPPER_EXTRA_PROFILE}" ]]; then
-            # shellcheck source=/dev/null
-            source "${AI_WRAPPER_EXTRA_PROFILE}"
-        else
-            echo "WARN: AI_WRAPPER_EXTRA_PROFILE=${AI_WRAPPER_EXTRA_PROFILE} not found; ignoring." >&2
-        fi
-    fi
-    : # ensure subshell returns 0
-) 2>&1"
+err_out="$(_load_extra_profile 2>&1)"
 ok=1
 if [[ "${err_out}" != *"WARN"* ]]; then
     _fail "HOOK-EXTRA-PROFILE-02" "expected WARN in stderr, got: ${err_out}" "" ""; ok=0

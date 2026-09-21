@@ -623,6 +623,20 @@ wrapper_log() {
     printf '[%s] %s: %s\n' "${AI_WRAPPER_AGENT_NAME:-ai-wrapper}" "${level}" "$*" >&2
 }
 
+# Source AI_WRAPPER_EXTRA_PROFILE when set. Silent no-op when unset or empty.
+# Emits WARN on stderr when the path is set but the file does not exist.
+# Extracted here (rather than inlined in each wrapper) so tests can exercise
+# the live guard logic directly via source_lib + _load_extra_profile.
+_load_extra_profile() {
+    [[ -n "${AI_WRAPPER_EXTRA_PROFILE:-}" ]] || return 0
+    if [[ -f "${AI_WRAPPER_EXTRA_PROFILE}" ]]; then
+        # shellcheck source=/dev/null
+        source "${AI_WRAPPER_EXTRA_PROFILE}"
+    else
+        echo "WARN: AI_WRAPPER_EXTRA_PROFILE=${AI_WRAPPER_EXTRA_PROFILE} not found; ignoring." >&2
+    fi
+}
+
 # ===== BINARY CHECK =====
 
 # Check that the agent binary exists. Exits with 127 if not found.
