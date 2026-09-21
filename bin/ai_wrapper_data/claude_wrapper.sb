@@ -465,6 +465,9 @@
 ;; the legacy SecKeychain* path (which `security` CLI and go-keyring both use)
 ;; writes the SQLite DB directly via atomic-replace — it creates a temp file
 ;; alongside login.keychain-db, writes it, then renames over the original. The
-;; whole subpath needs file*, not just file-read*.
+;; whole subpath needs file*, not just file-read*. Without this, a
+;; keychain-backed session store (e.g. any go-keyring client) fails with
+;; `exit status 161`
+;; (SecKeychainItemCreateFromContent: UNIX[Operation not permitted]).
 (allow file*
     (subpath (string-append (param "HOME_DIR") "/Library/Keychains")))

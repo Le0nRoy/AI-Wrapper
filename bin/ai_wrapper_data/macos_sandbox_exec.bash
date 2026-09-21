@@ -583,6 +583,15 @@ _run_sandboxed_agent_impl() {
         fi
     fi
 
+    # Downstream extension hook (see AI_WRAPPER_EXTRA_PROFILE in
+    # bin/executable_claude_wrapper.bash). Fires before binds are baked into
+    # the SBPL profile so the callback can append to binds_rw / binds_ro /
+    # binds_meta and mutate env_allowlist. Runs in the outer function scope
+    # (not the subshell), matching the arrays' scope.
+    if declare -f _extra_sandbox_setup >/dev/null 2>&1; then
+        _extra_sandbox_setup
+    fi
+
     local extra_rules
     if [[ ${#binds_rw[@]} -gt 0 ]]; then
         extra_rules="$(_append_bind_rules "${tag}" "file*" "--bind" "${binds_rw[@]}")" || return 1

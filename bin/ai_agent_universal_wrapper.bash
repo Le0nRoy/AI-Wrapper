@@ -481,6 +481,14 @@ _run_sandboxed_agent_linux() {
         [[ -f "${HOME_DIR}/.pypirc" ]]        && bwrap_args+=(--ro-bind "${HOME_DIR}/.pypirc" "${HOME_DIR}/.pypirc")
     fi
 
+    # Downstream extension hook (see AI_WRAPPER_EXTRA_PROFILE in
+    # bin/executable_claude_wrapper.bash). Fires before bwrap exec so the
+    # callback can append its own --bind / --ro-bind / --setenv pairs to
+    # bwrap_args. Symmetric with the Darwin hook in macos_sandbox_exec.bash.
+    if declare -f _extra_sandbox_setup >/dev/null 2>&1; then
+        _extra_sandbox_setup
+    fi
+
     # ===== EXECUTE — no more setpriv/prlimit wrapper =====
 
     bwrap "${bwrap_args[@]}" "${command}" "${cmd_args[@]}"
