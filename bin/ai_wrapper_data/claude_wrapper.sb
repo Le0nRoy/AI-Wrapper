@@ -225,6 +225,24 @@
     (literal (string-append (param "HOME_DIR") "/.CFUserTextEncoding"))
     (literal (string-append (param "HOME_DIR") "/.gitconfig"))
     (literal (string-append (param "HOME_DIR") "/.gitignore_global"))
+    ;; Shell rc files. Every /bin/bash -c invoked by the agent still tries
+    ;; to source ~/.bashrc; without a read grant every command prints
+    ;; "bash: /Users/…/.bashrc: Operation not permitted" and continues.
+    ;; The files are user config, not credential vehicles — read is fine.
+    ;; Bash / zsh / POSIX-sh variants included so the grant holds
+    ;; regardless of which shell the agent spawns.
+    (literal (string-append (param "HOME_DIR") "/.bashrc"))
+    (literal (string-append (param "HOME_DIR") "/.bash_profile"))
+    (literal (string-append (param "HOME_DIR") "/.bash_login"))
+    (literal (string-append (param "HOME_DIR") "/.bash_logout"))
+    (literal (string-append (param "HOME_DIR") "/.bash_aliases"))
+    (literal (string-append (param "HOME_DIR") "/.inputrc"))
+    (literal (string-append (param "HOME_DIR") "/.profile"))
+    (literal (string-append (param "HOME_DIR") "/.zshenv"))
+    (literal (string-append (param "HOME_DIR") "/.zprofile"))
+    (literal (string-append (param "HOME_DIR") "/.zshrc"))
+    (literal (string-append (param "HOME_DIR") "/.zlogin"))
+    (literal (string-append (param "HOME_DIR") "/.zlogout"))
     ;; System-wide AI agent rule files (parity with the Linux upstream's
     ;; auto-bind of ~/AGENTS.md + ~/CLAUDE.md). Granted unconditionally via
     ;; SBPL literal rules — no --ro-bind from the caller required, and a
