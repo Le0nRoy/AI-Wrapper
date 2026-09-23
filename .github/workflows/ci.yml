@@ -87,6 +87,7 @@ jobs:
           sysctl kernel.unprivileged_userns_clone
 
       - run: bash tests/test_sandbox_common.bash
+      - run: bash tests/test_extra_bind_dirs.bash
 
   # macOS's built-in sandbox-exec needs no install step. Runs the same
   # cross-platform smoke tests as Linux (run_sandboxed_agent dispatches on
@@ -97,3 +98,4 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4
       - run: bash tests/test_sandbox_common.bash
       - run: bash tests/test_sandbox_macos_only.bash
+      - run: bash tests/test_extra_bind_dirs.bash

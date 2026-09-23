@@ -126,6 +126,55 @@ _run_sandboxed_agent_linux() {
     # Remaining args are command arguments
     local -a cmd_args=("$@")
 
+    # AI_SANDBOX_EXTRA_{RW,RO}_DIRS: comma-separated absolute paths that
+    # extend the per-call bind list without patching individual wrappers.
+    # Populated by the interactive Settings sub-menu (str catalog entries
+    # in ai_wrapper_lib.bash) or set directly in the environment. Missing
+    # or non-directory entries WARN and are skipped rather than failing
+    # the launch — a preset that references a path present on the
+    # user's other machine should stay usable here.
+    # Entries accepted from AI_SANDBOX_EXTRA_{RW,RO}_DIRS, tracked separately
+    # from extra_bwrap_flags (which also carries the wrapper's own trusted
+    # binds, e.g. ~/.claude via WRAPPER_FLAGS). The sensitivity guard below
+    # must only ever see user-supplied entries — scanning extra_bwrap_flags
+    # wholesale would also flag those trusted binds and refuse to launch.
+    # Tilde is preserved verbatim in preset files; quoted [[ -d ]] does not
+    # expand it, so use parameter substitution to expand a leading ~ to $HOME.
+    local -a _user_extra_bind_dirs=()
+    local _extra_dirs_ifs _d
+    if [[ -n "${AI_SANDBOX_EXTRA_RW_DIRS:-}" ]]; then
+        _extra_dirs_ifs="${IFS}"; IFS=','
+        for _d in ${AI_SANDBOX_EXTRA_RW_DIRS}; do
+            _d="${_d#"${_d%%[![:space:]]*}"}"
+            _d="${_d%"${_d##*[![:space:]]}"}"
+            [[ -z "${_d}" ]] && continue
+            _d="${_d/#\~/${HOME}}"
+            if [[ -d "${_d}" ]]; then
+                extra_bwrap_flags+=(--bind "${_d}" "${_d}")
+                _user_extra_bind_dirs+=("${_d}")
+            else
+                echo_log "WARNING" "[$agent_name] AI_SANDBOX_EXTRA_RW_DIRS: skipping '${_d}' (not a directory)"
+            fi
+        done
+        IFS="${_extra_dirs_ifs}"
+    fi
+    if [[ -n "${AI_SANDBOX_EXTRA_RO_DIRS:-}" ]]; then
+        _extra_dirs_ifs="${IFS}"; IFS=','
+        for _d in ${AI_SANDBOX_EXTRA_RO_DIRS}; do
+            _d="${_d#"${_d%%[![:space:]]*}"}"
+            _d="${_d%"${_d##*[![:space:]]}"}"
+            [[ -z "${_d}" ]] && continue
+            _d="${_d/#\~/${HOME}}"
+            if [[ -d "${_d}" ]]; then
+                extra_bwrap_flags+=(--ro-bind "${_d}" "${_d}")
+                _user_extra_bind_dirs+=("${_d}")
+            else
+                echo_log "WARNING" "[$agent_name] AI_SANDBOX_EXTRA_RO_DIRS: skipping '${_d}' (not a directory)"
+            fi
+        done
+        IFS="${_extra_dirs_ifs}"
+    fi
+
     # Setup paths
     WORKDIR="$(pwd)"
     HOME_DIR="${HOME}"
@@ -171,6 +220,36 @@ _run_sandboxed_agent_linux() {
                     ;;
             esac
         fi
+
+        # Same sensitivity guard applied to every directory accepted from
+        # AI_SANDBOX_EXTRA_RW_DIRS / AI_SANDBOX_EXTRA_RO_DIRS. Without this,
+        # a settings-menu preset like AI_SANDBOX_EXTRA_RW_DIRS=~/.local
+        # would grant broad RW/RO on a HOME dotfile subtree that the WORKDIR
+        # guard above was specifically designed to refuse. Scoped to
+        # _user_extra_bind_dirs (not extra_bwrap_flags) so it never sees the
+        # wrapper's own trusted binds (~/.claude, ~/.claude.json, etc.).
+        for _d in "${_user_extra_bind_dirs[@]+"${_user_extra_bind_dirs[@]}"}"; do
+            local _sens_dir="${_d%/}"
+            case "${_sens_dir}" in
+                ""|/|/tmp|/var|/etc|/usr|/bin|/sbin|/opt|/home|/root|/proc|/sys|/dev|/boot|/mnt|/media|/srv|/run)
+                    echo_log "ERROR" "[$agent_name] Refusing extra bind '${_d}' (top-level or system location). Remove it from AI_SANDBOX_EXTRA_RW_DIRS/AI_SANDBOX_EXTRA_RO_DIRS, or set AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 to override."
+                    exit 1
+                    ;;
+            esac
+            if [[ -n "${home_normalized}" && "${_sens_dir}" == "${home_normalized}" ]]; then
+                echo_log "ERROR" "[$agent_name] Refusing extra bind '${_d}' (== \$HOME). Set AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 to override."
+                exit 1
+            fi
+            if [[ -n "${home_normalized}" ]]; then
+                case "${_sens_dir}" in
+                    "${home_normalized}"/.*)
+                        echo_log "ERROR" "[$agent_name] Refusing extra bind '${_d}' (under HOME dotfile dir — grants read/write on credentials). Set AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 to override."
+                        exit 1
+                        ;;
+                esac
+            fi
+        done
+        unset _sens_dir
     fi
 
     # ===== PATH VALIDATION FOR BIND MOUNTS =====

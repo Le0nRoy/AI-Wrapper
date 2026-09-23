@@ -110,6 +110,56 @@ _run_sandboxed_agent_impl() {
     [[ "${1:-}" == "--" ]] && shift
     local -a cmd_args=("$@")
 
+    # AI_SANDBOX_EXTRA_{RW,RO}_DIRS: comma-separated absolute paths that
+    # extend the per-call bind list without patching individual wrappers.
+    # Populated by the interactive Settings sub-menu (str catalog entries
+    # in ai_wrapper_lib.bash) or set directly in the environment. Missing
+    # or non-directory entries WARN and are skipped rather than failing
+    # the launch.
+    # Entries accepted from AI_SANDBOX_EXTRA_{RW,RO}_DIRS, tracked separately
+    # from binds_rw/binds_ro (which at this point already carry the
+    # wrapper's own trusted binds parsed from --bind/--ro-bind above, e.g.
+    # ~/.claude, ~/.claude.json, ~/.config/glab-cli, ~/Library/Application
+    # Support/glab-cli). The sensitivity guard below must only ever see
+    # user-supplied entries — scanning binds_rw/binds_ro wholesale would
+    # also flag those trusted binds and refuse every launch.
+    # Tilde is preserved verbatim in preset files; quoted [[ -d ]] does not
+    # expand it, so use parameter substitution to expand a leading ~ to $HOME.
+    local -a _user_extra_bind_dirs=()
+    local _extra_dirs_ifs _d
+    if [[ -n "${AI_SANDBOX_EXTRA_RW_DIRS:-}" ]]; then
+        _extra_dirs_ifs="${IFS}"; IFS=','
+        for _d in ${AI_SANDBOX_EXTRA_RW_DIRS}; do
+            _d="${_d#"${_d%%[![:space:]]*}"}"
+            _d="${_d%"${_d##*[![:space:]]}"}"
+            [[ -z "${_d}" ]] && continue
+            _d="${_d/#\~/${HOME}}"
+            if [[ -d "${_d}" ]]; then
+                binds_rw+=("${_d}")
+                _user_extra_bind_dirs+=("${_d}")
+            else
+                echo_log "WARN" "[${tag}] AI_SANDBOX_EXTRA_RW_DIRS: skipping '${_d}' (not a directory)"
+            fi
+        done
+        IFS="${_extra_dirs_ifs}"
+    fi
+    if [[ -n "${AI_SANDBOX_EXTRA_RO_DIRS:-}" ]]; then
+        _extra_dirs_ifs="${IFS}"; IFS=','
+        for _d in ${AI_SANDBOX_EXTRA_RO_DIRS}; do
+            _d="${_d#"${_d%%[![:space:]]*}"}"
+            _d="${_d%"${_d##*[![:space:]]}"}"
+            [[ -z "${_d}" ]] && continue
+            _d="${_d/#\~/${HOME}}"
+            if [[ -d "${_d}" ]]; then
+                binds_ro+=("${_d}")
+                _user_extra_bind_dirs+=("${_d}")
+            else
+                echo_log "WARN" "[${tag}] AI_SANDBOX_EXTRA_RO_DIRS: skipping '${_d}' (not a directory)"
+            fi
+        done
+        IFS="${_extra_dirs_ifs}"
+    fi
+
     local workdir; workdir="$(pwd -P)"
 
     # Profile selection:
@@ -185,6 +235,41 @@ _run_sandboxed_agent_impl() {
         esac
     fi
 
+    # Same sensitivity guard applied to every directory accepted from
+    # AI_SANDBOX_EXTRA_RW_DIRS / AI_SANDBOX_EXTRA_RO_DIRS. Without this, a
+    # settings-menu preset like AI_SANDBOX_EXTRA_RW_DIRS=~/.local would
+    # grant broad RW/RO on a HOME dotfile subtree that the WORKDIR guard
+    # above was specifically designed to refuse. Scoped to
+    # _user_extra_bind_dirs (not binds_rw/binds_ro) so it never sees the
+    # wrapper's own trusted binds (~/.claude, ~/.claude.json, glab-cli
+    # dirs, etc.) parsed earlier in this function.
+    if [[ "${AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR:-}" != "1" ]]; then
+        local _sens_bind _sens_resolved
+        for _sens_bind in "${_user_extra_bind_dirs[@]+"${_user_extra_bind_dirs[@]}"}"; do
+            _sens_resolved="$(_realpath "${_sens_bind}" 2>/dev/null)" || _sens_resolved="${_sens_bind%/}"
+            _sens_resolved="${_sens_resolved%/}"
+            case "${_sens_resolved}" in
+                /|/Users|/Users/Shared|/private|/private/tmp|/private/var|/private/var/tmp|/private/var/folders|/tmp|/var|/var/tmp|/etc|/usr|/usr/local|/bin|/sbin|/System|/Applications|/Library)
+                    echo_log "ERROR" "[${tag}] Refusing extra bind '${_sens_bind}' (top-level or system location). Remove it from AI_SANDBOX_EXTRA_RW_DIRS/AI_SANDBOX_EXTRA_RO_DIRS, or set AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 to override."
+                    return 1
+                    ;;
+            esac
+            if [[ -n "${resolved_home}" ]]; then
+                if [[ "${_sens_resolved}" == "${resolved_home}" ]]; then
+                    echo_log "ERROR" "[${tag}] Refusing extra bind '${_sens_bind}' (== \$HOME). Set AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 to override."
+                    return 1
+                fi
+                case "${_sens_resolved}" in
+                    "${resolved_home}"/.*|"${resolved_home}"/Library|"${resolved_home}"/Library/*)
+                        echo_log "ERROR" "[${tag}] Refusing extra bind '${_sens_bind}' (under HOME dotfile dir or ~/Library — grants read/write on credentials). Set AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 to override."
+                        return 1
+                        ;;
+                esac
+            fi
+        done
+        unset _sens_bind _sens_resolved
+    fi
+
     # WS3 / U-E: yellow-warn when WORKDIR is a direct $HOME child that
     # isn't on the project-dir allowlist. `~/Documents/foo`, `~/Desktop`,
     # `~/Downloads` etc. are accepted (the launch-refusal above only
@@ -222,6 +307,30 @@ _run_sandboxed_agent_impl() {
             _wd_parent="${_wd_parent%/*}"
         done
         unset _wd_parent
+    fi
+
+    # Same ancestor-metadata rationale as the WORKDIR walk above, applied
+    # to every per-call --bind / --ro-bind entry too. Without this the
+    # kernel's namei walk denies stat on intermediate dirs between HOME
+    # and a user-supplied bind target (e.g. HOME/.local/share/foo needs
+    # metadata on .local and .local/share), so `ls`/`stat`/realpath()
+    # from inside the sandbox fails even though the target subpath is
+    # granted. Duplicate entries in binds_meta are harmless (they render
+    # as extra (allow file-read-metadata (literal …)) rules).
+    if [[ -n "${resolved_home}" ]]; then
+        local _bind_target _bind_parent _bind_resolved
+        for _bind_target in "${binds_rw[@]+"${binds_rw[@]}"}" "${binds_ro[@]+"${binds_ro[@]}"}"; do
+            _bind_resolved="$(_realpath "${_bind_target}" 2>/dev/null)" || _bind_resolved="${_bind_target}"
+            [[ "${_bind_resolved}" == "${resolved_home}"/* ]] || continue
+            _bind_parent="${_bind_resolved%/*}"
+            while [[ -n "${_bind_parent}" \
+                    && "${_bind_parent}" != "${resolved_home}" \
+                    && "${_bind_parent}" != "/" ]]; do
+                binds_meta+=("${_bind_parent}")
+                _bind_parent="${_bind_parent%/*}"
+            done
+        done
+        unset _bind_target _bind_parent _bind_resolved
     fi
 
     # $HOME is interpolated into the base profile via -D HOME_DIR=…; validate
