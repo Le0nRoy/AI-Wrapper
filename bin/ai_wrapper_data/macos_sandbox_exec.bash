@@ -116,17 +116,6 @@ _run_sandboxed_agent_impl() {
     # in ai_wrapper_lib.bash) or set directly in the environment. Missing
     # or non-directory entries WARN and are skipped rather than failing
     # the launch.
-    # Tilde is preserved verbatim in preset files (`~/foo`) and inside
-    # quoted `[[ -d "$var" ]]` bash does not expand it, so a raw
-    # `~/some/path` would silently fail the directory check. Expand
-    # a leading `~` or `~/` to $HOME before probing.
-    _expand_tilde() {
-        case "${1}" in
-            "~")    printf '%s' "${HOME}" ;;
-            "~/"*)  printf '%s%s' "${HOME}" "${1#\~}" ;;
-            *)      printf '%s' "${1}" ;;
-        esac
-    }
     # Entries accepted from AI_SANDBOX_EXTRA_{RW,RO}_DIRS, tracked separately
     # from binds_rw/binds_ro (which at this point already carry the
     # wrapper's own trusted binds parsed from --bind/--ro-bind above, e.g.
@@ -134,6 +123,8 @@ _run_sandboxed_agent_impl() {
     # Support/glab-cli). The sensitivity guard below must only ever see
     # user-supplied entries — scanning binds_rw/binds_ro wholesale would
     # also flag those trusted binds and refuse every launch.
+    # Tilde is preserved verbatim in preset files; quoted [[ -d ]] does not
+    # expand it, so use parameter substitution to expand a leading ~ to $HOME.
     local -a _user_extra_bind_dirs=()
     local _extra_dirs_ifs _d
     if [[ -n "${AI_SANDBOX_EXTRA_RW_DIRS:-}" ]]; then
@@ -142,7 +133,7 @@ _run_sandboxed_agent_impl() {
             _d="${_d#"${_d%%[![:space:]]*}"}"
             _d="${_d%"${_d##*[![:space:]]}"}"
             [[ -z "${_d}" ]] && continue
-            _d="$(_expand_tilde "${_d}")"
+            _d="${_d/#\~/${HOME}}"
             if [[ -d "${_d}" ]]; then
                 binds_rw+=("${_d}")
                 _user_extra_bind_dirs+=("${_d}")
@@ -158,7 +149,7 @@ _run_sandboxed_agent_impl() {
             _d="${_d#"${_d%%[![:space:]]*}"}"
             _d="${_d%"${_d##*[![:space:]]}"}"
             [[ -z "${_d}" ]] && continue
-            _d="$(_expand_tilde "${_d}")"
+            _d="${_d/#\~/${HOME}}"
             if [[ -d "${_d}" ]]; then
                 binds_ro+=("${_d}")
                 _user_extra_bind_dirs+=("${_d}")
@@ -168,7 +159,6 @@ _run_sandboxed_agent_impl() {
         done
         IFS="${_extra_dirs_ifs}"
     fi
-    unset -f _expand_tilde
 
     local workdir; workdir="$(pwd -P)"
 
