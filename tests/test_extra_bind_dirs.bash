@@ -39,9 +39,16 @@ assert_contains "${out}" "extra-dir-ok" "benign AI_SANDBOX_EXTRA_RW_DIRS entry i
 # real claude_wrapper launch passes via WRAPPER_FLAGS) must NOT be
 # rejected by the extra-dirs sensitivity guard just because
 # AI_SANDBOX_EXTRA_RW_DIRS is also set in the same call. ---
+# macOS backend is single-arg (--bind SRC); Linux bwrap is two-arg (--bind SRC DST).
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    _test_bind_flags=(--bind "${FAKE_HOME}/.claude")
+else
+    _test_bind_flags=(--bind "${FAKE_HOME}/.claude" "${FAKE_HOME}/.claude")
+fi
 out="$(cd "${FAKE_HOME}/project" && AI_SANDBOX_EXTRA_RW_DIRS="${FAKE_HOME}/extra_data" \
-    run_sandboxed_agent /bin/echo -- --bind "${FAKE_HOME}/.claude" "${FAKE_HOME}/.claude" -- trusted-bind-ok 2>&1)"
+    run_sandboxed_agent /bin/echo -- "${_test_bind_flags[@]}" -- trusted-bind-ok 2>&1)"
 rc=$?
+unset _test_bind_flags
 echo "  (trusted ~/.claude bind + extra dir output: ${out})"
 assert_eq "${rc}" "0" "wrapper-internal ~/.claude bind is not rejected by the extra-dirs guard"
 assert_contains "${out}" "trusted-bind-ok" "command still runs when both a trusted bind and an extra dir are present"
