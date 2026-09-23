@@ -238,7 +238,7 @@ _run_sandboxed_agent_linux() {
         # guard above was specifically designed to refuse. Scoped to
         # _user_extra_bind_dirs (not extra_bwrap_flags) so it never sees the
         # wrapper's own trusted binds (~/.claude, ~/.claude.json, etc.).
-        for _d in "${_user_extra_bind_dirs[@]}"; do
+        for _d in "${_user_extra_bind_dirs[@]+"${_user_extra_bind_dirs[@]}"}"; do
             local _sens_dir="${_d%/}"
             case "${_sens_dir}" in
                 ""|/|/tmp|/var|/etc|/usr|/bin|/sbin|/opt|/home|/root|/proc|/sys|/dev|/boot|/mnt|/media|/srv|/run)

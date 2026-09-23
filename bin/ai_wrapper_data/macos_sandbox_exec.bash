@@ -255,7 +255,7 @@ _run_sandboxed_agent_impl() {
     # dirs, etc.) parsed earlier in this function.
     if [[ "${AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR:-}" != "1" ]]; then
         local _sens_bind _sens_resolved
-        for _sens_bind in "${_user_extra_bind_dirs[@]}"; do
+        for _sens_bind in "${_user_extra_bind_dirs[@]+"${_user_extra_bind_dirs[@]}"}"; do
             _sens_resolved="$(_realpath "${_sens_bind}" 2>/dev/null)" || _sens_resolved="${_sens_bind%/}"
             _sens_resolved="${_sens_resolved%/}"
             case "${_sens_resolved}" in
@@ -329,7 +329,7 @@ _run_sandboxed_agent_impl() {
     # as extra (allow file-read-metadata (literal …)) rules).
     if [[ -n "${resolved_home}" ]]; then
         local _bind_target _bind_parent _bind_resolved
-        for _bind_target in "${binds_rw[@]}" "${binds_ro[@]}"; do
+        for _bind_target in "${binds_rw[@]+"${binds_rw[@]}"}" "${binds_ro[@]+"${binds_ro[@]}"}"; do
             _bind_resolved="$(_realpath "${_bind_target}" 2>/dev/null)" || _bind_resolved="${_bind_target}"
             [[ "${_bind_resolved}" == "${resolved_home}"/* ]] || continue
             _bind_parent="${_bind_resolved%/*}"
