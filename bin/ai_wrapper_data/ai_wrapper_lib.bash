@@ -265,13 +265,11 @@ _AI_SETTINGS_LIST=("${_ai_settings_filtered[@]}")
 unset _ai_settings_os _ai_settings_filtered _ai_settings_entry _ai_scope
 unset _ai_n _ai_t _ai_d _ai_sev _ai_hl _ai_det _ai_cat
 
-# Plugin hook: extensions loaded via AI_WRAPPER_EXTRA_PROFILE can append
-# extra entries to _AI_SETTINGS_LIST before the banner/toggle menu reads it.
-# Runs after the OS-filter step so plugin entries survive filtering unchanged
-# (they can carry their own trailing "|OS_SCOPE" field too if they want).
-if declare -f _extra_settings_register >/dev/null 2>&1; then
-    _extra_settings_register
-fi
+# Plugin hook `_extra_settings_register` is invoked from _load_extra_profile
+# (below) right after the plugin file is sourced. Invoking it here would fire
+# before AI_WRAPPER_EXTRA_PROFILE is loaded by the wrapper entry script — the
+# callback would be undefined, no rows would land, and the later preset
+# autoload would emit "unknown setting" WARNs for every plugin-owned key.
 
 # Bump only when the load logic needs version-conditional handling.
 # Today: written into the preset file header for forward-compat
@@ -636,6 +634,14 @@ _load_extra_profile() {
         source "${AI_WRAPPER_EXTRA_PROFILE}"
     else
         echo "WARN: AI_WRAPPER_EXTRA_PROFILE=${AI_WRAPPER_EXTRA_PROFILE} not found; ignoring." >&2
+        return 0
+    fi
+    # Fire the settings-catalog registration callback now that the plugin
+    # has had a chance to define it. _AI_SETTINGS_LIST is already populated
+    # and OS-filtered at this point (see the source-time block earlier in
+    # this file), so plugin appends survive filtering unchanged.
+    if declare -f _extra_settings_register >/dev/null 2>&1; then
+        _extra_settings_register
     fi
 }
 
