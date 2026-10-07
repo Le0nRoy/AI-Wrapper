@@ -204,9 +204,27 @@ _check_workdir_breadth() {
 # SECURITY: the common dir comes from files inside WORKDIR (the `.git`
 # gitdir file and the `commondir` file it points at), i.e. it is
 # attacker-controlled for an untrusted checkout — a crafted repo could
-# otherwise get ~/.ssh, $HOME or /etc bound RW. _wrapper_git_common_dir_ok
-# validates it before binding; a rejected candidate is WARNed and skipped
-# (the launch continues, git just won't work in that worktree).
+# otherwise get ~/.ssh, $HOME, /etc or another repo's .git bound RW.
+# _wrapper_git_common_dir_ok validates it before binding; a rejected
+# candidate is WARNed and skipped (the launch continues, git just won't
+# work in that worktree).
+#
+# Even for a genuine worktree, RW on the shared .git would let the agent
+# plant host code execution for the user's next git command (hooks/,
+# config: core.hooksPath / core.fsmonitor / aliases / filter drivers,
+# other worktrees' entries, submodule git dirs). So after the RW bind the
+# wrapper over-mounts those read-only (bwrap: a later bind wins), keeping
+# only what git needs to commit / checkout / branch writable: objects/,
+# refs/, packed-refs, logs/ and this worktree's own worktrees/<name>/
+# (minus its commondir / gitdir / config.worktree links). Consequence:
+# git commands that write the shared config (git config, remote add,
+# push -u, branch --set-upstream-to), git worktree add/prune and
+# submodule updates fail inside the sandbox.
+#
+# macOS: Seatbelt grants are additive allows; a nested --ro-bind under a
+# --bind does not remove write access, and the macOS backend has no
+# deny-write helper yet. The RO over-mounts are therefore only enforced on
+# Linux; on macOS the wrapper WARNs (see docs/security-concerns.md B-λ).
 _wrapper_bind_git_common_dir() {
     local git_common_dir git_common_resolved wd_resolved home_resolved wt_parent
     git_common_dir="$(git -C "$(pwd -P)" rev-parse --git-common-dir 2>/dev/null)" || return 0
@@ -214,8 +232,8 @@ _wrapper_bind_git_common_dir() {
     # `git rev-parse --git-common-dir` returns either an absolute path or a
     # path relative to CWD (typically just ".git"). Canonicalize so the bind
     # source is unambiguous and so symlinks in the chain are resolved the
-    # same way the kernel's path lookup will. Only the resolved path is
-    # ever bound — never the raw, possibly-symlinked one.
+    # same way the kernel's path lookup will. Only the validated, resolved
+    # path is ever bound — never the raw, possibly-symlinked one.
     if [[ "${git_common_dir}" != /* ]]; then
         git_common_dir="$(pwd -P)/${git_common_dir}"
     fi
@@ -226,47 +244,107 @@ _wrapper_bind_git_common_dir() {
     home_resolved="${home_resolved%/}"
     # Skip when the shared .git is already inside WORKDIR — a regular
     # (non-worktree) repo binds it via the WORKDIR rule.
-    if [[ -n "${wd_resolved}" \
-            && "${git_common_resolved}" != "${wd_resolved}"/* \
-            && "${git_common_resolved}" != "${wd_resolved}" ]]; then
-        local reason
-        if ! reason="$(_wrapper_git_common_dir_ok "${git_common_resolved}" "${home_resolved}" "${wd_resolved}")"; then
-            echo_log "WARN" "[${AI_AGENT_COMMAND:-ai-wrapper}] Not binding git common dir ${git_common_resolved}: ${reason}. git will not work in this worktree; bind it via AI_SANDBOX_EXTRA_RW_DIRS if it is trusted."
+    [[ -n "${wd_resolved}" ]] || return 0
+    [[ "${git_common_resolved}" != "${wd_resolved}"/* \
+        && "${git_common_resolved}" != "${wd_resolved}" ]] || return 0
+
+    local reason
+    if ! reason="$(_wrapper_git_common_dir_ok "${git_common_resolved}" "${home_resolved}" "${wd_resolved}")"; then
+        echo_log "WARN" "[${AI_AGENT_COMMAND:-ai-wrapper}] Not binding git common dir ${git_common_resolved}: ${reason}. git will not work in this worktree; bind it via AI_SANDBOX_EXTRA_RW_DIRS if it is trusted."
+        return 0
+    fi
+    # _wrapper_git_common_dir_ok printed the validated worktree entry dir.
+    local wt_entry="${reason}"
+
+    # Host-side prep, all inside the validated common dir: the RO
+    # over-mounts need existing sources (an absent hooks/ would otherwise
+    # be creatable by the agent), and config.worktree is honoured by git
+    # only with extensions.worktreeConfig — pre-create it then so the agent
+    # can't add one. Any symlink among the over-mount targets (e.g. planted
+    # by an earlier session) aborts the bind: following it would expose
+    # the symlink's target instead.
+    local -a ro_paths=("${git_common_resolved}/config" "${git_common_resolved}/hooks")
+    [[ -d "${git_common_resolved}/hooks" || -L "${git_common_resolved}/hooks" ]] \
+        || mkdir "${git_common_resolved}/hooks" 2>/dev/null
+    if [[ "$(git config --file "${git_common_resolved}/config" --type=bool --get extensions.worktreeConfig 2>/dev/null)" == "true" \
+            && ! -e "${wt_entry}/config.worktree" && ! -L "${wt_entry}/config.worktree" ]]; then
+        : >"${wt_entry}/config.worktree" 2>/dev/null
+    fi
+    local sub
+    for sub in "${git_common_resolved}/modules/"*/; do
+        sub="${sub%/}"
+        [[ -d "${sub}" && ! -L "${sub}" ]] || continue
+        [[ -d "${sub}/hooks" || -L "${sub}/hooks" ]] || mkdir "${sub}/hooks" 2>/dev/null
+        ro_paths+=("${sub}/hooks")
+        [[ -e "${sub}/config" || -L "${sub}/config" ]] && ro_paths+=("${sub}/config")
+    done
+    local p
+    for p in "${ro_paths[@]}" "${git_common_resolved}/worktrees" "${wt_entry}" \
+            "${wt_entry}/commondir" "${wt_entry}/gitdir" "${wt_entry}/config.worktree"; do
+        if [[ -L "${p}" ]]; then
+            echo_log "WARN" "[${AI_AGENT_COMMAND:-ai-wrapper}] Not binding git common dir ${git_common_resolved}: ${p} is a symlink."
             return 0
         fi
-        _wrapper_add_bind "${git_common_resolved}"
-        # Git canonicalizes the absolute paths in the gitdir line
-        # (mainrepo/.git/worktrees/<name>) which requires stat() on every
-        # intermediate dir between $HOME and the shared .git (Seatbelt
-        # only — see _wrapper_add_meta_bind). Add only the shared-.git
-        # branch here; the WORKDIR branch of this walk is handled by
-        # each backend already.
-        wt_parent="${git_common_resolved%/*}"
-        while [[ -n "${wt_parent}" \
-                && "${wt_parent}" != "${home_resolved}" \
-                && "${wt_parent}" != "/" ]]; do
-            _wrapper_add_meta_bind "${wt_parent}"
-            wt_parent="${wt_parent%/*}"
-        done
+    done
+    if [[ ! -f "${git_common_resolved}/config" || ! -d "${git_common_resolved}/hooks" ]]; then
+        echo_log "WARN" "[${AI_AGENT_COMMAND:-ai-wrapper}] Not binding git common dir ${git_common_resolved}: config or hooks/ missing and could not be created."
+        return 0
     fi
+
+    _wrapper_add_bind "${git_common_resolved}"
+    for p in "${ro_paths[@]}"; do
+        _wrapper_add_ro_bind "${p}"
+    done
+    # Other worktrees' entries RO, this worktree's entry RW, and its link
+    # files RO again.
+    _wrapper_add_ro_bind "${git_common_resolved}/worktrees"
+    _wrapper_add_bind "${wt_entry}"
+    for p in "${wt_entry}/commondir" "${wt_entry}/gitdir" "${wt_entry}/config.worktree"; do
+        [[ -f "${p}" ]] && _wrapper_add_ro_bind "${p}"
+    done
+    if [[ "${_wrapper_os}" == "Darwin" ]]; then
+        echo_log "WARN" "[${AI_AGENT_COMMAND:-ai-wrapper}] macOS: ${git_common_resolved}/hooks and config are writable by the agent (no nested read-only on Seatbelt yet). Review them before running git outside the sandbox."
+    fi
+
+    # Git canonicalizes the absolute paths in the gitdir line
+    # (mainrepo/.git/worktrees/<name>) which requires stat() on every
+    # intermediate dir between $HOME and the shared .git (Seatbelt
+    # only — see _wrapper_add_meta_bind). Add only the shared-.git
+    # branch here; the WORKDIR branch of this walk is handled by
+    # each backend already.
+    wt_parent="${git_common_resolved%/*}"
+    while [[ -n "${wt_parent}" \
+            && "${wt_parent}" != "${home_resolved}" \
+            && "${wt_parent}" != "/" ]]; do
+        _wrapper_add_meta_bind "${wt_parent}"
+        wt_parent="${wt_parent%/*}"
+    done
     return 0
 }
 
 # Validate a resolved git common dir before it is bound RW. Args:
-# RESOLVED_COMMON_DIR RESOLVED_HOME RESOLVED_WORKDIR. Returns 0 if OK;
+# RESOLVED_COMMON_DIR RESOLVED_HOME RESOLVED_WORKDIR. On success prints the
+# resolved worktree entry dir (<common>/worktrees/<name>) and returns 0;
 # otherwise prints the rejection reason and returns 1. Rules:
 #   (a) a real directory (not a symlink) strictly under $HOME;
 #   (b) not a sensitive location per _sandbox_sensitive_dir_kind (the same
 #       classifier the sandbox applies to WORKDIR / AI_SANDBOX_EXTRA_*_DIRS:
 #       system dirs, $HOME, anything under a $HOME dotfile dir);
-#   (c) shaped like a git dir: HEAD file plus objects/ and refs/ dirs, and
-#       named `.git` (normal repo) or `<name>.git` (bare repo convention);
-#   (d) WORKDIR really is one of its linked worktrees: git's own gitdir
-#       for WORKDIR resolves to <common>/worktrees/<name>.
+#   (c) shaped like a git dir: config + HEAD files plus objects/ and refs/
+#       dirs, and named `.git` (normal repo) or `<name>.git` (bare repo);
+#   (d) forward link: git's gitdir for WORKDIR resolves to exactly
+#       <common>/worktrees/<name> (one path component);
+#   (e) reverse link: <common>/worktrees/<name>/gitdir — written by
+#       `git worktree add` in the victim-side repo, not writable from an
+#       untrusted checkout — resolves to exactly <worktree top>/.git, where
+#       <worktree top> is WORKDIR's toplevel. Without (e) a checkout could
+#       borrow any existing worktree entry of any repo by pointing its
+#       .git file at it.
+# Both sides of every comparison are realpath-resolved.
 # AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR does NOT relax these — trusted repos
 # outside the rules can be granted explicitly via AI_SANDBOX_EXTRA_RW_DIRS.
 _wrapper_git_common_dir_ok() {
-    local dir="${1%/}" home="${2%/}" wd="${3%/}" kind base git_dir
+    local dir="${1%/}" home="${2%/}" wd="${3%/}" kind base git_dir name top back
     # Fail closed if the classifier (ai_agent_universal_wrapper.bash)
     # wasn't sourced first.
     if ! declare -f _sandbox_sensitive_dir_kind >/dev/null 2>&1; then
@@ -286,15 +364,39 @@ _wrapper_git_common_dir_ok() {
         .git|?*.git) ;;
         *) echo "basename '${base}' is not .git or <name>.git"; return 1 ;;
     esac
-    if [[ ! -f "${dir}/HEAD" || -L "${dir}/HEAD" || ! -d "${dir}/objects" || ! -d "${dir}/refs" ]]; then
-        echo "does not look like a git dir (HEAD, objects/, refs/)"; return 1
+    if [[ ! -f "${dir}/HEAD" || -L "${dir}/HEAD" || ! -f "${dir}/config" \
+            || ! -d "${dir}/objects" || ! -d "${dir}/refs" ]]; then
+        echo "does not look like a git dir (config, HEAD, objects/, refs/)"; return 1
     fi
+    # (d) forward link.
     git_dir="$(git -C "${wd}" rev-parse --absolute-git-dir 2>/dev/null)" || git_dir=""
-    [[ -n "${git_dir}" ]] && git_dir="$(_realpath "${git_dir}")" || git_dir=""
-    case "${git_dir}" in
-        "${dir}"/worktrees/?*) ;;
-        *) echo "WORKDIR's gitdir (${git_dir:-unknown}) is not a worktree of it"; return 1 ;;
-    esac
+    if [[ -n "${git_dir}" ]]; then
+        git_dir="$(_realpath "${git_dir}")" || git_dir=""
+    fi
+    name="${git_dir#"${dir}/worktrees/"}"
+    if [[ -z "${git_dir}" || "${name}" == "${git_dir}" || -z "${name}" || "${name}" == */* \
+            || -L "${git_dir}" || ! -d "${git_dir}" ]]; then
+        echo "WORKDIR's gitdir (${git_dir:-unknown}) is not a worktree of it"; return 1
+    fi
+    # (e) reverse link.
+    top="$(git -C "${wd}" rev-parse --show-toplevel 2>/dev/null)" || top=""
+    if [[ -n "${top}" ]]; then
+        top="$(_realpath "${top}")" || top=""
+    fi
+    back=""
+    if [[ -f "${git_dir}/gitdir" && ! -L "${git_dir}/gitdir" ]]; then
+        IFS= read -r back <"${git_dir}/gitdir" || [[ -n "${back}" ]] || back=""
+        # git may record a path relative to the entry dir
+        # (worktree.useRelativePaths).
+        [[ -n "${back}" && "${back}" != /* ]] && back="${git_dir}/${back}"
+        if [[ -n "${back}" ]]; then
+            back="$(_realpath "${back}")" || back=""
+        fi
+    fi
+    if [[ -z "${top}" || -z "${back}" || "${back}" != "${top}/.git" ]]; then
+        echo "worktree entry ${git_dir} belongs to ${back:-unknown}, not this checkout (${top:-unknown}/.git)"; return 1
+    fi
+    printf '%s' "${git_dir}"
     return 0
 }
 

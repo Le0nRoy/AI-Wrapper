@@ -75,7 +75,10 @@ functional on Linux only (same limitation as the Claude wrapper).
 - Git worktrees: when the working directory is a `git worktree`, the main
   repository's shared `.git` is bound read-write so git works — only if it
   passes validation (under `$HOME`, not in a dotfile dir, a real `.git` /
-  `<name>.git` dir that lists this worktree). Otherwise a WARN is printed
+  `<name>.git` dir whose worktree entry links back to this checkout).
+  Its `config`, `hooks/` and other worktrees' entries stay read-only, so
+  `git config`, `git remote add`, `push -u`, `git worktree add` and
+  submodule updates fail inside the sandbox. Otherwise a WARN is printed
   and git won't work in the worktree; bind the `.git` via
   `AI_SANDBOX_EXTRA_RW_DIRS` if you trust it.
 - `AI_SANDBOX_PASS_GITLAB=1` also binds the glab config read-only.

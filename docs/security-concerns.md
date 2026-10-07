@@ -447,6 +447,48 @@ does not relax it. **Behaviour change:** worktrees of repos outside
 `$HOME` (or under a `$HOME` dotfile dir) no longer get the shared `.git`
 bound automatically — grant it explicitly with `AI_SANDBOX_EXTRA_RW_DIRS`.
 
+### B-λ — worktree common dir: borrowed entries and host code execution (RESOLVED on Linux, 2026-10)
+
+Two gaps left by B-ι's first fix:
+
+1. **Borrowed worktree entry.** A checkout's `.git` file could point at
+   an *existing* `<victim>/.git/worktrees/<name>` of any repo; the
+   forward-link check passed. Now `<common>/worktrees/<name>/gitdir`
+   (written by git, not writable from the checkout) must resolve to
+   exactly `<worktree toplevel>/.git` (both sides realpath'd; relative
+   `gitdir` entries are resolved against the entry dir).
+2. **RW on a genuine common dir = host code execution.** The agent could
+   write `hooks/`, `config` (`core.hooksPath`, `core.fsmonitor`, aliases,
+   filter drivers), other worktrees' entries (`commondir`,
+   `config.worktree`) or submodule git dirs, all of which run on the
+   user's next git command outside the sandbox. After the RW bind the
+   wrapper now over-mounts read-only: `config`, `hooks/` (created if
+   missing), all of `worktrees/` except this worktree's own entry, that
+   entry's `commondir` / `gitdir` / `config.worktree` (pre-created when
+   `extensions.worktreeConfig` is on), and `modules/*/{hooks,config}`.
+   Any of those being a symlink aborts the bind (WARN). Commit, branch,
+   checkout, fetch keep working; `git config`, `remote add`, `push -u`,
+   `branch --set-upstream-to`, `worktree add/prune` and submodule
+   updates fail inside the sandbox. Applies to the Claude wrapper too.
+
+**TOCTOU.** Validation and binds use the same realpath-resolved paths;
+the over-mount targets are checked for symlinks immediately before the
+flags are built. A residual window remains between this check and
+bwrap's mount for a *concurrent* host process that can write the
+victim repo; sandboxed sessions can no longer rename the RO mount
+points.
+
+**macOS (open).** Seatbelt grants are additive allows: a nested
+`--ro-bind` under the common dir's `--bind` does not remove write
+access, and `macos_sandbox_exec.bash` has no deny-write helper. On
+macOS the over-mounts are emitted but not enforced; the wrapper WARNs.
+Follow-up: add a `--deny-write` flag emitting `(deny file-write*
+(subpath …))` after the allows.
+
+**Not covered (follow-up).** The same hooks/config vector exists for the
+WORKDIR's own `.git` (regular repos, and the worktree's `.git` file,
+which can be repointed): WORKDIR is RW by design.
+
 ### B-κ — symlinked account paths (RESOLVED, 2026-10)
 
 Named profiles (`~/.claude-<name>`, `~/.claude-<name>.json`,

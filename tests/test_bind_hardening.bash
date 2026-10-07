@@ -77,6 +77,64 @@ if command -v git >/dev/null 2>&1; then
     out="$(_gitbind "${FAKE_HOME}/repos/wt")"
     assert_contains "${out}" "--bind${NL}${FAKE_HOME}/repos/main/.git" "legit worktree: shared .git bound"
     assert_not_contains "${out}" "WARN" "legit worktree: no WARN"
+    mg="${FAKE_HOME}/repos/main/.git"
+    if [[ "${OS}" == "Linux" ]]; then
+        for ro in config hooks worktrees worktrees/wt/commondir worktrees/wt/gitdir; do
+            assert_contains "${out}" "--ro-bind${NL}${mg}/${ro}${NL}" "legit worktree: ${ro} over-mounted read-only"
+        done
+        assert_contains "${out}" "--bind${NL}${mg}/worktrees/wt${NL}" "legit worktree: own worktree entry RW"
+        # Order matters for bwrap (later mount wins): RW common first,
+        # RO worktrees/ before the RW own entry, RO links last.
+        order="$(printf '%s\n' "${out}" | grep -n -x -e "${mg}" -e "${mg}/worktrees" -e "${mg}/worktrees/wt" -e "${mg}/worktrees/wt/gitdir" | awk -F: 'NR%2==1{print $2}' | tr '\n' ' ')"
+        assert_eq "${order}" "${mg} ${mg}/worktrees ${mg}/worktrees/wt ${mg}/worktrees/wt/gitdir " "legit worktree: bind order RW, RO, RW, RO"
+    fi
+
+    # Borrowed worktree entry: an untrusted checkout's .git file points at
+    # an EXISTING worktree entry of another repo. Forward link holds; the
+    # reverse link (<entry>/gitdir) names the real worktree, not this one.
+    rm -rf "${FAKE_HOME}/repos/evil"; mkdir -p "${FAKE_HOME}/repos/evil"
+    printf 'gitdir: %s\n' "${mg}/worktrees/wt" >"${FAKE_HOME}/repos/evil/.git"
+    out="$(_gitbind "${FAKE_HOME}/repos/evil")"
+    assert_not_contains "${out}" "--bind" "borrowed worktree entry: not bound"
+    assert_contains "${out}" "belongs to ${FAKE_HOME}/repos/wt/.git" "... rejected by the reverse-link rule"
+
+    # Subdirectory of a legit worktree still binds.
+    mkdir -p "${FAKE_HOME}/repos/wt/sub"
+    out="$(_gitbind "${FAKE_HOME}/repos/wt/sub")"
+    assert_contains "${out}" "--bind${NL}${mg}${NL}" "legit worktree subdirectory: shared .git bound"
+
+    # A symlink among the over-mount targets aborts the bind.
+    mv "${mg}/hooks" "${mg}/hooks.real"; ln -s "${FAKE_HOME}/.ssh" "${mg}/hooks"
+    out="$(_gitbind "${FAKE_HOME}/repos/wt")"
+    assert_not_contains "${out}" "--bind" "symlinked hooks/: common dir not bound"
+    assert_contains "${out}" "is a symlink" "... with symlink WARN"
+    rm -f "${mg}/hooks"; mv "${mg}/hooks.real" "${mg}/hooks"
+
+    # Missing hooks/ is created (so it can be over-mounted RO).
+    rm -rf "${mg}/hooks"
+    out="$(_gitbind "${FAKE_HOME}/repos/wt")"
+    hooks_made=0; [[ -d "${mg}/hooks" ]] && hooks_made=1
+    assert_eq "${hooks_made}" "1" "missing hooks/ is created before binding"
+
+    # extensions.worktreeConfig: config.worktree pre-created and RO.
+    git -C "${FAKE_HOME}/repos/main" config extensions.worktreeConfig true
+    out="$(_gitbind "${FAKE_HOME}/repos/wt")"
+    cw_made=0; [[ -f "${mg}/worktrees/wt/config.worktree" ]] && cw_made=1
+    assert_eq "${cw_made}" "1" "worktreeConfig: config.worktree pre-created"
+    if [[ "${OS}" == "Linux" ]]; then
+        assert_contains "${out}" "--ro-bind${NL}${mg}/worktrees/wt/config.worktree" "worktreeConfig: config.worktree RO"
+    fi
+    git -C "${FAKE_HOME}/repos/main" config --unset extensions.worktreeConfig
+    rm -f "${mg}/worktrees/wt/config.worktree"
+
+    # Submodule git dirs: hooks/ and config RO.
+    mkdir -p "${mg}/modules/sub1"; : >"${mg}/modules/sub1/config"
+    out="$(_gitbind "${FAKE_HOME}/repos/wt")"
+    if [[ "${OS}" == "Linux" ]]; then
+        assert_contains "${out}" "--ro-bind${NL}${mg}/modules/sub1/hooks" "submodule hooks/ RO"
+        assert_contains "${out}" "--ro-bind${NL}${mg}/modules/sub1/config" "submodule config RO"
+    fi
+    rm -rf "${mg}/modules"
 
     # Crafted commondir -> ~/.ssh (made git-dir shaped so git accepts it).
     _fake_gitdir "${FAKE_HOME}/.ssh"
@@ -132,6 +190,38 @@ if command -v git >/dev/null 2>&1; then
     mkdir -p "${FAKE_HOME}/repos/nogit/.git"
     _ok "${FAKE_HOME}/repos/nogit/.git" >/dev/null
     assert_eq "$?" "1" "validator rejects a .git without HEAD/objects/refs"
+
+    # End-to-end on Linux: a legit worktree can commit / branch / checkout
+    # inside the sandbox, but cannot write hooks/, config, another
+    # worktree's entry, or its own commondir link.
+    if [[ "${OS}" == "Linux" ]] && command -v bwrap >/dev/null 2>&1; then
+        git_q -C "${FAKE_HOME}/repos/main" worktree add "${FAKE_HOME}/repos/wt2" -b wt2
+        mkdir -p "${FAKE_HOME}/bin"
+        cat >"${FAKE_HOME}/bin/codex" <<'STUB'
+#!/bin/bash
+m="$(git rev-parse --git-common-dir)"
+g() { git -c user.name=t -c user.email=t@t "$@" >/dev/null 2>&1; }
+echo x >file && g add file && g commit -m sandboxed && echo COMMIT_OK
+g branch side && echo BRANCH_OK
+g checkout -b feature && g checkout wt && echo CHECKOUT_OK
+for f in "${m}/hooks/post-commit" "${m}/config" "${m}/worktrees/wt2/commondir" "${m}/worktrees/wt/commondir" "${m}/worktrees/newentry"; do
+    if (echo evil >>"${f}" || mkdir "${f}") 2>/dev/null; then echo "WROTE:${f##*/.git/}"; else echo "DENIED:${f##*/.git/}"; fi
+done
+STUB
+        chmod +x "${FAKE_HOME}/bin/codex"
+        out="$(cd "${FAKE_HOME}/repos/wt" && PATH="${FAKE_HOME}/bin:${PATH}" \
+            bash "${REPO_ROOT}/bin/executable_codex_wrapper.bash" x </dev/null 2>&1)"
+        for ok in COMMIT_OK BRANCH_OK CHECKOUT_OK; do
+            assert_contains "${out}" "${ok}" "e2e legit worktree: ${ok}"
+        done
+        for f in hooks/post-commit config worktrees/wt2/commondir worktrees/wt/commondir worktrees/newentry; do
+            assert_contains "${out}" "DENIED:${f}" "e2e legit worktree: write to ${f} denied"
+        done
+        log="$(git -C "${FAKE_HOME}/repos/main" log --format=%s -1 wt)"
+        assert_eq "${log}" "sandboxed" "e2e legit worktree: commit landed in the shared repo"
+        hooks_planted=0; [[ -e "${mg}/hooks/post-commit" ]] && hooks_planted=1
+        assert_eq "${hooks_planted}" "0" "e2e legit worktree: no hook planted on the host"
+    fi
 
     # End-to-end on Linux: the crafted repo launches (no abort) and the
     # agent cannot write into ~/.ssh.
