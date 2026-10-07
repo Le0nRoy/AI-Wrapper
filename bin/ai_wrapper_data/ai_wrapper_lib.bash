@@ -379,6 +379,33 @@ unset _ai_n _ai_t _ai_d _ai_sev _ai_hl _ai_det _ai_cat
 # on unrecognised keys, not a hard error).
 _AI_WRAPPER_PRESET_FORMAT_VERSION="2026-05-28"
 
+# The preset file is per-workdir, not per-agent, so the Claude and Codex
+# wrappers share it. Each agent's account key is only in its own catalog:
+# _preset_autoload skips these silently (instead of the "unknown setting"
+# WARN) and _preset_autosave carries their saved values over, so saving
+# from one wrapper doesn't erase the other wrapper's account choice.
+_AI_PRESET_FOREIGN_KEYS=(CLAUDE_ACCOUNT CODEX_ACCOUNT)
+
+# Return 0 when $1 is a catalog key in this process.
+_preset_is_catalog_key() {
+    local entry
+    for entry in "${_AI_SETTINGS_LIST[@]}"; do
+        [[ "${entry%%|*}" == "${1}" ]] && return 0
+    done
+    return 1
+}
+
+# Return 0 when $1 is another agent's key (see _AI_PRESET_FOREIGN_KEYS)
+# that this process's catalog doesn't own.
+_preset_is_foreign_key() {
+    local k
+    _preset_is_catalog_key "${1}" && return 1
+    for k in "${_AI_PRESET_FOREIGN_KEYS[@]}"; do
+        [[ "${k}" == "${1}" ]] && return 0
+    done
+    return 1
+}
+
 # Parse one catalog entry into globals: _set_name _set_type _set_default
 # _set_severity _set_headline _set_detail _set_category _set_os_scope.
 # Globals because bash 3.2 lacks namerefs and returning an 8-tuple via
@@ -619,6 +646,14 @@ _preset_autosave() {
             cur="$(_setting_current_value "${_set_name}" "${_set_type}" "${_set_default}")"
             printf '%s=%s\n' "${_set_name}" "${cur}"
         done
+        # Carry over the other agent's keys from the previous save.
+        if [[ -f "${path}" ]]; then
+            local line
+            while IFS= read -r line || [[ -n "${line}" ]]; do
+                [[ "${line}" == *=* ]] || continue
+                _preset_is_foreign_key "${line%%=*}" && printf '%s\n' "${line}"
+            done < "${path}"
+        fi
     } > "${tmp}" 2>/dev/null || {
         rm -f "${tmp}" 2>/dev/null
         echo "WARN: _preset_autosave: failed to write ${tmp}" >/dev/tty
@@ -670,6 +705,8 @@ _preset_autoload() {
             fi
         done
         if [[ -z "${catalog_type}" ]]; then
+            # Another agent wrapper's key in the shared per-workdir file.
+            _preset_is_foreign_key "${key}" && continue
             echo "  WARN: _preset_autoload: unknown setting: ${key}" >/dev/tty
             continue
         fi
