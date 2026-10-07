@@ -54,8 +54,9 @@ between them without logging in again.
   profiles it found. Create one with e.g. `mkdir ~/.codex-work`, then log
   in once from a wrapper session using that profile.
 - For the default account the wrapper creates `~/.codex` if missing, and
-  refuses to launch if `~/.codex` is a non-directory or a symlink that
-  resolves outside `$HOME`.
+  refuses to launch if `~/.codex` is a non-directory. Any profile dir that
+  is a symlink must resolve inside `$HOME` and outside credential dirs
+  (`~/.ssh`, `~/.gnupg`, `~/.aws`, ...), or the launch is refused.
 - Non-interactive launches respect `CODEX_ACCOUNT=<name>` from the
   environment, or fall back to the workdir's saved preset.
 
@@ -72,7 +73,11 @@ functional on Linux only (same limitation as the Claude wrapper).
 ## Also shared with the Claude wrapper
 
 - Git worktrees: when the working directory is a `git worktree`, the main
-  repository's shared `.git` is bound read-write so git works.
+  repository's shared `.git` is bound read-write so git works — only if it
+  passes validation (under `$HOME`, not in a dotfile dir, a real `.git` /
+  `<name>.git` dir that lists this worktree). Otherwise a WARN is printed
+  and git won't work in the worktree; bind the `.git` via
+  `AI_SANDBOX_EXTRA_RW_DIRS` if you trust it.
 - `AI_SANDBOX_PASS_GITLAB=1` also binds the glab config read-only.
 - `AI_WRAPPER_EXTRA_PROFILE` plugins (see the Claude wrapper help,
   "Extensions via AI_WRAPPER_EXTRA_PROFILE") are loaded, including the

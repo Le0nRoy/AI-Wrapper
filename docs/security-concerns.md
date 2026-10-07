@@ -423,6 +423,43 @@ shared `.git` (RW, only when it lies outside WORKDIR), and glab config
 (RO, only with `AI_SANDBOX_PASS_GITLAB=1`). The worktree/glab logic now
 lives once in `ai_wrapper_lib.bash` and is shared by both wrappers.
 
+### B-ι — git worktree common dir is attacker-controlled (RESOLVED, 2026-10)
+
+The worktree bind (`_wrapper_bind_git_common_dir`, originally inline in
+`claude_wrapper.bash`) RW-bound whatever `git rev-parse --git-common-dir`
+returned. That value comes from WORKDIR's `.git` file and the `commondir`
+file it points to — both controlled by an untrusted checkout. A crafted
+repo could name any git-shaped directory (another private repo's `.git`,
+whose `hooks/` then run on the host; `$HOME` or a dotfile dir that
+happens to contain `HEAD`/`objects`/`refs`) and get it bound RW.
+Pre-existing in the Claude wrapper; inherited by Codex when the logic
+moved to `ai_wrapper_lib.bash`.
+
+**Resolution.** `_wrapper_git_common_dir_ok` validates the resolved
+path first: a real directory strictly under `$HOME`; not sensitive per
+`_sandbox_sensitive_dir_kind` (the classifier the Linux backend now uses
+for WORKDIR / `AI_SANDBOX_EXTRA_*_DIRS`); basename `.git` or
+`<name>.git` with `HEAD`, `objects/`, `refs/`; and WORKDIR's own gitdir
+must resolve to `<common>/worktrees/<name>` (an attacker who can only
+write inside WORKDIR cannot create that back-link). Failure WARNs and
+skips the bind; the launch continues. `AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR`
+does not relax it. **Behaviour change:** worktrees of repos outside
+`$HOME` (or under a `$HOME` dotfile dir) no longer get the shared `.git`
+bound automatically — grant it explicitly with `AI_SANDBOX_EXTRA_RW_DIRS`.
+
+### B-κ — symlinked account paths (RESOLVED, 2026-10)
+
+Named profiles (`~/.claude-<name>`, `~/.claude-<name>.json`,
+`~/.codex-<name>`) and `~/.claude.json` were bound RW without checking
+whether they were symlinks, and `~/.claude` / `~/.codex` only refused
+targets outside `$HOME`. `_wrapper_check_config_symlink`
+(`ai_wrapper_lib.bash`) now refuses any of these that is a symlink
+resolving outside `$HOME` or into a credential location (`~/.ssh`,
+`~/.gnupg`, `~/.aws`, `~/.kube`, `~/.docker`, `~/.colima`, `~/.netrc`,
+`~/.npmrc`, `~/.pypirc`, gcloud and glab config). The `~/.claude.json`
+check runs before `touch`, so a dangling symlink target is never
+created. The Codex wrapper binds the resolved path.
+
 ### B-β — `_realpath` fallback chain has multiple silent branches (RESOLVED, 2026-05-24, WS6)
 
 Three resolvers tried in order: `realpath`, `perl -MCwd=abs_path`,

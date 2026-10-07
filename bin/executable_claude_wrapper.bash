@@ -144,6 +144,7 @@ _bind_claude_account() {
         # requires bind sources to exist, so a fresh machine (no prior
         # Claude run) would otherwise hard-fail here instead of letting
         # Claude initialize the directory itself.
+        _wrapper_check_config_symlink "${claude_dir}" || exit 1
         if ! mkdir -p "${claude_dir}"; then
             echo "ERROR: failed to create ${claude_dir}" >&2
             exit 1
@@ -154,6 +155,8 @@ _bind_claude_account() {
         # binding a nonexistent destination would leave that rename with
         # nothing to land on. If the path exists but isn't a regular file,
         # refuse rather than silently binding a misshapen path.
+        # Check a symlinked ~/.claude.json BEFORE touch follows it.
+        _wrapper_check_config_symlink "${claude_json_src}" || exit 1
         if [[ -e "${claude_json_src}" && ! -f "${claude_json_src}" ]]; then
             echo "ERROR: ${claude_json_src} exists but is not a regular file. Move or remove it before launching." >&2
             exit 1
@@ -166,6 +169,14 @@ _bind_claude_account() {
             echo "WARN: could not update ${claude_json_src} mtime; continuing because the file exists." >&2
         fi
     fi
+
+    # Shared symlink-target guard (ai_wrapper_lib.bash): refuses a
+    # symlinked profile dir / .claude.json whose target is outside $HOME or
+    # inside a credential location. Covers the named-account paths, the
+    # ~/.claude.json file, and credential-dir targets of ~/.claude, none of
+    # which the checks above caught.
+    _wrapper_check_config_symlink "${claude_dir}" || exit 1
+    _wrapper_check_config_symlink "${claude_json_src}" || exit 1
 
     _wrapper_add_bind "${claude_dir}" "${HOME}/.claude"
     _wrapper_add_bind "${claude_json_src}" "${HOME}/.claude.json"

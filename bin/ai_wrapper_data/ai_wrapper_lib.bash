@@ -200,6 +200,13 @@ _check_workdir_breadth() {
 # when the detection fails (not a git repo, git missing, or a regular
 # non-worktree repo where common-dir resolves to $PWD/.git which is already
 # inside WORKDIR).
+#
+# SECURITY: the common dir comes from files inside WORKDIR (the `.git`
+# gitdir file and the `commondir` file it points at), i.e. it is
+# attacker-controlled for an untrusted checkout — a crafted repo could
+# otherwise get ~/.ssh, $HOME or /etc bound RW. _wrapper_git_common_dir_ok
+# validates it before binding; a rejected candidate is WARNed and skipped
+# (the launch continues, git just won't work in that worktree).
 _wrapper_bind_git_common_dir() {
     local git_common_dir git_common_resolved wd_resolved home_resolved wt_parent
     git_common_dir="$(git -C "$(pwd -P)" rev-parse --git-common-dir 2>/dev/null)" || return 0
@@ -207,7 +214,8 @@ _wrapper_bind_git_common_dir() {
     # `git rev-parse --git-common-dir` returns either an absolute path or a
     # path relative to CWD (typically just ".git"). Canonicalize so the bind
     # source is unambiguous and so symlinks in the chain are resolved the
-    # same way the kernel's path lookup will.
+    # same way the kernel's path lookup will. Only the resolved path is
+    # ever bound — never the raw, possibly-symlinked one.
     if [[ "${git_common_dir}" != /* ]]; then
         git_common_dir="$(pwd -P)/${git_common_dir}"
     fi
@@ -221,6 +229,11 @@ _wrapper_bind_git_common_dir() {
     if [[ -n "${wd_resolved}" \
             && "${git_common_resolved}" != "${wd_resolved}"/* \
             && "${git_common_resolved}" != "${wd_resolved}" ]]; then
+        local reason
+        if ! reason="$(_wrapper_git_common_dir_ok "${git_common_resolved}" "${home_resolved}" "${wd_resolved}")"; then
+            echo_log "WARN" "[${AI_AGENT_COMMAND:-ai-wrapper}] Not binding git common dir ${git_common_resolved}: ${reason}. git will not work in this worktree; bind it via AI_SANDBOX_EXTRA_RW_DIRS if it is trusted."
+            return 0
+        fi
         _wrapper_add_bind "${git_common_resolved}"
         # Git canonicalizes the absolute paths in the gitdir line
         # (mainrepo/.git/worktrees/<name>) which requires stat() on every
@@ -236,6 +249,83 @@ _wrapper_bind_git_common_dir() {
             wt_parent="${wt_parent%/*}"
         done
     fi
+    return 0
+}
+
+# Validate a resolved git common dir before it is bound RW. Args:
+# RESOLVED_COMMON_DIR RESOLVED_HOME RESOLVED_WORKDIR. Returns 0 if OK;
+# otherwise prints the rejection reason and returns 1. Rules:
+#   (a) a real directory (not a symlink) strictly under $HOME;
+#   (b) not a sensitive location per _sandbox_sensitive_dir_kind (the same
+#       classifier the sandbox applies to WORKDIR / AI_SANDBOX_EXTRA_*_DIRS:
+#       system dirs, $HOME, anything under a $HOME dotfile dir);
+#   (c) shaped like a git dir: HEAD file plus objects/ and refs/ dirs, and
+#       named `.git` (normal repo) or `<name>.git` (bare repo convention);
+#   (d) WORKDIR really is one of its linked worktrees: git's own gitdir
+#       for WORKDIR resolves to <common>/worktrees/<name>.
+# AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR does NOT relax these — trusted repos
+# outside the rules can be granted explicitly via AI_SANDBOX_EXTRA_RW_DIRS.
+_wrapper_git_common_dir_ok() {
+    local dir="${1%/}" home="${2%/}" wd="${3%/}" kind base git_dir
+    # Fail closed if the classifier (ai_agent_universal_wrapper.bash)
+    # wasn't sourced first.
+    if ! declare -f _sandbox_sensitive_dir_kind >/dev/null 2>&1; then
+        echo "sensitive-path classifier unavailable"; return 1
+    fi
+    if [[ -L "${dir}" || ! -d "${dir}" ]]; then
+        echo "not a resolved directory"; return 1
+    fi
+    if [[ -z "${home}" || "${dir}" != "${home}"/* ]]; then
+        echo "not strictly under \$HOME"; return 1
+    fi
+    if kind="$(_sandbox_sensitive_dir_kind "${dir}" "${home}")"; then
+        echo "sensitive location (${kind})"; return 1
+    fi
+    base="${dir##*/}"
+    case "${base}" in
+        .git|?*.git) ;;
+        *) echo "basename '${base}' is not .git or <name>.git"; return 1 ;;
+    esac
+    if [[ ! -f "${dir}/HEAD" || -L "${dir}/HEAD" || ! -d "${dir}/objects" || ! -d "${dir}/refs" ]]; then
+        echo "does not look like a git dir (HEAD, objects/, refs/)"; return 1
+    fi
+    git_dir="$(git -C "${wd}" rev-parse --absolute-git-dir 2>/dev/null)" || git_dir=""
+    [[ -n "${git_dir}" ]] && git_dir="$(_realpath "${git_dir}")" || git_dir=""
+    case "${git_dir}" in
+        "${dir}"/worktrees/?*) ;;
+        *) echo "WORKDIR's gitdir (${git_dir:-unknown}) is not a worktree of it"; return 1 ;;
+    esac
+    return 0
+}
+
+# Guard for an agent config path (~/.claude, ~/.codex, ~/.<agent>-<name>,
+# ~/.claude-<name>.json) that the wrapper binds RW. If PATH is a symlink,
+# its target must resolve strictly under $HOME and outside the credential
+# locations the sandbox otherwise only exposes behind explicit PASS_*
+# opt-ins — a planted symlink must not turn the account bind into RW on
+# ~/.ssh, $HOME or /etc. Non-symlinks pass (callers check type/existence).
+# Prints an ERROR and returns 1 on refusal. Args: PATH
+_wrapper_check_config_symlink() {
+    local p="${1}" resolved home cred
+    [[ -L "${p}" ]] || return 0
+    if ! resolved="$(_realpath "${p}")" || [[ -z "${resolved}" ]]; then
+        echo "ERROR: ${p} is a symlink whose target cannot be resolved. Inspect and remove before launching." >&2
+        return 1
+    fi
+    home="$(_realpath "${HOME}")" || home="${HOME%/}"
+    home="${home%/}"
+    if [[ -z "${home}" || "${resolved}" != "${home}"/* ]]; then
+        echo "ERROR: ${p} is a symlink pointing outside \$HOME (resolves to ${resolved}). Refusing — the bind would grant RW on the target." >&2
+        return 1
+    fi
+    for cred in .ssh .gnupg .aws .kube .docker .colima .netrc .npmrc .pypirc \
+            .config/gcloud .config/glab-cli .local/share/glab-cli \
+            "Library/Application Support/glab-cli"; do
+        if [[ "${resolved}" == "${home}/${cred}" || "${resolved}" == "${home}/${cred}"/* ]]; then
+            echo "ERROR: ${p} is a symlink into a credential location (resolves to ${resolved}). Refusing — the bind would grant RW on it." >&2
+            return 1
+        fi
+    done
     return 0
 }
 

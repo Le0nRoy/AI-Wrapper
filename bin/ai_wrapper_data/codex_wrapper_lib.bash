@@ -105,27 +105,19 @@ _bind_codex_account() {
             echo "Available profiles: $(_codex_list_account_profiles | tr '\n' ' ')" >&2
             exit 1
         fi
+        # A named profile dir that is a symlink gets the same target
+        # check as the default dir below.
+        _wrapper_check_config_symlink "${codex_dir}" || exit 1
         AI_WRAPPER_AGENT_NAME="Codex CLI [${account}]"
     else
         codex_dir="${HOME}/.codex"
 
         # Symlink-safety guard (same as ~/.claude): refuse a ~/.codex that
-        # is a non-directory, or a symlink resolving outside $HOME — the
-        # mkdir/bind below would otherwise follow it and grant RW on the
-        # symlink target's real location.
+        # is a non-directory, or a symlink resolving outside $HOME or into
+        # a credential dir — the mkdir/bind below would otherwise follow
+        # it and grant RW on the symlink target's real location.
         if [[ -L "${codex_dir}" ]]; then
-            local _resolved_codex_dir
-            if ! _resolved_codex_dir="$(_realpath "${codex_dir}")" || [[ -z "${_resolved_codex_dir}" ]]; then
-                echo "ERROR: ${codex_dir} is a symlink whose target cannot be resolved. Inspect and remove before launching." >&2
-                exit 1
-            fi
-            case "${_resolved_codex_dir}" in
-                "${HOME}"/*) ;;
-                *)
-                    echo "ERROR: ${codex_dir} is a symlink pointing outside \$HOME (resolves to ${_resolved_codex_dir}). Refusing — the bind would grant RW on the target." >&2
-                    exit 1
-                    ;;
-            esac
+            _wrapper_check_config_symlink "${codex_dir}" || exit 1
         elif [[ -e "${codex_dir}" && ! -d "${codex_dir}" ]]; then
             echo "ERROR: ${codex_dir} exists but is not a directory or symlink. Move or remove it before launching." >&2
             exit 1
@@ -139,7 +131,10 @@ _bind_codex_account() {
         fi
     fi
 
-    _wrapper_add_bind "${codex_dir}" "${HOME}/.codex"
+    # Bind the resolved path, never a (checked) symlink unresolved.
+    local bind_src
+    bind_src="$(_realpath "${codex_dir}")" || bind_src="${codex_dir}"
+    _wrapper_add_bind "${bind_src}" "${HOME}/.codex"
 }
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
