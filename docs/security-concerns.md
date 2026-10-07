@@ -412,6 +412,96 @@ exists as a non-directory, or as a symlink whose target resolves
 outside `$HOME`. `~/.claude.json` has had this check since T11; WS3
 closes the asymmetry.
 
+**Codex wrapper (2026-10, codex parity).** `codex_wrapper.bash` had the
+same unguarded `mkdir -p ~/.codex` + RW bind. `_bind_codex_account`
+(`codex_wrapper_lib.bash`) now applies the identical guard to the default
+`~/.codex`. The same change gives the Codex wrapper the Claude wrapper's
+other binds — so its sandbox surface now matches Claude's rather than
+widening past it: a named `~/.codex-<name>/` profile (RW, bound at
+`~/.codex`, replacing — not added to — the default dir), a `git worktree`'s
+shared `.git` (RW, only when it lies outside WORKDIR), and glab config
+(RO, only with `AI_SANDBOX_PASS_GITLAB=1`). The worktree/glab logic now
+lives once in `ai_wrapper_lib.bash` and is shared by both wrappers.
+
+### B-ι — git worktree common dir is attacker-controlled (RESOLVED, 2026-10)
+
+The worktree bind (`_wrapper_bind_git_common_dir`, originally inline in
+`claude_wrapper.bash`) RW-bound whatever `git rev-parse --git-common-dir`
+returned. That value comes from WORKDIR's `.git` file and the `commondir`
+file it points to — both controlled by an untrusted checkout. A crafted
+repo could name any git-shaped directory (another private repo's `.git`,
+whose `hooks/` then run on the host; `$HOME` or a dotfile dir that
+happens to contain `HEAD`/`objects`/`refs`) and get it bound RW.
+Pre-existing in the Claude wrapper; inherited by Codex when the logic
+moved to `ai_wrapper_lib.bash`.
+
+**Resolution.** `_wrapper_git_common_dir_ok` validates the resolved
+path first: a real directory strictly under `$HOME`; not sensitive per
+`_sandbox_sensitive_dir_kind` (the classifier the Linux backend now uses
+for WORKDIR / `AI_SANDBOX_EXTRA_*_DIRS`); basename `.git` or
+`<name>.git` with `HEAD`, `objects/`, `refs/`; and WORKDIR's own gitdir
+must resolve to `<common>/worktrees/<name>` (an attacker who can only
+write inside WORKDIR cannot create that back-link). Failure WARNs and
+skips the bind; the launch continues. `AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR`
+does not relax it. **Behaviour change:** worktrees of repos outside
+`$HOME` (or under a `$HOME` dotfile dir) no longer get the shared `.git`
+bound automatically — grant it explicitly with `AI_SANDBOX_EXTRA_RW_DIRS`.
+
+### B-λ — worktree common dir: borrowed entries and host code execution (RESOLVED on Linux, 2026-10)
+
+Two gaps left by B-ι's first fix:
+
+1. **Borrowed worktree entry.** A checkout's `.git` file could point at
+   an *existing* `<victim>/.git/worktrees/<name>` of any repo; the
+   forward-link check passed. Now `<common>/worktrees/<name>/gitdir`
+   (written by git, not writable from the checkout) must resolve to
+   exactly `<worktree toplevel>/.git` (both sides realpath'd; relative
+   `gitdir` entries are resolved against the entry dir).
+2. **RW on a genuine common dir = host code execution.** The agent could
+   write `hooks/`, `config` (`core.hooksPath`, `core.fsmonitor`, aliases,
+   filter drivers), other worktrees' entries (`commondir`,
+   `config.worktree`) or submodule git dirs, all of which run on the
+   user's next git command outside the sandbox. After the RW bind the
+   wrapper now over-mounts read-only: `config`, `hooks/` (created if
+   missing), all of `worktrees/` except this worktree's own entry, that
+   entry's `commondir` / `gitdir` / `config.worktree` (pre-created when
+   `extensions.worktreeConfig` is on), and `modules/*/{hooks,config}`.
+   Any of those being a symlink aborts the bind (WARN). Commit, branch,
+   checkout, fetch keep working; `git config`, `remote add`, `push -u`,
+   `branch --set-upstream-to`, `worktree add/prune` and submodule
+   updates fail inside the sandbox. Applies to the Claude wrapper too.
+
+**TOCTOU.** Validation and binds use the same realpath-resolved paths;
+the over-mount targets are checked for symlinks immediately before the
+flags are built. A residual window remains between this check and
+bwrap's mount for a *concurrent* host process that can write the
+victim repo; sandboxed sessions can no longer rename the RO mount
+points.
+
+**macOS (open).** Seatbelt grants are additive allows: a nested
+`--ro-bind` under the common dir's `--bind` does not remove write
+access, and `macos_sandbox_exec.bash` has no deny-write helper. On
+macOS the over-mounts are emitted but not enforced; the wrapper WARNs.
+Follow-up: add a `--deny-write` flag emitting `(deny file-write*
+(subpath …))` after the allows.
+
+**Not covered (follow-up).** The same hooks/config vector exists for the
+WORKDIR's own `.git` (regular repos, and the worktree's `.git` file,
+which can be repointed): WORKDIR is RW by design.
+
+### B-κ — symlinked account paths (RESOLVED, 2026-10)
+
+Named profiles (`~/.claude-<name>`, `~/.claude-<name>.json`,
+`~/.codex-<name>`) and `~/.claude.json` were bound RW without checking
+whether they were symlinks, and `~/.claude` / `~/.codex` only refused
+targets outside `$HOME`. `_wrapper_check_config_symlink`
+(`ai_wrapper_lib.bash`) now refuses any of these that is a symlink
+resolving outside `$HOME` or into a credential location (`~/.ssh`,
+`~/.gnupg`, `~/.aws`, `~/.kube`, `~/.docker`, `~/.colima`, `~/.netrc`,
+`~/.npmrc`, `~/.pypirc`, gcloud and glab config). The `~/.claude.json`
+check runs before `touch`, so a dangling symlink target is never
+created. The Codex wrapper binds the resolved path.
+
 ### B-β — `_realpath` fallback chain has multiple silent branches (RESOLVED, 2026-05-24, WS6)
 
 Three resolvers tried in order: `realpath`, `perl -MCwd=abs_path`,

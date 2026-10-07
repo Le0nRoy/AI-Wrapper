@@ -19,6 +19,17 @@
 #   AI_SYSTEM_PROMPT_FLAG  - CLI flag for system prompt injection (e.g. "--append-system-prompt")
 #                            If unset, orchestration mode starts a plain session with a warning.
 #   AI_RESUME_ARGS         - Array of args for resume mode (default: --resume)
+#   AI_RESUME_ARGS_FIRST   - "1" to place AI_RESUME_ARGS BEFORE AGENT_FLAGS in
+#                            the resume argv (for agents whose resume is a
+#                            subcommand, e.g. `codex resume <flags>`).
+#                            Default "0": AGENT_FLAGS first (Claude).
+#
+# Optional per-agent hook (define in the agent lib to override the default
+# `AI_SYSTEM_PROMPT_FLAG <prompt>` pair in run_orchestrated_session):
+#   _agent_system_prompt_args PROMPT
+#                          - set the global array AI_SYSTEM_PROMPT_ARGS to the
+#                            argv words that inject PROMPT as a system /
+#                            developer prompt; return non-zero on failure.
 
 # pwd -P resolves symlinks so a symlinked install of this lib still finds its
 # sibling data files (orchestrator-prompt.md, etc.) next to the real file.
@@ -169,6 +180,289 @@ _check_workdir_breadth() {
     return 0
 }
 
+# ===== AGENT-GENERIC BIND HELPERS =====
+# Shared by every wrapper entry script (Claude/Codex). Both append to the
+# caller's WRAPPER_FLAGS via the OS-aware helpers above and are safe under
+# `set -u` (the Claude wrapper runs with it on).
+
+# Git worktree support: when WORKDIR is a `git worktree add`-created tree,
+# its top-level `.git` is a file (not a dir) that points at
+# <main>/.git/worktrees/<name> in the main repo. The shared object store +
+# refs live at the main repo's `.git/`, which is OUTSIDE WORKDIR — so every
+# git operation (status, log, fetch, commit) fails with "fatal: not a git
+# repository: <gitdir>" because the sandbox's default-deny fence hides the
+# shared `.git`.
+#
+# `git rev-parse --git-common-dir` returns the shared `.git` directory. When
+# it differs from `$PWD/.git`, bind it RW so the worktree is fully
+# functional. RW (not RO) is required: `git commit` / `git fetch` / `git gc`
+# all mutate the shared object store and refs. The bind is silently skipped
+# when the detection fails (not a git repo, git missing, or a regular
+# non-worktree repo where common-dir resolves to $PWD/.git which is already
+# inside WORKDIR).
+#
+# SECURITY: the common dir comes from files inside WORKDIR (the `.git`
+# gitdir file and the `commondir` file it points at), i.e. it is
+# attacker-controlled for an untrusted checkout — a crafted repo could
+# otherwise get ~/.ssh, $HOME, /etc or another repo's .git bound RW.
+# _wrapper_git_common_dir_ok validates it before binding; a rejected
+# candidate is WARNed and skipped (the launch continues, git just won't
+# work in that worktree).
+#
+# Even for a genuine worktree, RW on the shared .git would let the agent
+# plant host code execution for the user's next git command (hooks/,
+# config: core.hooksPath / core.fsmonitor / aliases / filter drivers,
+# other worktrees' entries, submodule git dirs). So after the RW bind the
+# wrapper over-mounts those read-only (bwrap: a later bind wins), keeping
+# only what git needs to commit / checkout / branch writable: objects/,
+# refs/, packed-refs, logs/ and this worktree's own worktrees/<name>/
+# (minus its commondir / gitdir / config.worktree links). Consequence:
+# git commands that write the shared config (git config, remote add,
+# push -u, branch --set-upstream-to), git worktree add/prune and
+# submodule updates fail inside the sandbox.
+#
+# macOS: Seatbelt grants are additive allows; a nested --ro-bind under a
+# --bind does not remove write access, and the macOS backend has no
+# deny-write helper yet. The RO over-mounts are therefore only enforced on
+# Linux; on macOS the wrapper WARNs (see docs/security-concerns.md B-λ).
+_wrapper_bind_git_common_dir() {
+    local git_common_dir git_common_resolved wd_resolved home_resolved wt_parent
+    git_common_dir="$(git -C "$(pwd -P)" rev-parse --git-common-dir 2>/dev/null)" || return 0
+    [[ -n "${git_common_dir}" ]] || return 0
+    # `git rev-parse --git-common-dir` returns either an absolute path or a
+    # path relative to CWD (typically just ".git"). Canonicalize so the bind
+    # source is unambiguous and so symlinks in the chain are resolved the
+    # same way the kernel's path lookup will. Only the validated, resolved
+    # path is ever bound — never the raw, possibly-symlinked one.
+    if [[ "${git_common_dir}" != /* ]]; then
+        git_common_dir="$(pwd -P)/${git_common_dir}"
+    fi
+    git_common_resolved="$(_realpath "${git_common_dir}")" || return 0
+    [[ -n "${git_common_resolved}" && -d "${git_common_resolved}" ]] || return 0
+    wd_resolved="$(_realpath "$(pwd -P)")" || wd_resolved=""
+    home_resolved="$(_realpath "${HOME}")" || home_resolved="${HOME%/}"
+    home_resolved="${home_resolved%/}"
+    # Skip when the shared .git is already inside WORKDIR — a regular
+    # (non-worktree) repo binds it via the WORKDIR rule.
+    [[ -n "${wd_resolved}" ]] || return 0
+    [[ "${git_common_resolved}" != "${wd_resolved}"/* \
+        && "${git_common_resolved}" != "${wd_resolved}" ]] || return 0
+
+    local reason
+    if ! reason="$(_wrapper_git_common_dir_ok "${git_common_resolved}" "${home_resolved}" "${wd_resolved}")"; then
+        echo_log "WARN" "[${AI_AGENT_COMMAND:-ai-wrapper}] Not binding git common dir ${git_common_resolved}: ${reason}. git will not work in this worktree; bind it via AI_SANDBOX_EXTRA_RW_DIRS if it is trusted."
+        return 0
+    fi
+    # _wrapper_git_common_dir_ok printed the validated worktree entry dir.
+    local wt_entry="${reason}"
+
+    # Host-side prep, all inside the validated common dir: the RO
+    # over-mounts need existing sources (an absent hooks/ would otherwise
+    # be creatable by the agent), and config.worktree is honoured by git
+    # only with extensions.worktreeConfig — pre-create it then so the agent
+    # can't add one. Any symlink among the over-mount targets (e.g. planted
+    # by an earlier session) aborts the bind: following it would expose
+    # the symlink's target instead.
+    local -a ro_paths=("${git_common_resolved}/config" "${git_common_resolved}/hooks")
+    [[ -d "${git_common_resolved}/hooks" || -L "${git_common_resolved}/hooks" ]] \
+        || mkdir "${git_common_resolved}/hooks" 2>/dev/null
+    if [[ "$(git config --file "${git_common_resolved}/config" --type=bool --get extensions.worktreeConfig 2>/dev/null)" == "true" \
+            && ! -e "${wt_entry}/config.worktree" && ! -L "${wt_entry}/config.worktree" ]]; then
+        : >"${wt_entry}/config.worktree" 2>/dev/null
+    fi
+    local sub
+    for sub in "${git_common_resolved}/modules/"*/; do
+        sub="${sub%/}"
+        [[ -d "${sub}" && ! -L "${sub}" ]] || continue
+        [[ -d "${sub}/hooks" || -L "${sub}/hooks" ]] || mkdir "${sub}/hooks" 2>/dev/null
+        ro_paths+=("${sub}/hooks")
+        [[ -e "${sub}/config" || -L "${sub}/config" ]] && ro_paths+=("${sub}/config")
+    done
+    local p
+    for p in "${ro_paths[@]}" "${git_common_resolved}/worktrees" "${wt_entry}" \
+            "${wt_entry}/commondir" "${wt_entry}/gitdir" "${wt_entry}/config.worktree"; do
+        if [[ -L "${p}" ]]; then
+            echo_log "WARN" "[${AI_AGENT_COMMAND:-ai-wrapper}] Not binding git common dir ${git_common_resolved}: ${p} is a symlink."
+            return 0
+        fi
+    done
+    if [[ ! -f "${git_common_resolved}/config" || ! -d "${git_common_resolved}/hooks" ]]; then
+        echo_log "WARN" "[${AI_AGENT_COMMAND:-ai-wrapper}] Not binding git common dir ${git_common_resolved}: config or hooks/ missing and could not be created."
+        return 0
+    fi
+
+    _wrapper_add_bind "${git_common_resolved}"
+    for p in "${ro_paths[@]}"; do
+        _wrapper_add_ro_bind "${p}"
+    done
+    # Other worktrees' entries RO, this worktree's entry RW, and its link
+    # files RO again.
+    _wrapper_add_ro_bind "${git_common_resolved}/worktrees"
+    _wrapper_add_bind "${wt_entry}"
+    for p in "${wt_entry}/commondir" "${wt_entry}/gitdir" "${wt_entry}/config.worktree"; do
+        [[ -f "${p}" ]] && _wrapper_add_ro_bind "${p}"
+    done
+    if [[ "${_wrapper_os}" == "Darwin" ]]; then
+        echo_log "WARN" "[${AI_AGENT_COMMAND:-ai-wrapper}] macOS: ${git_common_resolved}/hooks and config are writable by the agent (no nested read-only on Seatbelt yet). Review them before running git outside the sandbox."
+    fi
+
+    # Git canonicalizes the absolute paths in the gitdir line
+    # (mainrepo/.git/worktrees/<name>) which requires stat() on every
+    # intermediate dir between $HOME and the shared .git (Seatbelt
+    # only — see _wrapper_add_meta_bind). Add only the shared-.git
+    # branch here; the WORKDIR branch of this walk is handled by
+    # each backend already.
+    wt_parent="${git_common_resolved%/*}"
+    while [[ -n "${wt_parent}" \
+            && "${wt_parent}" != "${home_resolved}" \
+            && "${wt_parent}" != "/" ]]; do
+        _wrapper_add_meta_bind "${wt_parent}"
+        wt_parent="${wt_parent%/*}"
+    done
+    return 0
+}
+
+# Validate a resolved git common dir before it is bound RW. Args:
+# RESOLVED_COMMON_DIR RESOLVED_HOME RESOLVED_WORKDIR. On success prints the
+# resolved worktree entry dir (<common>/worktrees/<name>) and returns 0;
+# otherwise prints the rejection reason and returns 1. Rules:
+#   (a) a real directory (not a symlink) strictly under $HOME;
+#   (b) not a sensitive location per _sandbox_sensitive_dir_kind (the same
+#       classifier the sandbox applies to WORKDIR / AI_SANDBOX_EXTRA_*_DIRS:
+#       system dirs, $HOME, anything under a $HOME dotfile dir);
+#   (c) shaped like a git dir: config + HEAD files plus objects/ and refs/
+#       dirs, and named `.git` (normal repo) or `<name>.git` (bare repo);
+#   (d) forward link: git's gitdir for WORKDIR resolves to exactly
+#       <common>/worktrees/<name> (one path component);
+#   (e) reverse link: <common>/worktrees/<name>/gitdir — written by
+#       `git worktree add` in the victim-side repo, not writable from an
+#       untrusted checkout — resolves to exactly <worktree top>/.git, where
+#       <worktree top> is WORKDIR's toplevel. Without (e) a checkout could
+#       borrow any existing worktree entry of any repo by pointing its
+#       .git file at it.
+# Both sides of every comparison are realpath-resolved.
+# AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR does NOT relax these — trusted repos
+# outside the rules can be granted explicitly via AI_SANDBOX_EXTRA_RW_DIRS.
+_wrapper_git_common_dir_ok() {
+    local dir="${1%/}" home="${2%/}" wd="${3%/}" kind base git_dir name top back
+    # Fail closed if the classifier (ai_agent_universal_wrapper.bash)
+    # wasn't sourced first.
+    if ! declare -f _sandbox_sensitive_dir_kind >/dev/null 2>&1; then
+        echo "sensitive-path classifier unavailable"; return 1
+    fi
+    if [[ -L "${dir}" || ! -d "${dir}" ]]; then
+        echo "not a resolved directory"; return 1
+    fi
+    if [[ -z "${home}" || "${dir}" != "${home}"/* ]]; then
+        echo "not strictly under \$HOME"; return 1
+    fi
+    if kind="$(_sandbox_sensitive_dir_kind "${dir}" "${home}")"; then
+        echo "sensitive location (${kind})"; return 1
+    fi
+    base="${dir##*/}"
+    case "${base}" in
+        .git|?*.git) ;;
+        *) echo "basename '${base}' is not .git or <name>.git"; return 1 ;;
+    esac
+    if [[ ! -f "${dir}/HEAD" || -L "${dir}/HEAD" || ! -f "${dir}/config" \
+            || ! -d "${dir}/objects" || ! -d "${dir}/refs" ]]; then
+        echo "does not look like a git dir (config, HEAD, objects/, refs/)"; return 1
+    fi
+    # (d) forward link.
+    git_dir="$(git -C "${wd}" rev-parse --absolute-git-dir 2>/dev/null)" || git_dir=""
+    if [[ -n "${git_dir}" ]]; then
+        git_dir="$(_realpath "${git_dir}")" || git_dir=""
+    fi
+    name="${git_dir#"${dir}/worktrees/"}"
+    if [[ -z "${git_dir}" || "${name}" == "${git_dir}" || -z "${name}" || "${name}" == */* \
+            || -L "${git_dir}" || ! -d "${git_dir}" ]]; then
+        echo "WORKDIR's gitdir (${git_dir:-unknown}) is not a worktree of it"; return 1
+    fi
+    # (e) reverse link.
+    top="$(git -C "${wd}" rev-parse --show-toplevel 2>/dev/null)" || top=""
+    if [[ -n "${top}" ]]; then
+        top="$(_realpath "${top}")" || top=""
+    fi
+    back=""
+    if [[ -f "${git_dir}/gitdir" && ! -L "${git_dir}/gitdir" ]]; then
+        IFS= read -r back <"${git_dir}/gitdir" || [[ -n "${back}" ]] || back=""
+        # git may record a path relative to the entry dir
+        # (worktree.useRelativePaths).
+        [[ -n "${back}" && "${back}" != /* ]] && back="${git_dir}/${back}"
+        if [[ -n "${back}" ]]; then
+            back="$(_realpath "${back}")" || back=""
+        fi
+    fi
+    if [[ -z "${top}" || -z "${back}" || "${back}" != "${top}/.git" ]]; then
+        echo "worktree entry ${git_dir} belongs to ${back:-unknown}, not this checkout (${top:-unknown}/.git)"; return 1
+    fi
+    printf '%s' "${git_dir}"
+    return 0
+}
+
+# Guard for an agent config path (~/.claude, ~/.codex, ~/.<agent>-<name>,
+# ~/.claude-<name>.json) that the wrapper binds RW. If PATH is a symlink,
+# its target must resolve strictly under $HOME and outside the credential
+# locations the sandbox otherwise only exposes behind explicit PASS_*
+# opt-ins — a planted symlink must not turn the account bind into RW on
+# ~/.ssh, $HOME or /etc. Non-symlinks pass (callers check type/existence).
+# Prints an ERROR and returns 1 on refusal. Args: PATH
+_wrapper_check_config_symlink() {
+    local p="${1}" resolved home cred
+    [[ -L "${p}" ]] || return 0
+    if ! resolved="$(_realpath "${p}")" || [[ -z "${resolved}" ]]; then
+        echo "ERROR: ${p} is a symlink whose target cannot be resolved. Inspect and remove before launching." >&2
+        return 1
+    fi
+    home="$(_realpath "${HOME}")" || home="${HOME%/}"
+    home="${home%/}"
+    if [[ -z "${home}" || "${resolved}" != "${home}"/* ]]; then
+        echo "ERROR: ${p} is a symlink pointing outside \$HOME (resolves to ${resolved}). Refusing — the bind would grant RW on the target." >&2
+        return 1
+    fi
+    for cred in .ssh .gnupg .aws .kube .docker .colima .netrc .npmrc .pypirc \
+            .config/gcloud .config/glab-cli .local/share/glab-cli \
+            "Library/Application Support/glab-cli"; do
+        if [[ "${resolved}" == "${home}/${cred}" || "${resolved}" == "${home}/${cred}"/* ]]; then
+            echo "ERROR: ${p} is a symlink into a credential location (resolves to ${resolved}). Refusing — the bind would grant RW on it." >&2
+            return 1
+        fi
+    done
+    return 0
+}
+
+# Bind-list flags that the interactive Settings sub-menu can toggle
+# need to be evaluated AFTER the menu — otherwise enabling them via
+# `s)` has no effect (WRAPPER_FLAGS is frozen by then). The shared
+# wrapper re-reads env-passthrough gates inside run_sandboxed_agent
+# at exec time, so those keep working; this function covers only the
+# bind-list side.
+_apply_post_menu_binds() {
+    # GitLab CLI (glab) on-disk credentials. AI_SANDBOX_PASS_GITLAB
+    # already propagates GITLAB_TOKEN / CI_JOB_TOKEN env vars; when
+    # the user has no env var set, glab reads its token from the
+    # on-disk config instead. Bind that config dir RO when the same
+    # flag is set so `glab` works end-to-end without the user having
+    # to also export the token. RO is sufficient: glab only writes
+    # the config when running `glab auth login`, which is not the
+    # agent's job.
+    #
+    # macOS uses ~/Library/Application Support/glab-cli/; the XDG
+    # paths under ~/.config/glab-cli and ~/.local/share/glab-cli are
+    # honoured as fallbacks (some users set XDG_CONFIG_HOME to
+    # relocate) and are the only paths that exist on Linux.
+    if [[ "${AI_SANDBOX_PASS_GITLAB:-0}" == "1" ]]; then
+        local _glab_dir
+        for _glab_dir in \
+                "${HOME}/Library/Application Support/glab-cli" \
+                "${HOME}/.config/glab-cli" \
+                "${HOME}/.local/share/glab-cli"; do
+            [[ -d "${_glab_dir}" ]] && _wrapper_add_ro_bind "${_glab_dir}"
+        done
+    fi
+    return 0
+}
+
 # ===== SETTINGS CATALOG =====
 # Centralised list of env vars that change wrapper runtime behaviour.
 # Drives the startup banner table AND the interactive toggle sub-menu so
@@ -276,6 +570,33 @@ unset _ai_n _ai_t _ai_d _ai_sev _ai_hl _ai_det _ai_cat
 # debugging; not consulted on load (older presets load with a WARN
 # on unrecognised keys, not a hard error).
 _AI_WRAPPER_PRESET_FORMAT_VERSION="2026-05-28"
+
+# The preset file is per-workdir, not per-agent, so the Claude and Codex
+# wrappers share it. Each agent's account key is only in its own catalog:
+# _preset_autoload skips these silently (instead of the "unknown setting"
+# WARN) and _preset_autosave carries their saved values over, so saving
+# from one wrapper doesn't erase the other wrapper's account choice.
+_AI_PRESET_FOREIGN_KEYS=(CLAUDE_ACCOUNT CODEX_ACCOUNT)
+
+# Return 0 when $1 is a catalog key in this process.
+_preset_is_catalog_key() {
+    local entry
+    for entry in "${_AI_SETTINGS_LIST[@]}"; do
+        [[ "${entry%%|*}" == "${1}" ]] && return 0
+    done
+    return 1
+}
+
+# Return 0 when $1 is another agent's key (see _AI_PRESET_FOREIGN_KEYS)
+# that this process's catalog doesn't own.
+_preset_is_foreign_key() {
+    local k
+    _preset_is_catalog_key "${1}" && return 1
+    for k in "${_AI_PRESET_FOREIGN_KEYS[@]}"; do
+        [[ "${k}" == "${1}" ]] && return 0
+    done
+    return 1
+}
 
 # Parse one catalog entry into globals: _set_name _set_type _set_default
 # _set_severity _set_headline _set_detail _set_category _set_os_scope.
@@ -517,6 +838,14 @@ _preset_autosave() {
             cur="$(_setting_current_value "${_set_name}" "${_set_type}" "${_set_default}")"
             printf '%s=%s\n' "${_set_name}" "${cur}"
         done
+        # Carry over the other agent's keys from the previous save.
+        if [[ -f "${path}" ]]; then
+            local line
+            while IFS= read -r line || [[ -n "${line}" ]]; do
+                [[ "${line}" == *=* ]] || continue
+                _preset_is_foreign_key "${line%%=*}" && printf '%s\n' "${line}"
+            done < "${path}"
+        fi
     } > "${tmp}" 2>/dev/null || {
         rm -f "${tmp}" 2>/dev/null
         echo "WARN: _preset_autosave: failed to write ${tmp}" >/dev/tty
@@ -568,6 +897,8 @@ _preset_autoload() {
             fi
         done
         if [[ -z "${catalog_type}" ]]; then
+            # Another agent wrapper's key in the shared per-workdir file.
+            _preset_is_foreign_key "${key}" && continue
             echo "  WARN: _preset_autoload: unknown setting: ${key}" >/dev/tty
             continue
         fi
@@ -950,16 +1281,30 @@ run_orchestrated_session() {
         return 1
     fi
 
-    if [[ -z "${AI_SYSTEM_PROMPT_FLAG:-}" ]]; then
+    # Agents whose system-prompt injection isn't a plain `FLAG VALUE` pair
+    # (e.g. Codex: `-c developer_instructions=<TOML string>`) define
+    # _agent_system_prompt_args in their lib; everyone else uses
+    # AI_SYSTEM_PROMPT_FLAG.
+    AI_SYSTEM_PROMPT_ARGS=()
+    if declare -f _agent_system_prompt_args >/dev/null 2>&1; then
+        if ! _agent_system_prompt_args "${prompt_content}"; then
+            wrapper_log "ERROR" "Failed to build system prompt args for ${AI_WRAPPER_AGENT_NAME}."
+            return 1
+        fi
+    elif [[ -n "${AI_SYSTEM_PROMPT_FLAG:-}" ]]; then
+        AI_SYSTEM_PROMPT_ARGS=("${AI_SYSTEM_PROMPT_FLAG}" "${prompt_content}")
+    fi
+
+    if [[ ${#AI_SYSTEM_PROMPT_ARGS[@]} -eq 0 ]]; then
         # The user explicitly chose orchestrate; silently falling back
         # to a plain session would run the wrong workflow.
         wrapper_log "ERROR" "AI_SYSTEM_PROMPT_FLAG is not set for ${AI_WRAPPER_AGENT_NAME}; cannot inject orchestrator prompt."
-        wrapper_log "ERROR" "Set AI_SYSTEM_PROMPT_FLAG in the agent's wrapper lib (e.g. --append-system-prompt) or pick 'Start new conversation'."
+        wrapper_log "ERROR" "Set AI_SYSTEM_PROMPT_FLAG (or define _agent_system_prompt_args) in the agent's wrapper lib, or pick 'Start new conversation'."
         return 1
     fi
 
     run_sandboxed_agent "${AI_AGENT_COMMAND}" -- "${WRAPPER_FLAGS[@]}" -- \
-        "${AGENT_FLAGS[@]}" "${AI_SYSTEM_PROMPT_FLAG}" "${prompt_content}"
+        "${AGENT_FLAGS[@]}" "${AI_SYSTEM_PROMPT_ARGS[@]}"
 }
 
 # Run a plain agent session (start or resume). Uses AI_RESUME_ARGS if set.
@@ -972,7 +1317,13 @@ run_agent_session() {
 
     case "${action}" in
         resume)
-            run_sandboxed_agent "${AI_AGENT_COMMAND}" -- "${WRAPPER_FLAGS[@]}" -- "${AGENT_FLAGS[@]}" "${resume_args[@]}"
+            if [[ "${AI_RESUME_ARGS_FIRST:-0}" == "1" ]]; then
+                # Resume is a subcommand (e.g. `codex resume`): it must
+                # precede the agent flags so they parse as its options.
+                run_sandboxed_agent "${AI_AGENT_COMMAND}" -- "${WRAPPER_FLAGS[@]}" -- "${resume_args[@]}" "${AGENT_FLAGS[@]}"
+            else
+                run_sandboxed_agent "${AI_AGENT_COMMAND}" -- "${WRAPPER_FLAGS[@]}" -- "${AGENT_FLAGS[@]}" "${resume_args[@]}"
+            fi
             ;;
         start)
             run_sandboxed_agent "${AI_AGENT_COMMAND}" -- "${WRAPPER_FLAGS[@]}" -- "${AGENT_FLAGS[@]}"

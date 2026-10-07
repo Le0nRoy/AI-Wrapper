@@ -202,7 +202,8 @@ main menu.
 
 ### Account switching
 
-Claude wrapper only. Multi-account credential profiles let you keep
+Claude and Codex wrappers (the Codex wrapper uses `CODEX_ACCOUNT` and
+`~/.codex-<name>/` — see its own help). Multi-account credential profiles let you keep
 separate `~/.claude-<name>/` directories (e.g. work vs. personal) and
 switch between them without re-authenticating each time.
 

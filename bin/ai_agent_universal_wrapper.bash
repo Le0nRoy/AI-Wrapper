@@ -23,6 +23,44 @@ function echo_log() {
     echo -e "[$(date "+%F %T")] ${log_level}: $*" >&2
 }
 
+# Classify a directory path against the sandbox's sensitive-location
+# rules. Prints one of:
+#   system  - "" / a filesystem root or top-level system location
+#   home    - exactly $HOME
+#   dotfile - under a dotfile dir directly under $HOME (on macOS also
+#             ~/Library), where credentials live
+# and returns 0; prints nothing and returns 1 when PATH is not sensitive.
+# Pure string classification: callers pass an already-resolved PATH and
+# HOME (trailing slashes are stripped here). Single source for the Linux
+# backend's WORKDIR and AI_SANDBOX_EXTRA_{RW,RO}_DIRS refusals and the
+# wrapper-side git-worktree bind guard (ai_wrapper_lib.bash); the lists
+# match the macOS backend's extra-dir refusal (macos_sandbox_exec.bash).
+_sandbox_sensitive_dir_kind() {
+    local path="${1%/}" home="${2%/}"
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        case "${path}" in
+            ""|/|/Users|/Users/Shared|/private|/private/tmp|/private/var|/private/var/tmp|/private/var/folders|/tmp|/var|/var/tmp|/etc|/usr|/usr/local|/bin|/sbin|/System|/Applications|/Library)
+                echo system; return 0 ;;
+        esac
+    else
+        case "${path}" in
+            ""|/|/tmp|/var|/etc|/usr|/bin|/sbin|/opt|/home|/root|/proc|/sys|/dev|/boot|/mnt|/media|/srv|/run)
+                echo system; return 0 ;;
+        esac
+    fi
+    [[ -n "${home}" ]] || return 1
+    if [[ "${path}" == "${home}" ]]; then
+        echo home; return 0
+    fi
+    case "${path}" in
+        "${home}"/.*)
+            echo dotfile; return 0 ;;
+        "${home}"/Library|"${home}"/Library/*)
+            if [[ "$(uname -s)" == "Darwin" ]]; then echo dotfile; return 0; fi ;;
+    esac
+    return 1
+}
+
 run_sandboxed_agent() {
     case "$(uname -s)" in
         Linux)
@@ -200,26 +238,21 @@ _run_sandboxed_agent_linux() {
     # (/Users, /Library, /Applications, /System don't exist here).
     # Bypass with AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 when intentional.
     if [[ "${allow_sensitive_workdir}" != "1" ]]; then
-        local workdir_normalized="${WORKDIR%/}"
         local home_normalized="${HOME_DIR%/}"
-        case "${workdir_normalized}" in
-            ""|/|/tmp|/var|/etc|/usr|/bin|/sbin|/opt|/home|/root|/proc|/sys|/dev|/boot|/mnt|/media|/srv|/run)
+        case "$(_sandbox_sensitive_dir_kind "${WORKDIR}" "${home_normalized}")" in
+            system)
                 echo_log "ERROR" "[$agent_name] Refusing to sandbox with WORKDIR=${WORKDIR} (top-level or system location). cd into a project directory first, or set AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 to override."
                 exit 1
                 ;;
+            home)
+                echo_log "ERROR" "[$agent_name] Refusing to sandbox with WORKDIR=\$HOME (${WORKDIR}); that would grant RW on the entire home directory. cd into a subdirectory first, or set AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 to override."
+                exit 1
+                ;;
+            dotfile)
+                echo_log "ERROR" "[$agent_name] Refusing to sandbox with WORKDIR=${WORKDIR} (a dotfile directory directly under \$HOME — granting RW here likely exposes credentials). cd into a non-sensitive project directory, or set AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 to override."
+                exit 1
+                ;;
         esac
-        if [[ -n "${home_normalized}" && "${workdir_normalized}" == "${home_normalized}" ]]; then
-            echo_log "ERROR" "[$agent_name] Refusing to sandbox with WORKDIR=\$HOME (${WORKDIR}); that would grant RW on the entire home directory. cd into a subdirectory first, or set AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 to override."
-            exit 1
-        fi
-        if [[ -n "${home_normalized}" ]]; then
-            case "${workdir_normalized}" in
-                "${home_normalized}"/.*)
-                    echo_log "ERROR" "[$agent_name] Refusing to sandbox with WORKDIR=${WORKDIR} (a dotfile directory directly under \$HOME — granting RW here likely exposes credentials). cd into a non-sensitive project directory, or set AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 to override."
-                    exit 1
-                    ;;
-            esac
-        fi
 
         # Same sensitivity guard applied to every directory accepted from
         # AI_SANDBOX_EXTRA_RW_DIRS / AI_SANDBOX_EXTRA_RO_DIRS. Without this,
@@ -229,27 +262,21 @@ _run_sandboxed_agent_linux() {
         # _user_extra_bind_dirs (not extra_bwrap_flags) so it never sees the
         # wrapper's own trusted binds (~/.claude, ~/.claude.json, etc.).
         for _d in "${_user_extra_bind_dirs[@]+"${_user_extra_bind_dirs[@]}"}"; do
-            local _sens_dir="${_d%/}"
-            case "${_sens_dir}" in
-                ""|/|/tmp|/var|/etc|/usr|/bin|/sbin|/opt|/home|/root|/proc|/sys|/dev|/boot|/mnt|/media|/srv|/run)
+            case "$(_sandbox_sensitive_dir_kind "${_d}" "${home_normalized}")" in
+                system)
                     echo_log "ERROR" "[$agent_name] Refusing extra bind '${_d}' (top-level or system location). Remove it from AI_SANDBOX_EXTRA_RW_DIRS/AI_SANDBOX_EXTRA_RO_DIRS, or set AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 to override."
                     exit 1
                     ;;
+                home)
+                    echo_log "ERROR" "[$agent_name] Refusing extra bind '${_d}' (== \$HOME). Set AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 to override."
+                    exit 1
+                    ;;
+                dotfile)
+                    echo_log "ERROR" "[$agent_name] Refusing extra bind '${_d}' (under HOME dotfile dir — grants read/write on credentials). Set AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 to override."
+                    exit 1
+                    ;;
             esac
-            if [[ -n "${home_normalized}" && "${_sens_dir}" == "${home_normalized}" ]]; then
-                echo_log "ERROR" "[$agent_name] Refusing extra bind '${_d}' (== \$HOME). Set AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 to override."
-                exit 1
-            fi
-            if [[ -n "${home_normalized}" ]]; then
-                case "${_sens_dir}" in
-                    "${home_normalized}"/.*)
-                        echo_log "ERROR" "[$agent_name] Refusing extra bind '${_d}' (under HOME dotfile dir — grants read/write on credentials). Set AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 to override."
-                        exit 1
-                        ;;
-                esac
-            fi
         done
-        unset _sens_dir
     fi
 
     # ===== PATH VALIDATION FOR BIND MOUNTS =====

@@ -88,6 +88,8 @@ jobs:
 
       - run: bash tests/test_sandbox_common.bash
       - run: bash tests/test_extra_bind_dirs.bash
+      - run: bash tests/test_codex_wrapper.bash
+      - run: bash tests/test_bind_hardening.bash
 
   # macOS's built-in sandbox-exec needs no install step. Runs the same
   # cross-platform smoke tests as Linux (run_sandboxed_agent dispatches on

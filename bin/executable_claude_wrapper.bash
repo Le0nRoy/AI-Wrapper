@@ -144,6 +144,7 @@ _bind_claude_account() {
         # requires bind sources to exist, so a fresh machine (no prior
         # Claude run) would otherwise hard-fail here instead of letting
         # Claude initialize the directory itself.
+        _wrapper_check_config_symlink "${claude_dir}" || exit 1
         if ! mkdir -p "${claude_dir}"; then
             echo "ERROR: failed to create ${claude_dir}" >&2
             exit 1
@@ -154,6 +155,8 @@ _bind_claude_account() {
         # binding a nonexistent destination would leave that rename with
         # nothing to land on. If the path exists but isn't a regular file,
         # refuse rather than silently binding a misshapen path.
+        # Check a symlinked ~/.claude.json BEFORE touch follows it.
+        _wrapper_check_config_symlink "${claude_json_src}" || exit 1
         if [[ -e "${claude_json_src}" && ! -f "${claude_json_src}" ]]; then
             echo "ERROR: ${claude_json_src} exists but is not a regular file. Move or remove it before launching." >&2
             exit 1
@@ -167,93 +170,23 @@ _bind_claude_account() {
         fi
     fi
 
+    # Shared symlink-target guard (ai_wrapper_lib.bash): refuses a
+    # symlinked profile dir / .claude.json whose target is outside $HOME or
+    # inside a credential location. Covers the named-account paths, the
+    # ~/.claude.json file, and credential-dir targets of ~/.claude, none of
+    # which the checks above caught.
+    _wrapper_check_config_symlink "${claude_dir}" || exit 1
+    _wrapper_check_config_symlink "${claude_json_src}" || exit 1
+
     _wrapper_add_bind "${claude_dir}" "${HOME}/.claude"
     _wrapper_add_bind "${claude_json_src}" "${HOME}/.claude.json"
 }
 
-# Git worktree support: when WORKDIR is a `git worktree add`-created tree, its
-# top-level `.git` is a file (not a dir) that points at <main>/.git/worktrees/<name>
-# in the main repo. The shared object store + refs live at the main repo's
-# `.git/`, which is OUTSIDE WORKDIR — so every git operation (status, log,
-# fetch, commit) fails with "fatal: not a git repository: <gitdir>" because
-# the sandbox's default-deny fence hides the shared `.git`.
-#
-# `git rev-parse --git-common-dir` returns the shared `.git` directory. When
-# it differs from `$PWD/.git`, bind it RW so the worktree is fully functional.
-# RW (not RO) is required: `git commit` / `git fetch` / `git gc` all mutate
-# the shared object store and refs. The bind is silently skipped when the
-# detection fails (not a git repo, git missing, or a regular non-worktree
-# repo where common-dir resolves to $PWD/.git which is already inside WORKDIR).
-if _git_common_dir="$(git -C "$(pwd -P)" rev-parse --git-common-dir 2>/dev/null)" \
-        && [[ -n "${_git_common_dir}" ]]; then
-    # `git rev-parse --git-common-dir` returns either an absolute path or a
-    # path relative to CWD (typically just ".git"). Canonicalize so the bind
-    # source is unambiguous and so symlinks in the chain are resolved the
-    # same way the kernel's path lookup will.
-    if [[ "${_git_common_dir}" != /* ]]; then
-        _git_common_dir="$(pwd -P)/${_git_common_dir}"
-    fi
-    if _git_common_resolved="$(_realpath "${_git_common_dir}")" \
-            && [[ -n "${_git_common_resolved}" && -d "${_git_common_resolved}" ]]; then
-        _wd_resolved_for_git="$(_realpath "$(pwd -P)")" || _wd_resolved_for_git=""
-        _home_resolved_for_git="$(_realpath "${HOME}")" || _home_resolved_for_git="${HOME%/}"
-        _home_resolved_for_git="${_home_resolved_for_git%/}"
-        # Skip when the shared .git is already inside WORKDIR — a regular
-        # (non-worktree) repo binds it via the WORKDIR rule.
-        if [[ -n "${_wd_resolved_for_git}" \
-                && "${_git_common_resolved}" != "${_wd_resolved_for_git}"/* \
-                && "${_git_common_resolved}" != "${_wd_resolved_for_git}" ]]; then
-            _wrapper_add_bind "${_git_common_resolved}"
-            # Git canonicalizes the absolute paths in the gitdir line
-            # (mainrepo/.git/worktrees/<name>) which requires stat() on every
-            # intermediate dir between $HOME and the shared .git (Seatbelt
-            # only — see _wrapper_add_meta_bind). Add only the shared-.git
-            # branch here; the WORKDIR branch of this walk is handled by
-            # each backend already.
-            _wt_parent="${_git_common_resolved%/*}"
-            while [[ -n "${_wt_parent}" \
-                    && "${_wt_parent}" != "${_home_resolved_for_git}" \
-                    && "${_wt_parent}" != "/" ]]; do
-                _wrapper_add_meta_bind "${_wt_parent}"
-                _wt_parent="${_wt_parent%/*}"
-            done
-            unset _wt_parent
-        fi
-        unset _wd_resolved_for_git _home_resolved_for_git
-    fi
-fi
-unset _git_common_dir _git_common_resolved
-
-# Bind-list flags that the interactive Settings sub-menu can toggle
-# need to be evaluated AFTER the menu — otherwise enabling them via
-# `s)` has no effect (WRAPPER_FLAGS is frozen by then). The shared
-# wrapper re-reads env-passthrough gates inside run_sandboxed_agent
-# at exec time, so those keep working; this function covers only the
-# bind-list side.
-_apply_post_menu_binds() {
-    # GitLab CLI (glab) on-disk credentials. AI_SANDBOX_PASS_GITLAB
-    # already propagates GITLAB_TOKEN / CI_JOB_TOKEN env vars; when
-    # the user has no env var set, glab reads its token from the
-    # on-disk config instead. Bind that config dir RO when the same
-    # flag is set so `glab` works end-to-end without the user having
-    # to also export the token. RO is sufficient: glab only writes
-    # the config when running `glab auth login`, which is not the
-    # agent's job.
-    #
-    # macOS uses ~/Library/Application Support/glab-cli/; the XDG
-    # paths under ~/.config/glab-cli and ~/.local/share/glab-cli are
-    # honoured as fallbacks (some users set XDG_CONFIG_HOME to
-    # relocate) and are the only paths that exist on Linux.
-    if [[ "${AI_SANDBOX_PASS_GITLAB:-0}" == "1" ]]; then
-        local _glab_dir
-        for _glab_dir in \
-                "${HOME}/Library/Application Support/glab-cli" \
-                "${HOME}/.config/glab-cli" \
-                "${HOME}/.local/share/glab-cli"; do
-            [[ -d "${_glab_dir}" ]] && _wrapper_add_ro_bind "${_glab_dir}"
-        done
-    fi
-}
+# Git worktree common-dir bind (shared .git outside WORKDIR) and the
+# post-menu glab bind (_apply_post_menu_binds, called below) live in the
+# shared ai_wrapper_data/ai_wrapper_lib.bash so the Codex wrapper gets the
+# same behavior. See the comments there.
+_wrapper_bind_git_common_dir
 
 # Claude CLI flags — full autonomy *within the sandbox boundary*.
 # The sandbox (bwrap args / SBPL profile) is the permission fence here:
