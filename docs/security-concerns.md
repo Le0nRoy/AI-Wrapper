@@ -412,6 +412,17 @@ exists as a non-directory, or as a symlink whose target resolves
 outside `$HOME`. `~/.claude.json` has had this check since T11; WS3
 closes the asymmetry.
 
+**Codex wrapper (2026-10, codex parity).** `codex_wrapper.bash` had the
+same unguarded `mkdir -p ~/.codex` + RW bind. `_bind_codex_account`
+(`codex_wrapper_lib.bash`) now applies the identical guard to the default
+`~/.codex`. The same change gives the Codex wrapper the Claude wrapper's
+other binds — so its sandbox surface now matches Claude's rather than
+widening past it: a named `~/.codex-<name>/` profile (RW, bound at
+`~/.codex`, replacing — not added to — the default dir), a `git worktree`'s
+shared `.git` (RW, only when it lies outside WORKDIR), and glab config
+(RO, only with `AI_SANDBOX_PASS_GITLAB=1`). The worktree/glab logic now
+lives once in `ai_wrapper_lib.bash` and is shared by both wrappers.
+
 ### B-β — `_realpath` fallback chain has multiple silent branches (RESOLVED, 2026-05-24, WS6)
 
 Three resolvers tried in order: `realpath`, `perl -MCwd=abs_path`,
