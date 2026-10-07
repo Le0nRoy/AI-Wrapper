@@ -19,6 +19,17 @@
 #   AI_SYSTEM_PROMPT_FLAG  - CLI flag for system prompt injection (e.g. "--append-system-prompt")
 #                            If unset, orchestration mode starts a plain session with a warning.
 #   AI_RESUME_ARGS         - Array of args for resume mode (default: --resume)
+#   AI_RESUME_ARGS_FIRST   - "1" to place AI_RESUME_ARGS BEFORE AGENT_FLAGS in
+#                            the resume argv (for agents whose resume is a
+#                            subcommand, e.g. `codex resume <flags>`).
+#                            Default "0": AGENT_FLAGS first (Claude).
+#
+# Optional per-agent hook (define in the agent lib to override the default
+# `AI_SYSTEM_PROMPT_FLAG <prompt>` pair in run_orchestrated_session):
+#   _agent_system_prompt_args PROMPT
+#                          - set the global array AI_SYSTEM_PROMPT_ARGS to the
+#                            argv words that inject PROMPT as a system /
+#                            developer prompt; return non-zero on failure.
 
 # pwd -P resolves symlinks so a symlinked install of this lib still finds its
 # sibling data files (orchestrator-prompt.md, etc.) next to the real file.
@@ -1041,16 +1052,30 @@ run_orchestrated_session() {
         return 1
     fi
 
-    if [[ -z "${AI_SYSTEM_PROMPT_FLAG:-}" ]]; then
+    # Agents whose system-prompt injection isn't a plain `FLAG VALUE` pair
+    # (e.g. Codex: `-c developer_instructions=<TOML string>`) define
+    # _agent_system_prompt_args in their lib; everyone else uses
+    # AI_SYSTEM_PROMPT_FLAG.
+    AI_SYSTEM_PROMPT_ARGS=()
+    if declare -f _agent_system_prompt_args >/dev/null 2>&1; then
+        if ! _agent_system_prompt_args "${prompt_content}"; then
+            wrapper_log "ERROR" "Failed to build system prompt args for ${AI_WRAPPER_AGENT_NAME}."
+            return 1
+        fi
+    elif [[ -n "${AI_SYSTEM_PROMPT_FLAG:-}" ]]; then
+        AI_SYSTEM_PROMPT_ARGS=("${AI_SYSTEM_PROMPT_FLAG}" "${prompt_content}")
+    fi
+
+    if [[ ${#AI_SYSTEM_PROMPT_ARGS[@]} -eq 0 ]]; then
         # The user explicitly chose orchestrate; silently falling back
         # to a plain session would run the wrong workflow.
         wrapper_log "ERROR" "AI_SYSTEM_PROMPT_FLAG is not set for ${AI_WRAPPER_AGENT_NAME}; cannot inject orchestrator prompt."
-        wrapper_log "ERROR" "Set AI_SYSTEM_PROMPT_FLAG in the agent's wrapper lib (e.g. --append-system-prompt) or pick 'Start new conversation'."
+        wrapper_log "ERROR" "Set AI_SYSTEM_PROMPT_FLAG (or define _agent_system_prompt_args) in the agent's wrapper lib, or pick 'Start new conversation'."
         return 1
     fi
 
     run_sandboxed_agent "${AI_AGENT_COMMAND}" -- "${WRAPPER_FLAGS[@]}" -- \
-        "${AGENT_FLAGS[@]}" "${AI_SYSTEM_PROMPT_FLAG}" "${prompt_content}"
+        "${AGENT_FLAGS[@]}" "${AI_SYSTEM_PROMPT_ARGS[@]}"
 }
 
 # Run a plain agent session (start or resume). Uses AI_RESUME_ARGS if set.
@@ -1063,7 +1088,13 @@ run_agent_session() {
 
     case "${action}" in
         resume)
-            run_sandboxed_agent "${AI_AGENT_COMMAND}" -- "${WRAPPER_FLAGS[@]}" -- "${AGENT_FLAGS[@]}" "${resume_args[@]}"
+            if [[ "${AI_RESUME_ARGS_FIRST:-0}" == "1" ]]; then
+                # Resume is a subcommand (e.g. `codex resume`): it must
+                # precede the agent flags so they parse as its options.
+                run_sandboxed_agent "${AI_AGENT_COMMAND}" -- "${WRAPPER_FLAGS[@]}" -- "${resume_args[@]}" "${AGENT_FLAGS[@]}"
+            else
+                run_sandboxed_agent "${AI_AGENT_COMMAND}" -- "${WRAPPER_FLAGS[@]}" -- "${AGENT_FLAGS[@]}" "${resume_args[@]}"
+            fi
             ;;
         start)
             run_sandboxed_agent "${AI_AGENT_COMMAND}" -- "${WRAPPER_FLAGS[@]}" -- "${AGENT_FLAGS[@]}"
