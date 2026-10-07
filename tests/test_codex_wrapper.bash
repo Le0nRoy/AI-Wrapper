@@ -279,7 +279,8 @@ STUB
     assert_contains "${out}" "ARGV:--dangerously-bypass-approvals-and-sandbox exec hello" "non-interactive argv is AGENT_FLAGS + user args"
     assert_contains "${out}" "alt-profile" "\$HOME/.codex-alt is visible at \$HOME/.codex inside the sandbox"
 
-    out="$(cd "${FAKE_HOME}/work" && PATH="${FAKE_HOME}/bin:${PATH}" CODEX_ACCOUNT='x;y' \
+    _fresh_dir="$(mktemp -d "${FAKE_HOME}/work-invalid-XXXXXX")"
+    out="$(cd "${_fresh_dir}" && PATH="${FAKE_HOME}/bin:${PATH}" CODEX_ACCOUNT='x;y' \
         bash "${REPO_ROOT}/bin/executable_codex_wrapper.bash" exec hello </dev/null 2>&1)"
     rc=$?
     assert_eq "${rc}" "1" "wrapper refuses an invalid CODEX_ACCOUNT before launch"
