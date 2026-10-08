@@ -17,7 +17,7 @@ source_lib
 export XDG_CONFIG_HOME="${TEST_SCRATCH}/config"
 workdir="$(pwd -P)"
 hash="$(printf '%s' "${workdir}" | shasum -a 256 | cut -c1-12)"
-expected="${TEST_SCRATCH}/config/ai-wrapper/last-preset/${hash}.env"
+expected="${TEST_SCRATCH}/config/ai-wrapper/last-preset/${hash}-${TEST_AGENT_ID}.env"
 actual="$(_preset_autosave_path)"
 if assert_eq "UNIT-AUTOSAVE-01" "${expected}" "${actual}"; then
     PASS=$((PASS+1)); echo "PASS UNIT-AUTOSAVE-01"
@@ -33,7 +33,7 @@ clear_catalog_env
 source_lib
 workdir="$(pwd -P)"
 hash="$(printf '%s' "${workdir}" | shasum -a 256 | cut -c1-12)"
-expected="${HOME}/.config/ai-wrapper/last-preset/${hash}.env"
+expected="${HOME}/.config/ai-wrapper/last-preset/${hash}-${TEST_AGENT_ID}.env"
 actual="$(_preset_autosave_path)"
 if assert_eq "UNIT-AUTOSAVE-02" "${expected}" "${actual}"; then
     PASS=$((PASS+1)); echo "PASS UNIT-AUTOSAVE-02"
@@ -64,7 +64,7 @@ assert_match "UNIT-AUTOSAVE-03" "AI_SANDBOX_PASS_ENV=" "${content}" || ok=0
 if (( ok == 1 )); then PASS=$((PASS+1)); echo "PASS UNIT-AUTOSAVE-03"; else FAIL=$((FAIL+1)); fi
 clean_scratch
 
-# UNIT-AUTOSAVE-04: _preset_autosave writes workdir: header comment.
+# UNIT-AUTOSAVE-04: _preset_autosave writes workdir: and agent: header comments.
 mk_scratch; guard_home
 unset XDG_CONFIG_HOME
 export XDG_CONFIG_HOME="${TEST_SCRATCH}/config"
@@ -74,11 +74,10 @@ workdir="$(pwd -P)"
 _preset_autosave
 path="$(_preset_autosave_path)"
 content="$(cat "${path}")"
-if assert_match "UNIT-AUTOSAVE-04" "# workdir: ${workdir}" "${content}"; then
-    PASS=$((PASS+1)); echo "PASS UNIT-AUTOSAVE-04"
-else
-    FAIL=$((FAIL+1))
-fi
+ok=1
+assert_match "UNIT-AUTOSAVE-04" "# workdir: ${workdir}" "${content}" || ok=0
+assert_match "UNIT-AUTOSAVE-04" "# agent: ${TEST_AGENT_ID}" "${content}" || ok=0
+if (( ok == 1 )); then PASS=$((PASS+1)); echo "PASS UNIT-AUTOSAVE-04"; else FAIL=$((FAIL+1)); fi
 clean_scratch
 
 # UNIT-AUTOSAVE-05: _preset_autosave writes mode 0644.
@@ -148,6 +147,51 @@ assert_file_exists "UNIT-AUTOSAVE-07" "${path2}" || ok=0
 if (( ok == 1 )); then PASS=$((PASS+1)); echo "PASS UNIT-AUTOSAVE-07"; else FAIL=$((FAIL+1)); fi
 # cd back so clean_scratch works
 cd "${TEST_SCRATCH}/work"
+clean_scratch
+
+# UNIT-AUTOSAVE-08: two agents in one workdir get distinct files and
+# neither save clobbers the other (the original shared-file bug).
+mk_scratch; guard_home
+unset XDG_CONFIG_HOME
+export XDG_CONFIG_HOME="${TEST_SCRATCH}/config"
+clear_catalog_env
+source_lib
+AI_WRAPPER_AGENT_ID="alpha"
+export AI_SANDBOX_PASS_AWS=1
+_preset_autosave
+path_a="$(_preset_autosave_path)"
+AI_WRAPPER_AGENT_ID="beta"
+export AI_SANDBOX_PASS_AWS=0
+_preset_autosave
+path_b="$(_preset_autosave_path)"
+ok=1
+if [[ "${path_a}" == "${path_b}" ]]; then
+    _fail "UNIT-AUTOSAVE-08" "both agents got the same path" "${path_a}" "${path_b}"; ok=0
+fi
+assert_match "UNIT-AUTOSAVE-08" "AI_SANDBOX_PASS_AWS=1" "$(cat "${path_a}")" || ok=0
+assert_match "UNIT-AUTOSAVE-08" "AI_SANDBOX_PASS_AWS=0" "$(cat "${path_b}")" || ok=0
+assert_file_absent "UNIT-AUTOSAVE-08-legacy" "$(_preset_legacy_path)" || ok=0
+if (( ok == 1 )); then PASS=$((PASS+1)); echo "PASS UNIT-AUTOSAVE-08"; else FAIL=$((FAIL+1)); fi
+clean_scratch
+
+# UNIT-AUTOSAVE-09: unset AI_WRAPPER_AGENT_ID fails loudly, writes nothing.
+mk_scratch; guard_home
+unset XDG_CONFIG_HOME
+export XDG_CONFIG_HOME="${TEST_SCRATCH}/config"
+clear_catalog_env
+source_lib
+unset AI_WRAPPER_AGENT_ID
+set +e
+err="$(_preset_autosave 2>&1)"
+rc=$?
+set -e
+ok=1
+(( rc == 1 )) || { _fail "UNIT-AUTOSAVE-09" "expected rc=1" "1" "${rc}"; ok=0; }
+assert_match "UNIT-AUTOSAVE-09" "AI_WRAPPER_AGENT_ID" "${err}" || ok=0
+if [[ -d "${XDG_CONFIG_HOME}/ai-wrapper" ]]; then
+    _fail "UNIT-AUTOSAVE-09" "preset dir created despite missing agent id"; ok=0
+fi
+if (( ok == 1 )); then PASS=$((PASS+1)); echo "PASS UNIT-AUTOSAVE-09"; else FAIL=$((FAIL+1)); fi
 clean_scratch
 
 printf 'SUMMARY %s pass=%d fail=%d skip=%d\n' "$(basename "${BASH_SOURCE[0]}")" "${PASS}" "${FAIL}" "${SKIP}"

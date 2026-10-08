@@ -217,8 +217,8 @@ switch between them without re-authenticating each time.
 - If `~/.claude-<name>.json` also exists it's used for that profile's
   session/account metadata; otherwise the shared `~/.claude.json` is
   used.
-- The choice persists per-workdir via the same auto-save/auto-load
-  mechanism as every other setting (see `c) Clear` below) — pick an
+- The choice persists per-workdir (in the Claude wrapper's own preset
+  file) via the same auto-save/auto-load mechanism as every other setting (see `c) Clear` below) — pick an
   account once per project and it's remembered on the next launch from
   that directory.
 - Non-interactive launches respect `CLAUDE_ACCOUNT=<name>` set in the
@@ -244,31 +244,42 @@ functional on Linux only.
 
 The wrapper automatically saves your current settings when you pick a
 launch option (1/2/3) and restores them the next time you open the
-menu from the same directory. This is a silent, per-workdir operation
-— no naming, no confirmation, no sub-menu required.
+menu from the same directory. This is a silent, per-workdir,
+per-agent operation — no naming, no confirmation, no sub-menu required.
 
 **How it works:**
 
 - **Auto-save** — fires after you choose a launch mode, before the
   session starts. Writes every catalog setting (including explicit
   `bool=0` values) to
-  `${XDG_CONFIG_HOME:-$HOME/.config}/ai-wrapper/last-preset/<hash>.env`
+  `${XDG_CONFIG_HOME:-$HOME/.config}/ai-wrapper/last-preset/<hash>-<agent>.env`
   where `<hash>` is the first 12 hex chars of the SHA-256 of the
-  resolved working directory path. One file per workdir, no clobber
-  across directories.
+  resolved working directory path and `<agent>` is `claude`, `codex` or
+  `cursor`. One file per workdir and agent, so running the Claude and
+  Codex wrappers in the same directory never clobbers the other's
+  settings.
 - **Auto-load** — fires when the menu opens. Restores all settings
   silently on a match; if the file does not exist (first run or after
   a clear) the menu starts with catalog defaults. A dim
   `(restored from <path>)` line appears in the header when settings
   are in effect.
-- **`c) Clear`** — removes the preset file for the current workdir and
-  unsets the restored-from marker so the header line disappears on the
-  next render. No confirmation. Use this as the escape hatch to start
-  fresh from catalog defaults.
+- **Upgrade from the shared file** — older releases wrote one shared
+  `<hash>.env` per workdir for all agents. Until this agent has saved
+  its own `<hash>-<agent>.env`, auto-load reads that legacy file
+  instead (keys belonging to other agents are skipped silently). The
+  legacy file is never modified by auto-save, so each agent migrates
+  from it on its own first launch.
+- **`c) Clear`** — removes this agent's preset file for the current
+  workdir (plus the legacy shared `<hash>.env`, if still present, so
+  it can't be re-loaded as a fallback) and unsets the restored-from
+  marker so the header line disappears on the next render. Other
+  agents' `<hash>-<agent>.env` files are left alone. No confirmation.
+  Use this as the escape hatch to start fresh from catalog defaults.
 
-The preset file is plain `KEY=VALUE` per line with a comment header;
-you can `grep -r workdir: ~/.config/ai-wrapper/last-preset/` to
-find a file by its workdir path.
+The preset file is plain `KEY=VALUE` per line with a comment header
+(`# workdir: <path>` and `# agent: <id>`); you can
+`grep -r workdir: ~/.config/ai-wrapper/last-preset/` to find a file by
+its workdir path.
 
 **Known limitation — cross-OS preset portability:** The preset file
 stores every catalog key, including OS-specific ones (e.g.

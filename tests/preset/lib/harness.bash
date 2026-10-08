@@ -22,12 +22,14 @@ CANARY_BOOL="AI_SANDBOX_PASS_AWS"
 CANARY_BOOL_2="AI_SANDBOX_PASS_KUBE"
 CANARY_STR="AI_SANDBOX_PASS_ENV"
 CANARY_PATH="AI_SANDBOX_PROFILE"
+# Agent id source_lib exports; names the preset file <hash>-<id>.env.
+TEST_AGENT_ID="test"
 
 # --- Paths -----------------------------------------------------------------
 
 _HARNESS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 _REPO_ROOT="$(cd "${_HARNESS_DIR}/../../.." && pwd -P)"
-_SRC_LIB="${_REPO_ROOT}/ai_wrapper_data/ai_wrapper_lib.bash"
+_SRC_LIB="${_REPO_ROOT}/bin/ai_wrapper_data/ai_wrapper_lib.bash"
 _REAL_HOME="${HOME}"   # remember real home so we can refuse to clobber it
 # Scratch root: prefers $TMPDIR (standard convention), but falls back to
 # the repo-local tests/preset/_scratch when `mkdir -p` through the
@@ -179,6 +181,8 @@ close_tty_input() {
 source_lib() {
     export AI_WRAPPER_AGENT_NAME="test-agent"
     export AI_AGENT_COMMAND="true"
+    # Preset files are per-agent: <hash>-${AI_WRAPPER_AGENT_ID}.env.
+    export AI_WRAPPER_AGENT_ID="${TEST_AGENT_ID}"
     # No-op the sandbox launcher so a stray call cannot launch anything.
     run_sandboxed_agent() { :; }
     # Stub the screen-clearing header so integration tests do not

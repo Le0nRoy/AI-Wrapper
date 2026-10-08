@@ -4,6 +4,7 @@
 
 AI_WRAPPER_AGENT_NAME="Cursor Agent"
 AI_AGENT_COMMAND="cursor-agent"
+AI_WRAPPER_AGENT_ID="cursor"
 # TODO: Set to the correct system prompt injection flag once verified.
 # Common candidates: --instructions, --system-prompt
 AI_SYSTEM_PROMPT_FLAG=""

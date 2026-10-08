@@ -12,7 +12,7 @@ set -o pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
 PRESET_DIR="${SCRIPT_DIR}/preset"
-SRC_LIB="${REPO_ROOT}/ai_wrapper_data/ai_wrapper_lib.bash"
+SRC_LIB="${REPO_ROOT}/bin/ai_wrapper_data/ai_wrapper_lib.bash"
 
 # Platform guard (the lib targets macOS; integration helpers use stat -f).
 if [[ "$(uname -s)" != "Darwin" ]]; then
@@ -68,6 +68,7 @@ smoke_tty_substitution() {
         set +u
         export AI_WRAPPER_AGENT_NAME="smoke"
         export AI_AGENT_COMMAND="true"
+        export AI_WRAPPER_AGENT_ID="smoke"
         run_sandboxed_agent() { :; }
         show_header() { :; }
         : > "${tmp}/tty.in"

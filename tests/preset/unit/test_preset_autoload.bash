@@ -173,5 +173,45 @@ else
 fi
 clean_scratch
 
+# UNIT-AUTOLOAD-09: falls back to the legacy shared <hash>.env when the
+# per-agent file is absent; other agents' keys there are skipped silently.
+mk_scratch; guard_home
+unset XDG_CONFIG_HOME
+export XDG_CONFIG_HOME="${TEST_SCRATCH}/config"
+clear_catalog_env
+source_lib
+legacy="$(_preset_legacy_path)"
+mkdir -p "$(dirname "${legacy}")"
+printf '# workdir: %s\nCODEX_ACCOUNT=alt\nAI_SANDBOX_PASS_AWS=1\n' "$(pwd -P)" > "${legacy}"
+unset AI_SANDBOX_PASS_AWS CODEX_ACCOUNT AI_WRAPPER_PRESET_AUTOLOADED_FROM
+tty_reset
+_preset_autoload
+ok=1
+assert_eq "UNIT-AUTOLOAD-09" "1" "${AI_SANDBOX_PASS_AWS:-}" || ok=0
+assert_eq "UNIT-AUTOLOAD-09-from" "${legacy}" "${AI_WRAPPER_PRESET_AUTOLOADED_FROM:-}" || ok=0
+assert_eq "UNIT-AUTOLOAD-09-foreign" "" "${CODEX_ACCOUNT:-}" || ok=0
+assert_unmatch "UNIT-AUTOLOAD-09-warn" "unknown setting" "$(cat "${TEST_TTY_OUT}")" || ok=0
+if (( ok == 1 )); then PASS=$((PASS+1)); echo "PASS UNIT-AUTOLOAD-09"; else FAIL=$((FAIL+1)); fi
+clean_scratch
+
+# UNIT-AUTOLOAD-10: per-agent file takes precedence over the legacy file.
+mk_scratch; guard_home
+unset XDG_CONFIG_HOME
+export XDG_CONFIG_HOME="${TEST_SCRATCH}/config"
+clear_catalog_env
+source_lib
+legacy="$(_preset_legacy_path)"
+path="$(_preset_autosave_path)"
+mkdir -p "$(dirname "${path}")"
+printf 'AI_SANDBOX_PASS_AWS=1\n' > "${legacy}"
+printf 'AI_SANDBOX_PASS_AWS=0\n' > "${path}"
+unset AI_SANDBOX_PASS_AWS AI_WRAPPER_PRESET_AUTOLOADED_FROM
+_preset_autoload
+ok=1
+assert_eq "UNIT-AUTOLOAD-10" "0" "${AI_SANDBOX_PASS_AWS:-}" || ok=0
+assert_eq "UNIT-AUTOLOAD-10-from" "${path}" "${AI_WRAPPER_PRESET_AUTOLOADED_FROM:-}" || ok=0
+if (( ok == 1 )); then PASS=$((PASS+1)); echo "PASS UNIT-AUTOLOAD-10"; else FAIL=$((FAIL+1)); fi
+clean_scratch
+
 printf 'SUMMARY %s pass=%d fail=%d skip=%d\n' "$(basename "${BASH_SOURCE[0]}")" "${PASS}" "${FAIL}" "${SKIP}"
 exit $(( FAIL == 0 ? 0 : 1 ))

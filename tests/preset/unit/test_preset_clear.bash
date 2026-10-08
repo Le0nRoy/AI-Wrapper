@@ -82,5 +82,27 @@ assert_file_exists "UNIT-CLEAR-04-other" "${path2}" || ok=0
 if (( ok == 1 )); then PASS=$((PASS+1)); echo "PASS UNIT-CLEAR-04"; else FAIL=$((FAIL+1)); fi
 clean_scratch
 
+# UNIT-CLEAR-05: clear removes the legacy shared file (else the autoload
+# fallback would resurrect it) but keeps other agents' per-agent files.
+mk_scratch; guard_home
+unset XDG_CONFIG_HOME
+export XDG_CONFIG_HOME="${TEST_SCRATCH}/config"
+clear_catalog_env
+source_lib
+path="$(_preset_autosave_path)"
+legacy="$(_preset_legacy_path)"
+other="${legacy%.env}-other.env"
+mkdir -p "$(dirname "${path}")"
+printf 'AI_SANDBOX_PASS_AWS=1\n' > "${path}"
+printf 'AI_SANDBOX_PASS_AWS=1\n' > "${legacy}"
+printf 'AI_SANDBOX_PASS_AWS=1\n' > "${other}"
+_preset_clear
+ok=1
+assert_file_absent "UNIT-CLEAR-05-own" "${path}" || ok=0
+assert_file_absent "UNIT-CLEAR-05-legacy" "${legacy}" || ok=0
+assert_file_exists "UNIT-CLEAR-05-other" "${other}" || ok=0
+if (( ok == 1 )); then PASS=$((PASS+1)); echo "PASS UNIT-CLEAR-05"; else FAIL=$((FAIL+1)); fi
+clean_scratch
+
 printf 'SUMMARY %s pass=%d fail=%d skip=%d\n' "$(basename "${BASH_SOURCE[0]}")" "${PASS}" "${FAIL}" "${SKIP}"
 exit $(( FAIL == 0 ? 0 : 1 ))

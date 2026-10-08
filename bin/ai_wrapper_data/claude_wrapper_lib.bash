@@ -8,6 +8,7 @@
 
 AI_WRAPPER_AGENT_NAME="Claude CLI"
 AI_AGENT_COMMAND="claude"
+AI_WRAPPER_AGENT_ID="claude"
 AI_SYSTEM_PROMPT_FLAG="--append-system-prompt"
 
 # Declared (empty) so the shared lib's `${AI_RESUME_ARGS[@]:---resume}` fallback
