@@ -213,5 +213,28 @@ assert_eq "UNIT-AUTOLOAD-10-from" "${path}" "${AI_WRAPPER_PRESET_AUTOLOADED_FROM
 if (( ok == 1 )); then PASS=$((PASS+1)); echo "PASS UNIT-AUTOLOAD-10"; else FAIL=$((FAIL+1)); fi
 clean_scratch
 
+# UNIT-AUTOLOAD-11: unset AI_WRAPPER_AGENT_ID returns rc=1, no side effects.
+mk_scratch; guard_home
+unset XDG_CONFIG_HOME
+export XDG_CONFIG_HOME="${TEST_SCRATCH}/config"
+clear_catalog_env
+source_lib
+unset AI_WRAPPER_AGENT_ID
+unset AI_WRAPPER_PRESET_AUTOLOADED_FROM
+set +e
+_preset_autoload 2>/dev/null
+rc=$?
+set -e
+ok=1
+(( rc == 1 )) || { _fail "UNIT-AUTOLOAD-11" "expected rc=1" "1" "${rc}"; ok=0; }
+if [[ -n "${AI_WRAPPER_PRESET_AUTOLOADED_FROM:-}" ]]; then
+    _fail "UNIT-AUTOLOAD-11" "AI_WRAPPER_PRESET_AUTOLOADED_FROM set despite invalid agent id" "(unset)" "${AI_WRAPPER_PRESET_AUTOLOADED_FROM}"; ok=0
+fi
+if [[ -d "${XDG_CONFIG_HOME}/ai-wrapper" ]]; then
+    _fail "UNIT-AUTOLOAD-11" "preset dir created despite invalid agent id"; ok=0
+fi
+if (( ok == 1 )); then PASS=$((PASS+1)); echo "PASS UNIT-AUTOLOAD-11"; else FAIL=$((FAIL+1)); fi
+clean_scratch
+
 printf 'SUMMARY %s pass=%d fail=%d skip=%d\n' "$(basename "${BASH_SOURCE[0]}")" "${PASS}" "${FAIL}" "${SKIP}"
 exit $(( FAIL == 0 ? 0 : 1 ))

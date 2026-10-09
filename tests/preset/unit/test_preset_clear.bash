@@ -104,5 +104,27 @@ assert_file_exists "UNIT-CLEAR-05-other" "${other}" || ok=0
 if (( ok == 1 )); then PASS=$((PASS+1)); echo "PASS UNIT-CLEAR-05"; else FAIL=$((FAIL+1)); fi
 clean_scratch
 
+# UNIT-CLEAR-06: unset AI_WRAPPER_AGENT_ID returns rc=1, leaves existing files untouched.
+mk_scratch; guard_home
+unset XDG_CONFIG_HOME
+export XDG_CONFIG_HOME="${TEST_SCRATCH}/config"
+clear_catalog_env
+source_lib
+# Create a preset file using the valid agent id, then break the id.
+path="$(_preset_autosave_path)"
+mkdir -p "$(dirname "${path}")"
+printf '# workdir: %s\nAI_SANDBOX_PASS_AWS=1\n' "$(pwd -P)" > "${path}"
+unset AI_WRAPPER_AGENT_ID
+set +e
+_preset_clear 2>/dev/null
+rc=$?
+set -e
+ok=1
+(( rc == 1 )) || { _fail "UNIT-CLEAR-06" "expected rc=1" "1" "${rc}"; ok=0; }
+# The file created with the valid id must still exist (clear was a no-op).
+assert_file_exists "UNIT-CLEAR-06" "${path}" || ok=0
+if (( ok == 1 )); then PASS=$((PASS+1)); echo "PASS UNIT-CLEAR-06"; else FAIL=$((FAIL+1)); fi
+clean_scratch
+
 printf 'SUMMARY %s pass=%d fail=%d skip=%d\n' "$(basename "${BASH_SOURCE[0]}")" "${PASS}" "${FAIL}" "${SKIP}"
 exit $(( FAIL == 0 ? 0 : 1 ))
