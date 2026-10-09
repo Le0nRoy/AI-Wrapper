@@ -58,6 +58,26 @@ jobs:
       - run: bash tests/test_catalog_os_scope.bash
       - run: bash tests/test_help_doc_os_scope.bash
 
+  hermes-tests:
+    runs-on: ubuntu-latest
+    env:
+      PYTHONPATH: ${{ github.workspace }}/bin/ai_wrapper_data
+      HERMES_TEST_UPSTREAM: ${{ github.workspace }}/.hermes-upstream-fixture
+      HERMES_UPSTREAM_SOURCE: ${{ github.workspace }}/.hermes-upstream-fixture
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Checkout reviewed Hermes source fixture
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: NousResearch/hermes-agent
+          ref: 19cb1cbfedeafaca099be6ff0141a28a6c516c0f
+          path: .hermes-upstream-fixture
+          persist-credentials: false
+      - name: Hermes Python unit tests
+        run: python3 -m unittest discover -s tests -p 'test_hermes_*.py' -v
+      - name: Hermes wrapper tests
+        run: bash tests/test_hermes_wrapper.bash
+
   # Real bubblewrap smoke tests: actually launches sandboxed processes and
   # asserts on real security properties (WORKDIR refusal, credential-path
   # denial by default). This is what caught three real bugs during

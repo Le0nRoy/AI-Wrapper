@@ -1,0 +1,110 @@
+{
+  "schema_version": 1,
+  "policy": {
+    "opt_in": true,
+    "auto_install": false,
+    "caller": "Trusted host CLI validates the active profile and state path strictly below its private state prefix before calling this module. Do not expose installation or update as an agent tool.",
+    "destination": "${private_profile_state}/skills/${addon_name}",
+    "staging": "${private_profile_state}/.addon-stage-${random_id}, outside the discoverable skills tree; download temporary files are private children of staging and removed before publication.",
+    "publication_lock": "Advisory flock(LOCK_EX) on the profile skills directory is held from destination checks through staging, atomic publication and cleanup. Future frontends must delegate to this API or use the same lock.",
+    "package_content": "Read-only package files and support directories; package root is private mode 0700 to allow atomic directory moves between staging and skills. Preserve source execute bits only for explicit executable_files. No program command, installer, import, or skill is executed during installation.",
+    "runtime": "Skills and scripts must run inside the Hermes sandbox and may read only private profile state and the approved workspace. The runtime caller routes TMPDIR into private profile state. Package metadata is not a sandbox or an egress policy.",
+    "local_artifacts": "User-provided tar or ZIP archives only. Acquisition, payment, provenance review and approval happen outside this installer. No signed URLs or credentials are stored.",
+    "updates": "Trusted host user must explicitly pass --update. Linux renameat2 atomically exchanges complete package directories; unsupported systems fail without replacing the existing package."
+  },
+  "addons": {
+    "start-second-brain": {
+      "title": "Start Second Brain",
+      "status": "optional",
+      "kind": "skill",
+      "source": "github",
+      "repository": "artemiimillier/start-second-brain",
+      "commit": "d5dad206b0326a3e123e8d55f39a563cdd5cf6f1",
+      "sha256": "a37778d69d508e967d2b5c17ace9facef4843dee790ade8f69e3a09b84ced1bd",
+      "verified_ref": "https://github.com/artemiimillier/start-second-brain/commit/d5dad206b0326a3e123e8d55f39a563cdd5cf6f1",
+      "include": ["SKILL.md", "LICENSE", "templates/", "scripts/"],
+      "required": ["SKILL.md", "LICENSE", "scripts/brain_check.py", "templates/INDEX.md"],
+      "executable_files": ["scripts/brain_check.py"],
+      "mode": "private-profile-workspace",
+      "runtime_requires_sandbox": true,
+      "host_plugins": false
+    },
+    "models-table": {
+      "title": "Hermes Models Table",
+      "status": "optional",
+      "kind": "reference",
+      "source": "github",
+      "repository": "artemiimillier/hermes-models-table",
+      "commit": "84e6f7b13c286e4467b0498b453402d3dfc3b9ab",
+      "sha256": "a9f8af76dc971426b566e34e6a24106bd61afbafe85cf09a4bef6786fdc9c5ad",
+      "verified_ref": "https://github.com/artemiimillier/hermes-models-table/commit/84e6f7b13c286e4467b0498b453402d3dfc3b9ab",
+      "include": ["README.md", "LICENSE"],
+      "required": ["README.md", "LICENSE"],
+      "executable_files": [],
+      "mode": "nonexecuting-reference",
+      "import_model_claims": false,
+      "host_plugins": false
+    },
+    "customer-problem-researcher": {
+      "title": "Customer Problem Researcher",
+      "status": "optional",
+      "kind": "skill",
+      "source": "local",
+      "include": ["SKILL.md", "README.md", "LICENSE", "templates/", "scripts/", "references/", "assets/"],
+      "required": ["SKILL.md"],
+      "executable_files": [],
+      "mode": "local-exports-only",
+      "runtime_requires_sandbox": true,
+      "host_plugins": false,
+      "deferred": ["live-service-connectors"]
+    },
+    "financial-manager": {
+      "title": "Financial Manager",
+      "status": "optional",
+      "kind": "skill",
+      "source": "local",
+      "include": ["SKILL.md", "README.md", "LICENSE", "templates/", "scripts/", "references/", "assets/"],
+      "required": ["SKILL.md"],
+      "executable_files": [],
+      "mode": "local-normalized-records-only",
+      "runtime_requires_sandbox": true,
+      "host_plugins": false,
+      "deferred": ["live-crm-importers", "1c-importers", "universal-excel-importers"]
+    },
+    "make-feature": {
+      "title": "Make Feature",
+      "status": "optional",
+      "kind": "skill",
+      "source": "local",
+      "include": ["SKILL.md", "README.md", "LICENSE", "templates/", "scripts/", "references/", "assets/"],
+      "required": ["SKILL.md"],
+      "executable_files": [],
+      "mode": "approved-workspace-only",
+      "runtime_requires_sandbox": true,
+      "host_plugins": false
+    },
+    "competitive-intelligence": {
+      "title": "Competitive Intelligence",
+      "status": "optional",
+      "kind": "skill",
+      "source": "local",
+      "include": ["SKILL.md", "README.md", "LICENSE", "templates/", "scripts/", "references/", "assets/"],
+      "required": ["SKILL.md"],
+      "executable_files": [],
+      "mode": "public-web-only",
+      "runtime_requires_sandbox": true,
+      "host_plugins": false,
+      "deferred": ["funnel-traversal", "separate-email-browser-identities", "telegram-account-automation"]
+    },
+    "codex-limits": {
+      "title": "Hermes Codex Limits",
+      "status": "deferred",
+      "reason": "Pending verification of source functions and backend polling integration, confined quota collection, explicit credential paths and managed updates. A future opt-in frontend bridge may run in the reviewed private Desktop UI runtime confined with bubblewrap/Xpra. No host plugin installation."
+    },
+    "codex-pool": {
+      "title": "Hermes Codex Pool",
+      "status": "deferred",
+      "reason": "Entire credential, proxy, account rotation and service subsystem is deferred."
+    }
+  }
+}
