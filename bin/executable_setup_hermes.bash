@@ -7,6 +7,7 @@ profile="default"
 runtime=""
 workspace=""
 state=""
+workspaces=()
 revision="19cb1cbfedeafaca099be6ff0141a28a6c516c0f"
 action="init"
 dry_run=0
@@ -37,7 +38,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --help|-h)
             printf '%s\n' \
-                'Usage: setup_hermes.bash init|register --runtime DIR --workspace DIR [--profile NAME] [--state DIR]' \
+                'Usage: setup_hermes.bash init|register --runtime DIR [--workspace DIR] [--profile NAME] [--state DIR]' \
                 'Prepare: setup_hermes.bash prepare --runtime DIR --workspace DIR [--state DIR] [--revision PIN] [--dry-run]' \
                 'Doctor: setup_hermes.bash doctor [--profile NAME]' \
                 'Runtime must be an installed Hermes checkout with .venv/bin/python.' \
@@ -60,8 +61,24 @@ if [[ "${action}" == "doctor" ]]; then
     python3 -I "${WRAPPER_DIR}/ai_wrapper_data/hermes_sandbox/profile.py" doctor --profile "${profile}"
     exit $?
 fi
-if [[ -z "${runtime}" || -z "${workspace}" ]]; then
-    printf 'ERROR: --runtime and --workspace are required.\n' >&2
+if [[ -z "${runtime}" ]]; then
+    printf 'ERROR: --runtime is required.\n' >&2
+    exit 2
+fi
+if [[ -t 0 && -t 1 && "${action}" != "prepare" ]]; then
+    if [[ -z "${workspace}" ]]; then
+        printf 'Primary workspace directory: ' >/dev/tty
+        IFS= read -r -e workspace </dev/tty || exit 1
+    fi
+    while ((${#workspaces[@]} < 64)); do
+        printf 'Additional writable workspace (blank to finish): ' >/dev/tty
+        IFS= read -r -e extra_workspace </dev/tty || exit 1
+        [[ -z "${extra_workspace}" ]] && break
+        workspaces+=(--workspaces "${extra_workspace}")
+    done
+fi
+if [[ -z "${workspace}" ]]; then
+    printf 'ERROR: --workspace is required without an interactive terminal.\n' >&2
     exit 2
 fi
 state="${state:-${HOME}/.local/share/hermes-sandbox/profiles/${profile}}"
@@ -80,4 +97,4 @@ elif [[ "${dry_run}" == "1" ]]; then
     exit 2
 fi
 python3 -I "${WRAPPER_DIR}/ai_wrapper_data/hermes_sandbox/profile.py" init \
-    --profile "${profile}" --runtime "${runtime}" --state "${state}" --workspace "${workspace}"
+    --profile "${profile}" --runtime "${runtime}" --state "${state}" --workspace "${workspace}" "${workspaces[@]}"

@@ -145,6 +145,38 @@ class ProfileTests(unittest.TestCase):
             with self.subTest(role=role), self.assertRaises(profile.ProfileError):
                 profile.validate_profile(dict(self.value, **{role: str(path)}))
 
+    def test_additional_workspaces_are_validated_and_nonoverlapping(self):
+        extra = self.home / "extra-workspace"
+        nested = self.workspace / "nested"
+        hidden = self.home / ".hidden-workspace"
+        extra.mkdir(mode=0o700)
+        nested.mkdir(mode=0o700)
+        hidden.mkdir(mode=0o700)
+        profile_value = dict(self.value, workspaces=[str(extra)])
+        self.assertEqual(profile.validate_profile(profile_value)["workspaces"], [str(extra)])
+        for invalid in ([str(self.workspace)], [str(nested)], [str(self.state)],
+                        [str(self.home)], [str(hidden)], [str(profile.profiles_directory())],
+                        [str(extra), str(extra)], ["relative"],
+                        [str(extra)] * 33):
+            with self.subTest(invalid=invalid), self.assertRaises(profile.ProfileError):
+                profile.validate_profile(dict(self.value, workspaces=invalid))
+
+    def test_registered_profile_preserves_extra_workspaces(self):
+        extra = self.home / "extra-workspace"
+        primary = self.home / "multi-primary"
+        extra.mkdir(mode=0o700)
+        primary.mkdir(mode=0o700)
+        state = self.home / "new-state"
+        result = profile.register_profile("multi", str(self.runtime), str(state),
+                                          str(primary), [str(extra)])
+        self.assertEqual(result["workspaces"], [str(extra)])
+        self.assertEqual(profile.load_profile("multi"), result)
+        self.assertEqual(profile._writable_roots(result),
+                         (result["state"], result["workspace"], str(extra)))
+        self.assertEqual(profile._select_workspace(result, str(extra)), str(extra))
+        with self.assertRaises(profile.ProfileError):
+            profile._select_workspace(result, str(self.home))
+
     def test_policy_ancestor_and_descendant_rejected(self):
         for role in ("runtime", "state", "workspace"):
             for path in (self.registry.parent, self.registry, self.registry.parent.parent):

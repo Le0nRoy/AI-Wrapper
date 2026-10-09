@@ -40,6 +40,15 @@ The provisioning doctor reports package suggestions and availability; the fronte
 
 The default profile is `default`. Names match `[a-z0-9][a-z0-9_-]{0,63}`: one to 64 lowercase letters, digits, underscores, or hyphens, starting with a letter or digit.
 
+A profile can bind one primary workdir plus up to 32 additional explicit writable workdirs. All share the profile's Hermes memory, settings, and history; the primary workdir remains the initial current directory. Run setup interactively and enter the primary directory followed by any additional workdirs; submit a blank line when finished:
+
+```bash
+~/ai-wrapper/bin/setup_hermes.bash init --profile work \\
+    --runtime "$HOME/.local/share/hermes-runtimes/19cb1cb"
+```
+
+Every directory is validated on registration and launch. Paths must be canonical, existing, non-symlinked, and must not overlap each other, profile state, credentials, or protected policy. Interactive launch presents only those registered roots and asks which one to use as the starting directory. All roots remain bound for that session; `HERMES_SANDBOX_WORKSPACES` lists additional roots as JSON. An agent cannot add mounts through command-line arguments. Each registered profile remains independently scoped.
+
 For a new pinned runtime, first create private parent directories and select an existing workspace:
 
 ```bash
@@ -77,14 +86,15 @@ For an existing reviewed runtime produced by preparation, registration alone is 
 
 `register` is an alias for `init`; omitting the setup action also selects `init`. An explicit `--state DIR` selects another private state directory. The default is `~/.local/share/hermes-sandbox/profiles/NAME`. Neither registration action installs runtime dependencies nor overwrites an existing profile. Registration requires `.venv/pyvenv.cfg` and an executable `.venv/bin/python` resolving within the runtime or the system installation. Actual runtime entry also requires the reviewed `hermes-provision.json`, PM seed, and external install stamp; an arbitrary upstream venv alone is insufficient.
 
-Profile policy is stored in `~/.config/hermes-sandbox/profiles/NAME.json` with exactly:
+Profile policy is stored in `~/.config/hermes-sandbox/profiles/NAME.json`. The optional `workspaces` list contains additional approved writable roots:
 
 ```json
 {
   "version": 1,
   "runtime": "/home/example/.local/share/hermes-runtimes/19cb1cb",
   "state": "/home/example/.local/share/hermes-sandbox/profiles/work",
-  "workspace": "/home/example/projects/my-project"
+  "workspace": "/home/example/projects/my-project",
+  "workspaces": ["/home/example/projects/shared-library"]
 }
 ```
 

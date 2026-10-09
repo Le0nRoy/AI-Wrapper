@@ -35,6 +35,9 @@ import os
 import sys
 for argument in sys.argv[1:]:
     print("ARG:" + argument)
+for index, argument in enumerate(sys.argv[1:-1]):
+    if argument == "--chdir" and sys.argv[index + 2].endswith("/extra-workspace"):
+        print("SELECTED_EXTRA_WORKSPACE")
 for key in sorted(os.environ):
     print("ENV:" + key)
 PY
@@ -50,7 +53,18 @@ os.execv(command[0], command)
 PY
     chmod 0700 "${case_root}/stubs/systemd-run"
     export PATH="${case_root}/stubs:${PATH}"
+    mkdir -p "${HOME}/extra-workspace"
     bash "${install}/executable_setup_hermes.bash" init --runtime "${HOME}/runtime" --workspace "${HOME}/workspace" || exit 1
+    python3 - "${HOME}/.config/hermes-sandbox/profiles/default.json" "${HOME}/extra-workspace" <<'PY'
+import json
+import pathlib
+import sys
+path = pathlib.Path(sys.argv[1])
+value = json.loads(path.read_text())
+value["workspaces"] = [sys.argv[2]]
+path.write_text(json.dumps(value))
+path.chmod(0o600)
+PY
 }
 
 _policy_case() (
@@ -72,6 +86,8 @@ _policy_case() (
 out="$(_policy_case 2>&1)"; rc=$?
 assert_eq "${rc}" "0" "dedicated Hermes profile launches without legacy preflight/settings"
 assert_contains "${out}" $'ARG:HERMES_PROFILE_NAME\nARG:team-profile\n' "native profile identity matches the selected registry profile"
+assert_contains "${out}" '/extra-workspace' "registered extra workspace is bind-mounted"
+assert_contains "${out}" "ARG:HERMES_SANDBOX_WORKSPACES" "Hermes receives the explicit workspace list"
 assert_not_contains "${out}" 'HOST_PROFILE_OVERRIDE' "native profile identity ignores inherited overrides"
 for expected in 'ARG:--new-session' 'ARG:--unshare-user' 'ARG:--unshare-pid' 'ARG:--cap-drop' 'ARG:ALL' 'ARG:--clearenv' 'ARG:/opt/hermes-sandbox/adapter.py' 'ARG:a prompt with spaces' 'ARG:UTC'; do
     assert_contains "${out}" "${expected}" "Hermes launch contains ${expected}"
@@ -87,6 +103,19 @@ assert_not_contains "${out}" 'LEASE:cli' "separate CLI sessions do not take a br
 for budget in MemoryMax=6G CPUQuota=200% TasksMax=512; do
     assert_contains "${out}" "BUDGET:--property=${budget}" "interactive CLI enforces ${budget}"
 done
+
+_interactive_launch_case() (
+    _fixture
+    command="$(printf '%q' "${install}/executable_hermes_wrapper.bash")"
+    printf '%s\n' "${HOME}/extra-workspace"
+    printf '2\n1\n' | script -qec "bash ${command}" /dev/null
+)
+
+if command -v script >/dev/null 2>&1; then
+    interactive_out="$(_interactive_launch_case 2>&1)"
+    assert_contains "${interactive_out}" 'Select a registered workspace' "interactive Hermes shows its workspace picker"
+    assert_contains "${interactive_out}" 'SELECTED_EXTRA_WORKSPACE' "selected workspace becomes the CLI starting directory"
+fi
 
 _rejection_case() (
     _fixture
@@ -142,6 +171,18 @@ assert_not_contains "${out}" 'LEASE:cli' "worker attempt does not take an exclus
 
 _setup_case() (
     _fixture
+    mkdir -p "${HOME}/wizard-primary" "${HOME}/wizard-extra"
+    wizard_out="$(printf '%s\n%s\n\n' "${HOME}/wizard-primary" "${HOME}/wizard-extra" | \
+        script -qec "bash '${install}/executable_setup_hermes.bash' init --profile wizard --runtime '${HOME}/runtime' --state '${HOME}/state-wizard'" /dev/null 2>&1)"
+    python3 - "${HOME}/.config/hermes-sandbox/profiles/wizard.json" "${HOME}/wizard-extra" <<'PY'
+import json
+import pathlib
+import sys
+profile = json.loads(pathlib.Path(sys.argv[1]).read_text())
+assert profile["workspace"] != sys.argv[2]
+assert profile["workspaces"] == [sys.argv[2]]
+PY
+    [[ $? == 0 ]] && printf 'SETUP_WIZARD_OK\n'
     bash "${install}/executable_setup_hermes.bash" doctor
     printf 'DOCTOR_RC:%s\n' "$?"
     bash "${install}/executable_setup_hermes.bash" register --runtime "${HOME}/runtime" --workspace "${HOME}/workspace"
@@ -164,6 +205,7 @@ PY
 )
 
 out="$(_setup_case 2>&1)"
+assert_contains "${out}" 'SETUP_WIZARD_OK' "interactive setup registers multiple workspaces in one profile"
 assert_contains "${out}" 'DOCTOR_RC:0' "doctor validates the real registered profile"
 assert_contains "${out}" 'REGISTER_AGAIN_RC:1' "registration never overwrites an existing profile"
 assert_contains "${out}" 'PREPARE_DRY_RC:0' "setup routes prepare dry-run"

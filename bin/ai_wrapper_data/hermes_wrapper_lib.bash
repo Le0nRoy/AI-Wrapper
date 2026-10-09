@@ -14,19 +14,25 @@ _hermes_resolve_profile() {
     while IFS= read -r value; do
         paths+=("${value}")
     done <<<"${values}"
-    if [[ ${#paths[@]} -ne 9 ]]; then
+    if [[ ${#paths[@]} -lt 11 || ! "${paths[9]}" =~ ^[0-9]+$ || ${#paths[@]} -ne $((11 + paths[9])) ]]; then
         echo_log "ERROR" "Invalid Hermes profile resolver response."
         return 1
     fi
     _HERMES_RUNTIME="${paths[0]}"
     _HERMES_STATE="${paths[1]}"
     _HERMES_WORKSPACE="${paths[2]}"
+    _HERMES_SELECTED_WORKSPACE="${paths[2]}"
     _HERMES_SNAPSHOT="${paths[3]}"
     _HERMES_CONTROL_SOCKET="${paths[4]}"
     _HERMES_DESKTOP_BRIDGE="${paths[5]}"
     _HERMES_CONTROL_TOKEN="${paths[6]}"
     _HERMES_BACKEND_DIRECTORY="${paths[7]}"
     _HERMES_BACKEND_MANIFEST="${paths[8]}"
+    _HERMES_WORKSPACES_JSON="${paths[10]}"
+    _HERMES_WORKSPACES=("${paths[@]:11}")
+    if [[ -n "${_HERMES_START_WORKSPACE:-}" ]]; then
+        _hermes_select_workspace "${_HERMES_START_WORKSPACE}" || return $?
+    fi
     [[ "${_HERMES_SNAPSHOT}" == "-" ]] && _HERMES_SNAPSHOT=""
     [[ "${_HERMES_CONTROL_SOCKET}" == "-" ]] && _HERMES_CONTROL_SOCKET=""
     [[ "${_HERMES_DESKTOP_BRIDGE}" == "-" ]] && _HERMES_DESKTOP_BRIDGE=""
@@ -36,6 +42,23 @@ _hermes_resolve_profile() {
     _HERMES_PROFILE="${profile}"
     AI_AGENT_COMMAND="${_HERMES_RUNTIME}/.venv/bin/python"
     return 0
+}
+
+_hermes_select_workspace() {
+    local candidate="${1}"
+    local workspace
+    if [[ "${candidate}" == "${_HERMES_WORKSPACE}" ]]; then
+        _HERMES_SELECTED_WORKSPACE="${candidate}"
+        return 0
+    fi
+    for workspace in "${_HERMES_WORKSPACES[@]}"; do
+        if [[ "${candidate}" == "${workspace}" ]]; then
+            _HERMES_SELECTED_WORKSPACE="${candidate}"
+            return 0
+        fi
+    done
+    echo_log "ERROR" "Workspace is not registered for this Hermes profile."
+    return 78
 }
 
 _run_hermes_sandbox_linux() {
@@ -53,6 +76,7 @@ _run_hermes_sandbox_linux() {
         echo_log "ERROR" "Hermes must use the registered runtime's provisioned Python interpreter."
         return 78
     fi
+    _hermes_select_workspace "${_HERMES_SELECTED_WORKSPACE:-${_HERMES_WORKSPACE}}" || return $?
     local bwrap_binary
     bwrap_binary="$(command -v bwrap)" || {
         echo_log "ERROR" "Hermes requires bubblewrap; sandbox setup has no fallback."
@@ -80,14 +104,15 @@ _run_hermes_sandbox_linux() {
         --setenv HERMES_PROFILE_NAME "${_HERMES_PROFILE}"
         --setenv HERMES_SANDBOX_PROFILE "${_HERMES_PROFILE}"
         --setenv HERMES_SANDBOX_RUNTIME "${_HERMES_RUNTIME}"
-        --setenv HERMES_SANDBOX_WORKSPACE "${_HERMES_WORKSPACE}"
+        --setenv HERMES_SANDBOX_WORKSPACE "${_HERMES_SELECTED_WORKSPACE:-${_HERMES_WORKSPACE}}"
+        --setenv HERMES_SANDBOX_WORKSPACES "${_HERMES_WORKSPACES_JSON}"
         --setenv HERMES_SANDBOX_WORKER_SNAPSHOT /run/hermes/worker.json
         --setenv HERMES_SANDBOX_CONTROL_SOCKET /run/hermes/control.sock
         --setenv HERMES_SANDBOX_CONTROL_TOKEN_FILE /run/hermes/control.token
         --setenv _HERMES_PROFILE "${_HERMES_PROFILE}"
         --setenv _HERMES_RUNTIME "${_HERMES_RUNTIME}"
         --setenv _HERMES_STATE "${_HERMES_STATE}"
-        --setenv _HERMES_WORKSPACE "${_HERMES_WORKSPACE}"
+        --setenv _HERMES_WORKSPACE "${_HERMES_SELECTED_WORKSPACE:-${_HERMES_WORKSPACE}}"
         --setenv _HERMES_SNAPSHOT /run/hermes/worker.json
         --setenv XDG_CONFIG_HOME /home/hermes/.config
         --setenv XDG_CACHE_HOME "${_HERMES_STATE}/cache"
@@ -101,8 +126,12 @@ _run_hermes_sandbox_linux() {
         --ro-bind "${WRAPPER_DATA_DIR}/hermes_sandbox" /opt/hermes-sandbox
         --bind "${_HERMES_STATE}" "${_HERMES_STATE}"
         --bind "${_HERMES_WORKSPACE}" "${_HERMES_WORKSPACE}"
-        --chdir "${_HERMES_WORKSPACE}"
+        --chdir "${_HERMES_SELECTED_WORKSPACE:-${_HERMES_WORKSPACE}}"
     )
+    local workspace
+    for workspace in "${_HERMES_WORKSPACES[@]}"; do
+        hermes_args+=(--bind "${workspace}" "${workspace}")
+    done
     [[ -d /lib64 ]] && hermes_args+=(--ro-bind /lib64 /lib64)
     local system_path
     for system_path in /etc/resolv.conf /etc/hosts /etc/nsswitch.conf /etc/passwd /etc/group /etc/ssl /etc/pki /etc/ca-certificates /etc/localtime /etc/fonts /etc/mime.types; do

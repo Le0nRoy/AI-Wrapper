@@ -22,6 +22,7 @@ from urllib.parse import urlsplit
 PROFILE_PATTERN = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}\Z")
 IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z", re.ASCII)
 PROFILE_KEYS = {"version", "runtime", "state", "workspace"}
+OPTIONAL_PROFILE_KEYS = {"workspaces"}
 MAX_PROFILE_BYTES = 65536
 MAX_SNAPSHOT_BYTES = 1024 * 1024
 PINNED_REVISION = "19cb1cbfedeafaca099be6ff0141a28a6c516c0f"
@@ -180,28 +181,42 @@ def _directory(value, label, allow_missing=False):
 
 
 def validate_profile(profile, registry_root=None, allow_missing_state=False):
-    if not isinstance(profile, dict) or set(profile) != PROFILE_KEYS:
-        raise ProfileError("Registry must contain exactly version, runtime, state, and workspace.")
+    if (not isinstance(profile, dict) or not PROFILE_KEYS <= set(profile)
+            or set(profile) - PROFILE_KEYS - OPTIONAL_PROFILE_KEYS):
+        raise ProfileError("Registry must contain version, runtime, state, and workspace, with optional workspaces.")
     if type(profile["version"]) is not int or profile["version"] != 1:
         raise ProfileError("Unsupported registry version.")
     paths = {key: _directory(profile[key], key, allow_missing=key == "state" and allow_missing_state)
              for key in ("runtime", "state", "workspace")}
+    workspaces = profile.get("workspaces", [])
+    if (not isinstance(workspaces, list) or len(workspaces) > 32
+            or any(not isinstance(value, str) for value in workspaces)):
+        raise ProfileError("Additional workspaces must be a list of at most 32 directory paths.")
+    extra_paths = [_directory(value, "workspace") for value in workspaces]
+    all_workspaces = [paths["workspace"], *extra_paths]
+    if len(set(all_workspaces)) != len(all_workspaces):
+        raise ProfileError("Workspace directories must be unique.")
     registry = Path(registry_root) if registry_root is not None else profiles_directory()
     _no_symlinks(registry)
     protected = (registry.parent, control_directory().parent, launcher_directory(),
                  support_directory(), Path(f"/run/user/{os.getuid()}/hermes-sandbox"))
-    for label, path in paths.items():
+    protected_mounts = [*paths.items(), *(('workspace', path) for path in extra_paths)]
+    for label, path in protected_mounts:
         for location in protected:
             _no_symlinks(location)
             if _overlap(path, location):
                 raise ProfileError(f"{label} overlaps protected policy, control, or launcher paths.")
-    for left, right in (("runtime", "state"), ("runtime", "workspace"), ("state", "workspace")):
-        if _overlap(paths[left], paths[right]):
-            raise ProfileError(f"{left} and {right} directories must not overlap.")
+    for workspace in all_workspaces:
+        for label in ("runtime", "state"):
+            if _overlap(paths[label], workspace):
+                raise ProfileError(f"{label} and workspace directories must not overlap.")
+    for index, workspace in enumerate(all_workspaces):
+        if any(_overlap(workspace, other) for other in all_workspaces[index + 1:]):
+            raise ProfileError("Workspace directories must not overlap.")
     home = Path.home().resolve()
-    workspace = paths["workspace"]
-    if _under(workspace, home) and workspace.relative_to(home).parts[0].startswith("."):
-        raise ProfileError("Workspace must not be inside a home dotfile directory.")
+    for workspace in all_workspaces:
+        if _under(workspace, home) and workspace.relative_to(home).parts[0].startswith("."):
+            raise ProfileError("Workspace must not be inside a home dotfile directory.")
     if paths["state"].exists() or not allow_missing_state:
         _private(paths["state"], directory=True)
     venv = paths["runtime"] / ".venv"
@@ -214,7 +229,10 @@ def validate_profile(profile, registry_root=None, allow_missing_state=False):
     interpreter = python.resolve()
     if not any(_under(interpreter, parent) for parent in (paths["runtime"], Path("/usr"), Path("/bin"))):
         raise ProfileError("Runtime Python must resolve inside the runtime or system installation.")
-    return dict(profile)
+    normalized = dict(profile)
+    if "workspaces" in normalized:
+        normalized["workspaces"] = [str(path) for path in extra_paths]
+    return normalized
 
 
 def _pairs(pairs):
@@ -254,12 +272,19 @@ def _check_other_profiles(profile, root, name=None):
         descriptor = os.open(entry, os.O_RDONLY | os.O_NOFOLLOW)
         with os.fdopen(descriptor, "r", encoding="utf-8") as stream:
             other = validate_profile(_decode(stream), root)
+        other_paths = {label: [Path(other[label])] for label in ("runtime", "state", "workspace")}
+        other_paths["workspace"].extend(Path(path) for path in other.get("workspaces", []))
         for label in ("runtime", "state", "workspace"):
-            for other_label in ("runtime", "state", "workspace"):
-                if label == other_label == "runtime":
-                    continue
-                if _overlap(Path(profile[label]), Path(other[other_label])):
-                    raise ProfileError("Profile paths overlap another profile's writable state or workspace.")
+            profile_paths = [Path(profile[label])]
+            if label == "workspace":
+                profile_paths.extend(Path(path) for path in profile.get("workspaces", []))
+            for current in profile_paths:
+                for other_label in ("runtime", "state", "workspace"):
+                    for other_path in other_paths[other_label]:
+                        if label == other_label == "runtime":
+                            continue
+                        if _overlap(current, other_path):
+                            raise ProfileError("Profile paths overlap another profile's writable state or workspace.")
 
 
 def load_profile(name, registry_root=None):
@@ -280,13 +305,14 @@ def load_profile(name, registry_root=None):
     return profile
 
 
-def register_profile(name, runtime, state, workspace):
+def register_profile(name, runtime, state, workspace, workspaces=()):
     validate_name(name)
     root = profiles_directory()
     _no_symlinks(root)
-    profile = validate_profile({
-        "version": 1, "runtime": runtime, "state": state, "workspace": workspace,
-    }, root, allow_missing_state=True)
+    value = {"version": 1, "runtime": runtime, "state": state, "workspace": workspace}
+    if workspaces:
+        value["workspaces"] = list(workspaces)
+    profile = validate_profile(value, root, allow_missing_state=True)
     for directory in (root.parent, root):
         if directory.exists():
             _private(directory, directory=True)
@@ -362,7 +388,8 @@ def doctor(name):
     socket_path = control_socket()
     token_path = control_token(name)
     return {"profile": name, "runtime": profile["runtime"], "state": profile["state"],
-            "workspace": profile["workspace"], "control_socket": socket_path is not None,
+            "workspace": profile["workspace"], "workspaces": profile.get("workspaces", []),
+            "control_socket": socket_path is not None,
             "control_token": token_path is not None, "revision": PINNED_REVISION}
 
 
@@ -479,16 +506,28 @@ def _wrapper_environment():
     return environment
 
 
-def _serve_command(name, registered, identity, manifest, port):
+def _select_workspace(registered, requested=None):
+    workspace = registered["workspace"] if requested is None else requested
+    if workspace not in [registered["workspace"], *registered.get("workspaces", [])]:
+        raise ProfileError("Selected workspace is not registered for this Hermes profile.")
+    return workspace
+
+
+def _writable_roots(registered):
+    return (registered["state"], registered["workspace"], *registered.get("workspaces", []))
+
+
+def _serve_command(name, registered, identity, manifest, port, workspace=None):
     import frontends
 
     runtime_args = frontends.serve_argv(Path(registered["runtime"]) / ".venv/bin/python",
                                       identity["token_file"], identity["owner_nonce"], port)
     return ["/bin/bash", str(_wrapper_path()), "--profile", name, "_serve_server",
-            identity["host_directory"], str(manifest), *runtime_args[4:]]
+            identity["host_directory"], str(manifest), "--workspace-root",
+            _select_workspace(registered, workspace), *runtime_args[4:]]
 
 
-def serve(name, argv):
+def serve(name, argv, workspace_root=None):
     options = argparse.ArgumentParser(prog="hermes_wrapper.bash serve")
     options.add_argument("--port", type=int, default=9119)
     options.add_argument("--host", choices=("127.0.0.1",), default="127.0.0.1")
@@ -497,12 +536,14 @@ def serve(name, argv):
     if not 1 <= arguments.port <= 65535:
         raise ProfileError("Invalid backend port.")
     registered = load_profile(name)
+    workspace = _select_workspace(registered, workspace_root)
     import frontends
 
     with frontends.profile_owner(private_control_directory("locks"), name, "serve",
-                                 writable_roots=(registered["state"], registered["workspace"])):
+                                 writable_roots=_writable_roots(registered)):
         with backend_bundle(name, arguments.port) as (identity, manifest):
-            return subprocess.call(_serve_command(name, registered, identity, manifest, arguments.port),
+            return subprocess.call(_serve_command(name, registered, identity, manifest, arguments.port,
+                                                  workspace),
                                    env=_wrapper_environment())
 
 
@@ -527,7 +568,7 @@ def execute(name, kind, argv):
     lease = contextlib.nullcontext()
     if kind in {"gateway", "serve"}:
         lease = frontends.profile_owner(private_control_directory("locks"), name, kind,
-                                        writable_roots=(registered["state"], registered["workspace"]))
+                                        writable_roots=_writable_roots(registered))
     with lease:
         try:
             return subprocess.call(command, env=environment)
@@ -579,8 +620,10 @@ def wait_backend(manifest, process=None, timeout=BACKEND_READY_TIMEOUT):
     raise ProfileError("Authenticated backend readiness timed out.")
 
 
-def desktop(name, argv):
+def desktop(name, argv, workspace_root=None):
     registered = load_profile(name)
+    workspace = _select_workspace(registered, workspace_root)
+    hermes_args = list(argv)
     import frontends
 
     displays = private_control_directory("displays") / name
@@ -593,18 +636,20 @@ def desktop(name, argv):
     try:
         with contextlib.ExitStack() as stack:
             stack.enter_context(frontends.profile_owner(private_control_directory("locks"), name, "desktop",
-                                                         writable_roots=(registered["state"], registered["workspace"])))
+                                                         writable_roots=_writable_roots(registered)))
             environment = _wrapper_environment()
             manifest = connection_manifest(name)
             if manifest is None:
                 stack.enter_context(frontends.profile_owner(private_control_directory("locks"), name, "serve",
-                                                             writable_roots=(registered["state"], registered["workspace"])))
+                                                             writable_roots=_writable_roots(registered)))
                 identity, manifest = stack.enter_context(backend_bundle(name, 9119))
-                backend = subprocess.Popen(_serve_command(name, registered, identity, manifest, 9119), env=environment)
+                backend = subprocess.Popen(_serve_command(name, registered, identity, manifest, 9119,
+                                                          workspace), env=environment)
             try:
                 wait_backend(manifest, backend)
                 server = subprocess.Popen(["/bin/bash", str(_wrapper_path()), "--profile", name,
-                                           "_desktop_server", str(bridge), *argv], env=environment)
+                                           "_desktop_server", str(bridge), "--workspace-root",
+                                           workspace, *hermes_args], env=environment)
                 result = frontends.run_desktop_client(bridge, server)
                 return result if type(result) is int else 0
             finally:
@@ -635,6 +680,7 @@ def main(argv=None):
     register.add_argument("--runtime", required=True)
     register.add_argument("--state", required=True)
     register.add_argument("--workspace", required=True)
+    register.add_argument("--workspaces", action="append", default=[])
     diagnosis = subcommands.add_parser("doctor")
     diagnosis.add_argument("--profile", default="default")
     execution = subcommands.add_parser("execute")
@@ -643,14 +689,17 @@ def main(argv=None):
     execution.add_argument("argv", nargs=argparse.REMAINDER)
     display = subcommands.add_parser("desktop")
     display.add_argument("--profile", default="default")
+    display.add_argument("--workspace-root")
     display.add_argument("argv", nargs=argparse.REMAINDER)
     backend = subcommands.add_parser("serve")
     backend.add_argument("--profile", default="default")
+    backend.add_argument("--workspace-root")
     backend.add_argument("argv", nargs=argparse.REMAINDER)
     arguments = parser.parse_args(argv)
     try:
         if arguments.command in {"register", "init"}:
-            register_profile(arguments.profile, arguments.runtime, arguments.state, arguments.workspace)
+            register_profile(arguments.profile, arguments.runtime, arguments.state, arguments.workspace,
+                             arguments.workspaces)
             print(f"Registered Hermes sandbox profile: {arguments.profile}")
         elif arguments.command == "doctor":
             result = doctor(arguments.profile)
@@ -661,8 +710,8 @@ def main(argv=None):
             if arguments.command == "execute":
                 return execute(arguments.profile, arguments.kind, argv)
             if arguments.command == "serve":
-                return serve(arguments.profile, argv)
-            return desktop(arguments.profile, argv)
+                return serve(arguments.profile, argv, arguments.workspace_root)
+            return desktop(arguments.profile, argv, arguments.workspace_root)
         else:
             profile = load_profile(arguments.profile)
             snapshot = worker_snapshot(arguments.profile, *arguments.worker) if arguments.worker else None
@@ -684,6 +733,11 @@ def main(argv=None):
                 backend_directory, manifest = None, connection_manifest(arguments.profile)
             print(backend_directory if backend_directory is not None else "-")
             print(manifest if manifest is not None else "-")
+            extra_workspaces = profile.get("workspaces", [])
+            print(len(extra_workspaces))
+            print(json.dumps(extra_workspaces, separators=(",", ":")))
+            for path in extra_workspaces:
+                print(path)
     except ProcessInterrupted as error:
         return 128 + error.signum
     except (ValueError, OSError, ImportError, RuntimeError) as error:

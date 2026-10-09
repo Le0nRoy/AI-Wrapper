@@ -448,6 +448,26 @@ class LifecycleTests(BrokerFixture):
 
 
 class ValidationTests(BrokerFixture):
+    def test_profile_accepts_disjoint_extra_workspaces_and_rejects_overlap(self):
+        extra = self.root / "extra-workspace"
+        extra.mkdir(mode=0o700)
+        self.policy["workspaces"] = [str(extra)]
+        self.write_policy()
+        descriptor = os.open(self.profiles_dir, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            profiles = self.broker._profiles(descriptor)
+        finally:
+            os.close(descriptor)
+        self.assertEqual(profiles[self.profile]["workspaces"], [extra])
+        self.policy["workspaces"] = [str(self.state)]
+        self.write_policy()
+        descriptor = os.open(self.profiles_dir, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            with self.assertRaises(control.BrokerError):
+                self.broker._profiles(descriptor)
+        finally:
+            os.close(descriptor)
+
     def test_closed_schema_and_lexical_ids(self):
         with self.subTest(phase="Arrange"):
             cases = [(dict(self.request, **{field: value}), "invalid_token")

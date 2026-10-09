@@ -461,11 +461,16 @@ class Broker:
                 name = _token(entry.name[:-5], profile=True)
                 value = _decode(_read_file(descriptor, entry.name, MAX_PROFILE_BYTES,
                                            protected=True), MAX_PROFILE_BYTES)
-                if not isinstance(value, dict) or set(value) != {
-                        "version", "runtime", "state", "workspace"}:
+                required_fields = {"version", "runtime", "state", "workspace"}
+                if (not isinstance(value, dict) or not required_fields <= set(value)
+                        or set(value) - required_fields - {"workspaces"}):
                     raise BrokerError("invalid_profile_schema")
                 if type(value["version"]) is not int or value["version"] != 1:
                     raise BrokerError("invalid_profile_version")
+                extra_workspaces = value.get("workspaces", [])
+                if (not isinstance(extra_workspaces, list) or len(extra_workspaces) > 32
+                        or any(not isinstance(path, str) for path in extra_workspaces)):
+                    raise BrokerError("invalid_profile_schema")
                 for field in ("runtime", "state", "workspace"):
                     path = _absolute(value[field])
                     home = Path(pwd.getpwuid(os.getuid()).pw_dir)
@@ -474,9 +479,24 @@ class Broker:
                     check = _open_directory(path)
                     os.close(check)
                     value[field] = path
-                if any(_overlap(value[first], value[second]) for first, second in (
-                        ("state", "workspace"), ("runtime", "workspace"), ("runtime", "state"))):
+                workspaces = [value["workspace"]]
+                for workspace in extra_workspaces:
+                    path = _absolute(workspace)
+                    home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+                    if _contains(path, home) or path == Path("/"):
+                        raise BrokerError("unsafe_profile_path")
+                    check = _open_directory(path)
+                    os.close(check)
+                    workspaces.append(path)
+                if len(set(workspaces)) != len(workspaces) or any(
+                        _overlap(left, right) for index, left in enumerate(workspaces)
+                        for right in workspaces[index + 1:]):
                     raise BrokerError("overlapping_profile_paths")
+                if any(_overlap(value[label], workspace) for label in ("state", "runtime")
+                       for workspace in workspaces):
+                    raise BrokerError("overlapping_profile_paths")
+                if "workspaces" in value:
+                    value["workspaces"] = workspaces[1:]
                 profiles[name] = value
                 if len(profiles) > MAX_PROFILES:
                     raise BrokerError("profile_limit")
@@ -495,12 +515,20 @@ class Broker:
                 for field in ("state", "workspace"):
                     if _overlap(protected, profile[field]):
                         raise BrokerError("overlapping_policy")
+                if any(_overlap(protected, workspace) for workspace in profile.get("workspaces", [])):
+                    raise BrokerError("overlapping_policy")
                 if _contains(profile["runtime"], protected):
                     raise BrokerError("overlapping_policy")
 
     def _policy_digest(self, profile):
-        value = {key: str(path) if isinstance(path, Path) else path
-                 for key, path in self.profiles[profile].items()}
+        def serialize(value):
+            if isinstance(value, Path):
+                return str(value)
+            if isinstance(value, list):
+                return [serialize(item) for item in value]
+            return value
+
+        value = {key: serialize(path) for key, path in self.profiles[profile].items()}
         value["wrapper"] = str(self.wrapper)
         return hashlib.sha256(_encode(value)).hexdigest()
 
