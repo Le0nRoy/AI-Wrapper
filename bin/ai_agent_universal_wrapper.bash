@@ -62,6 +62,25 @@ _sandbox_sensitive_dir_kind() {
 }
 
 run_sandboxed_agent() {
+    case "${AI_SANDBOX_AGENT_PROFILE:-default}" in
+        default) ;;
+        hermes)
+            if [[ "$(uname -s)" != "Linux" ]]; then
+                echo_log "ERROR" "The Hermes sandbox profile requires Linux and bubblewrap."
+                return 78
+            fi
+            if ! declare -f _run_hermes_sandbox_linux >/dev/null 2>&1; then
+                echo_log "ERROR" "The Hermes profile must be launched through hermes_wrapper.bash."
+                return 78
+            fi
+            _run_hermes_sandbox_linux "$@"
+            return $?
+            ;;
+        *)
+            echo_log "ERROR" "Unknown sandbox agent profile."
+            return 78
+            ;;
+    esac
     case "$(uname -s)" in
         Linux)
             _run_sandboxed_agent_linux "$@"
