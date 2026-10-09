@@ -222,11 +222,12 @@ source_lib
 unset AI_WRAPPER_AGENT_ID
 unset AI_WRAPPER_PRESET_AUTOLOADED_FROM
 set +e
-_preset_autoload 2>/dev/null
+err="$( _preset_autoload 2>&1 )"
 rc=$?
 set -e
 ok=1
 (( rc == 1 )) || { _fail "UNIT-AUTOLOAD-11" "expected rc=1" "1" "${rc}"; ok=0; }
+assert_match "UNIT-AUTOLOAD-11" "AI_WRAPPER_AGENT_ID" "${err}" || ok=0
 if [[ -n "${AI_WRAPPER_PRESET_AUTOLOADED_FROM:-}" ]]; then
     _fail "UNIT-AUTOLOAD-11" "AI_WRAPPER_PRESET_AUTOLOADED_FROM set despite invalid agent id" "(unset)" "${AI_WRAPPER_PRESET_AUTOLOADED_FROM}"; ok=0
 fi

@@ -116,11 +116,12 @@ mkdir -p "$(dirname "${path}")"
 printf '# workdir: %s\nAI_SANDBOX_PASS_AWS=1\n' "$(pwd -P)" > "${path}"
 unset AI_WRAPPER_AGENT_ID
 set +e
-_preset_clear 2>/dev/null
+err="$( _preset_clear 2>&1 )"
 rc=$?
 set -e
 ok=1
 (( rc == 1 )) || { _fail "UNIT-CLEAR-06" "expected rc=1" "1" "${rc}"; ok=0; }
+assert_match "UNIT-CLEAR-06" "AI_WRAPPER_AGENT_ID" "${err}" || ok=0
 # The file created with the valid id must still exist (clear was a no-op).
 assert_file_exists "UNIT-CLEAR-06" "${path}" || ok=0
 if (( ok == 1 )); then PASS=$((PASS+1)); echo "PASS UNIT-CLEAR-06"; else FAIL=$((FAIL+1)); fi
