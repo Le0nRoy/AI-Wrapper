@@ -33,7 +33,7 @@ check_agent_binary
 
 # Interactive session selection (only if no arguments provided and stdin/stdout are terminals)
 if [[ $# -eq 0 && -t 0 && -t 1 ]]; then
-    # Auto-load the per-workdir preset before the menu renders so restored
+    # Auto-load this workdir's cursor preset before the menu renders so restored
     # AI_SANDBOX_* settings are visible in the settings table on first paint.
     # Silent no-op when no preset file exists (first run).
     _preset_autoload
@@ -55,7 +55,7 @@ if [[ $# -eq 0 && -t 0 && -t 1 ]]; then
 fi
 
 # Non-interactive or argument pass-through. No menu runs, so load the
-# per-workdir preset (AI_SANDBOX_* flags) directly so a scripted invocation
+# workdir's cursor preset (AI_SANDBOX_* flags) directly so a scripted invocation
 # still picks up settings saved from an earlier interactive session in this
 # workdir, instead of silently reverting to catalog defaults.
 # AI rules (AGENTS.md and CLAUDE.md) are bound by default in universal wrapper

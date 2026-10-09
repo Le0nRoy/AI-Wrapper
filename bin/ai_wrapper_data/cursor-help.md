@@ -21,8 +21,9 @@ Opens the toggle-and-edit sub-menu for the `AI_SANDBOX_*` sandbox flags
 per-workdir via the same auto-save/auto-load mechanism as `c) Clear` below.
 
 ### c) Clear saved settings for this workdir
-Removes the auto-saved settings preset for the current directory, resetting
-the menu to catalog defaults on the next open.
+Removes the Cursor wrapper's auto-saved settings preset for the current
+directory (`<hash>-cursor.env`), resetting the menu to catalog defaults on
+the next open. Other wrappers' presets for the directory are not affected.
 
 ### h) Help
 Shows this help document.

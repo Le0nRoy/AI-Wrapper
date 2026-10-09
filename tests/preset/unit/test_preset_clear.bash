@@ -82,5 +82,50 @@ assert_file_exists "UNIT-CLEAR-04-other" "${path2}" || ok=0
 if (( ok == 1 )); then PASS=$((PASS+1)); echo "PASS UNIT-CLEAR-04"; else FAIL=$((FAIL+1)); fi
 clean_scratch
 
+# UNIT-CLEAR-05: clear removes the legacy shared file (else the autoload
+# fallback would resurrect it) but keeps other agents' per-agent files.
+mk_scratch; guard_home
+unset XDG_CONFIG_HOME
+export XDG_CONFIG_HOME="${TEST_SCRATCH}/config"
+clear_catalog_env
+source_lib
+path="$(_preset_autosave_path)"
+legacy="$(_preset_legacy_path)"
+other="${legacy%.env}-other.env"
+mkdir -p "$(dirname "${path}")"
+printf 'AI_SANDBOX_PASS_AWS=1\n' > "${path}"
+printf 'AI_SANDBOX_PASS_AWS=1\n' > "${legacy}"
+printf 'AI_SANDBOX_PASS_AWS=1\n' > "${other}"
+_preset_clear
+ok=1
+assert_file_absent "UNIT-CLEAR-05-own" "${path}" || ok=0
+assert_file_absent "UNIT-CLEAR-05-legacy" "${legacy}" || ok=0
+assert_file_exists "UNIT-CLEAR-05-other" "${other}" || ok=0
+if (( ok == 1 )); then PASS=$((PASS+1)); echo "PASS UNIT-CLEAR-05"; else FAIL=$((FAIL+1)); fi
+clean_scratch
+
+# UNIT-CLEAR-06: unset AI_WRAPPER_AGENT_ID returns rc=1, leaves existing files untouched.
+mk_scratch; guard_home
+unset XDG_CONFIG_HOME
+export XDG_CONFIG_HOME="${TEST_SCRATCH}/config"
+clear_catalog_env
+source_lib
+# Create a preset file using the valid agent id, then break the id.
+path="$(_preset_autosave_path)"
+mkdir -p "$(dirname "${path}")"
+printf '# workdir: %s\nAI_SANDBOX_PASS_AWS=1\n' "$(pwd -P)" > "${path}"
+unset AI_WRAPPER_AGENT_ID
+set +e
+err="$( _preset_clear 2>&1 )"
+rc=$?
+set -e
+ok=1
+(( rc == 1 )) || { _fail "UNIT-CLEAR-06" "expected rc=1" "1" "${rc}"; ok=0; }
+assert_match "UNIT-CLEAR-06" "AI_WRAPPER_AGENT_ID" "${err}" || ok=0
+# The file created with the valid id must still exist (clear was a no-op).
+assert_file_exists "UNIT-CLEAR-06" "${path}" || ok=0
+if (( ok == 1 )); then PASS=$((PASS+1)); echo "PASS UNIT-CLEAR-06"; else FAIL=$((FAIL+1)); fi
+clean_scratch
+
 printf 'SUMMARY %s pass=%d fail=%d skip=%d\n' "$(basename "${BASH_SOURCE[0]}")" "${PASS}" "${FAIL}" "${SKIP}"
 exit $(( FAIL == 0 ? 0 : 1 ))
