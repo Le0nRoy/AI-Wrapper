@@ -8,7 +8,8 @@
 #     default ~/.codex symlink guards)
 #   - the agent-generic LIB helpers moved out of the Claude wrapper
 #     (_wrapper_bind_git_common_dir, _apply_post_menu_binds), under `set -u`
-#   - per-workdir preset carry-over of the other agent's account key
+#   - per-agent per-workdir presets: no cross-agent clobbering, legacy
+#     shared-file fallback and precedence, clear, missing agent id
 #   - end-to-end: the real codex wrapper, with a stub `codex` binary, inside
 #     the real sandbox (Linux only — the account remap is bwrap-only)
 #
@@ -239,27 +240,106 @@ out="$( set -u; _load codex; WRAPPER_FLAGS=(); AI_SANDBOX_PASS_GITLAB=0 _apply_p
 assert_eq "${out}" "" "PASS_GITLAB=0 adds no glab bind"
 
 # ---------------------------------------------------------------------------
-echo "-- shared per-workdir preset keeps the other agent's account"
+echo "-- per-agent per-workdir presets (claude and codex in one workdir)"
 if ! command -v shasum >/dev/null 2>&1; then
     shasum() { sha256sum; }   # Linux hosts without perl's shasum
 fi
-_preset_roundtrip() {
+# Each case gets its own workdir so preset files never leak between cases.
+_pdir() { mkdir -p "${FAKE_HOME}/preset-${1}" && printf '%s' "${FAKE_HOME}/preset-${1}"; }
+# Print the per-agent preset path for agent $1 in dir $2.
+_ppath() { ( cd "${2}" && _load "${1}" && _preset_autosave_path ); }
+# Print the legacy shared preset path for dir $1.
+_plegacy() { ( cd "${1}" && _load claude && _preset_legacy_path ); }
+# Autoload agent $1's preset in dir $2 from a clean env; print the values.
+_pload() {
     (
-        cd "${FAKE_HOME}/work" || exit 1
-        _load claude; CLAUDE_ACCOUNT=work; _preset_autosave
+        cd "${2}" || exit 1
+        unset CLAUDE_ACCOUNT CODEX_ACCOUNT AI_SANDBOX_PASS_AWS AI_SANDBOX_PASS_KUBE
+        _load "${1}"
+        unset CLAUDE_ACCOUNT CODEX_ACCOUNT   # agent libs may default these
+        _preset_autoload 2>&1
+        printf 'C=%s X=%s AWS=%s KUBE=%s FROM=%s\n' "${CLAUDE_ACCOUNT:-<unset>}" \
+            "${CODEX_ACCOUNT:-<unset>}" "${AI_SANDBOX_PASS_AWS:-<unset>}" \
+            "${AI_SANDBOX_PASS_KUBE:-<unset>}" "${AI_WRAPPER_PRESET_AUTOLOADED_FROM:-<unset>}"
     )
-    (
-        cd "${FAKE_HOME}/work" || exit 1
-        _load codex; CODEX_ACCOUNT=alt; _preset_autosave
-    )
-    cat "$(cd "${FAKE_HOME}/work" && _load codex && _preset_autosave_path)"
 }
-out="$(_preset_roundtrip 2>&1)"
-assert_contains "${out}" "CLAUDE_ACCOUNT=work" "codex save keeps claude's account"
-assert_contains "${out}" "CODEX_ACCOUNT=alt" "codex save writes its own account"
-out="$( cd "${FAKE_HOME}/work" && _load claude && _preset_autoload 2>&1 && echo "C=${CLAUDE_ACCOUNT} X=${CODEX_ACCOUNT:-<unset>}" )"
-assert_contains "${out}" "C=work X=<unset>" "claude autoload restores its account and does not export codex's"
-assert_not_contains "${out}" "unknown setting" "foreign account key loads without WARN"
+
+# Control: a single agent round-trips its own settings.
+d="$(_pdir control)"
+( cd "${d}" && _load claude && CLAUDE_ACCOUNT=work AI_SANDBOX_PASS_AWS=1 _preset_autosave )
+claude_path="$(_ppath claude "${d}")"
+assert_eq "$(basename "${claude_path}")" "$(basename "$(_plegacy "${d}")" .env)-claude.env" "claude preset file is <hash>-claude.env"
+out="$(_pload claude "${d}")"
+assert_contains "${out}" "C=work X=<unset> AWS=1" "control: claude save -> claude load restores its settings"
+assert_contains "${out}" "FROM=${claude_path}" "control: restored-from marker names the per-agent file"
+
+# Both agents save different values in the same workdir; neither clobbers.
+d="$(_pdir both)"
+( cd "${d}" && _load claude && CLAUDE_ACCOUNT=work AI_SANDBOX_PASS_AWS=1 AI_SANDBOX_PASS_KUBE=0 _preset_autosave )
+( cd "${d}" && _load codex && CODEX_ACCOUNT=alt AI_SANDBOX_PASS_AWS=0 AI_SANDBOX_PASS_KUBE=1 _preset_autosave )
+claude_path="$(_ppath claude "${d}")"
+codex_path="$(_ppath codex "${d}")"
+assert_eq "$(basename "${codex_path}")" "$(basename "$(_plegacy "${d}")" .env)-codex.env" "codex preset file is <hash>-codex.env"
+claude_file="$(cat "${claude_path}" 2>&1)"
+codex_file="$(cat "${codex_path}" 2>&1)"
+assert_contains "${claude_file}" "CLAUDE_ACCOUNT=work" "claude file keeps its account after codex saved"
+assert_contains "${claude_file}" "AI_SANDBOX_PASS_AWS=1" "claude file keeps its shared setting after codex saved"
+assert_not_contains "${claude_file}" "CODEX_ACCOUNT" "claude file holds no codex key"
+assert_contains "${claude_file}" "# agent: claude" "claude file has '# agent: claude' header"
+assert_contains "${claude_file}" "# workdir: $(cd "${d}" && pwd -P)" "claude file keeps the '# workdir:' header"
+assert_contains "${codex_file}" "CODEX_ACCOUNT=alt" "codex file has its own account"
+assert_contains "${codex_file}" "AI_SANDBOX_PASS_AWS=0" "codex file has its own shared setting"
+assert_not_contains "${codex_file}" "CLAUDE_ACCOUNT" "codex file holds no claude key"
+assert_contains "${codex_file}" "# agent: codex" "codex file has '# agent: codex' header"
+out="$(_pload claude "${d}")"
+assert_contains "${out}" "C=work X=<unset> AWS=1 KUBE=0" "claude reload after codex save restores claude's values"
+assert_not_contains "${out}" "unknown setting" "claude reload emits no unknown-setting WARN"
+out="$(_pload codex "${d}")"
+assert_contains "${out}" "C=<unset> X=alt AWS=0 KUBE=1" "codex reload restores codex's values"
+
+# Migration: no per-agent file yet -> load from the legacy shared file.
+d="$(_pdir legacy)"
+legacy_path="$(_plegacy "${d}")"
+mkdir -p "$(dirname "${legacy_path}")"
+printf '# workdir: %s\nCLAUDE_ACCOUNT=old\nCODEX_ACCOUNT=oldx\nAI_SANDBOX_PASS_KUBE=1\n' "${d}" >"${legacy_path}"
+legacy_before="$(cat "${legacy_path}")"
+out="$(_pload claude "${d}")"
+assert_contains "${out}" "C=old X=<unset> AWS=<unset> KUBE=1" "claude falls back to the legacy file (codex key not exported)"
+assert_contains "${out}" "FROM=${legacy_path}" "restored-from marker names the legacy file"
+assert_not_contains "${out}" "unknown setting" "legacy fallback skips the other agent's key without WARN"
+out="$(_pload codex "${d}")"
+assert_contains "${out}" "C=<unset> X=oldx AWS=<unset> KUBE=1" "codex falls back to the same legacy file"
+( cd "${d}" && _load claude && _preset_autoload 2>/dev/null && _preset_autosave )
+assert_eq "$(cat "${legacy_path}" 2>&1)" "${legacy_before}" "autosave after migration leaves the legacy file untouched"
+assert_contains "$(cat "$(_ppath claude "${d}")" 2>&1)" "CLAUDE_ACCOUNT=old" "migrated values land in the per-agent file"
+
+# Precedence: per-agent file wins over legacy when both exist.
+d="$(_pdir precedence)"
+legacy_path="$(_plegacy "${d}")"
+claude_path="$(_ppath claude "${d}")"
+mkdir -p "$(dirname "${legacy_path}")"
+printf 'CLAUDE_ACCOUNT=old\nAI_SANDBOX_PASS_KUBE=1\n' >"${legacy_path}"
+printf 'CLAUDE_ACCOUNT=new\nAI_SANDBOX_PASS_KUBE=0\n' >"${claude_path}"
+out="$(_pload claude "${d}")"
+assert_contains "${out}" "C=new X=<unset> AWS=<unset> KUBE=0" "per-agent file takes precedence over legacy"
+assert_contains "${out}" "FROM=${claude_path}" "restored-from marker names the per-agent file, not legacy"
+
+# Clear: removes own file + legacy, leaves the other agent's file.
+codex_path="$(_ppath codex "${d}")"
+printf 'CODEX_ACCOUNT=alt\n' >"${codex_path}"
+( cd "${d}" && _load claude && _preset_clear )
+assert_eq "$([[ -e "${claude_path}" ]] && echo present || echo absent)" "absent" "clear removes the agent's own file"
+assert_eq "$([[ -e "${legacy_path}" ]] && echo present || echo absent)" "absent" "clear removes the legacy file (no resurrection via fallback)"
+assert_eq "$([[ -e "${codex_path}" ]] && echo present || echo absent)" "present" "clear leaves the other agent's file"
+
+# Missing agent id fails loudly instead of writing a shared file.
+d="$(_pdir noid)"
+out="$( cd "${d}" && _load claude && AI_WRAPPER_AGENT_ID="" && _preset_autosave 2>&1; echo "rc=$?" )"
+assert_contains "${out}" "ERROR: AI_WRAPPER_AGENT_ID is unset" "unset agent id: autosave reports an error"
+assert_contains "${out}" "rc=1" "unset agent id: autosave returns 1"
+assert_eq "$(ls -A "$(dirname "$(_plegacy "${d}")")" | grep -c "^$(basename "$(_plegacy "${d}")" .env)")" "0" "unset agent id: no preset file written"
+out="$( cd "${d}" && _load claude && AI_WRAPPER_AGENT_ID="../x" && _preset_autosave_path 2>&1; echo "rc=$?" )"
+assert_contains "${out}" "rc=1" "agent id with a path separator is rejected"
 
 # ---------------------------------------------------------------------------
 echo "-- end-to-end: real codex wrapper + stub codex in the sandbox"

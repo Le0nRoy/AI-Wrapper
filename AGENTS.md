@@ -17,7 +17,7 @@ These rules apply to **Claude Code** (and any other AI agents) working on **any 
 | Orchestrator prompt | `~/bin/ai_wrapper_data/orchestrator-prompt.md` |
 | Installed plugins | `~/.claude/settings.json` → `enabledPlugins` |
 | Plugin marketplace | `~/.claude/plugins/marketplaces/claude-plugins-official/plugins/` |
-| Sandbox settings / account switching | `s) Settings` in the wrapper's main menu — toggles `AI_SANDBOX_*` flags and (Claude wrapper only) the active `CLAUDE_ACCOUNT` profile; persists per-workdir |
+| Sandbox settings / account switching | `s) Settings` in the wrapper's main menu — toggles `AI_SANDBOX_*` flags and (Claude wrapper only) the active `CLAUDE_ACCOUNT` profile; persists per-workdir and per-agent |
 | macOS sandbox backend | `sandbox-exec` (Seatbelt), auto-selected via `uname -s` — see `bin/ai_wrapper_data/macos_sandbox_exec.bash` and `claude_wrapper.sb` |
 
 **Key skills (always relevant):**

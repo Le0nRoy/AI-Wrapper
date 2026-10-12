@@ -209,8 +209,8 @@ unset _wd_resolved _home_resolved
 # therefore to run_sandboxed_agent below. The chosen action is returned via
 # the global $WRAPPER_MENU_CHOICE.
 if [[ $# -eq 0 && -t 0 && -t 1 ]]; then
-    # Auto-load the per-workdir preset before the menu renders so the
-    # restored settings (including CLAUDE_ACCOUNT) are visible in the
+    # Auto-load this workdir's claude preset before the menu renders so
+    # the restored settings (including CLAUDE_ACCOUNT) are visible in the
     # settings table on first paint. Silent no-op when no preset file
     # exists (first run).
     _preset_autoload
@@ -245,7 +245,7 @@ if [[ $# -eq 0 && -t 0 && -t 1 ]]; then
 fi
 
 # Non-interactive or argument pass-through. No menu runs, so load the
-# per-workdir preset (CLAUDE_ACCOUNT, AI_SANDBOX_* flags) directly so a
+# workdir's claude preset (CLAUDE_ACCOUNT, AI_SANDBOX_* flags) directly so a
 # scripted invocation still picks up settings saved from an earlier
 # interactive session in this workdir, instead of silently reverting to
 # catalog defaults.

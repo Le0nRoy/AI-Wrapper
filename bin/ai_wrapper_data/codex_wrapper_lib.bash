@@ -7,6 +7,7 @@
 
 AI_WRAPPER_AGENT_NAME="Codex CLI"
 AI_AGENT_COMMAND="codex"
+AI_WRAPPER_AGENT_ID="codex"
 # Codex has no plain `--system-prompt <text>` flag; orchestration injects
 # the prompt via `-c developer_instructions=<TOML string>` instead — see
 # _agent_system_prompt_args below, which run_orchestrated_session prefers

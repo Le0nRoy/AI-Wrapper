@@ -179,6 +179,7 @@
     (subpath "/private/var/db/mds")                   ; Spotlight metadata (Foundation reads on init)
     (subpath "/private/var/run")                      ; socket-symlink resolution (docker.sock parent)
     (subpath "/Library/Preferences")                  ; system-wide CFPrefs (not per-user)
+    (subpath "/Library/Application Support/ClaudeCode") ; managed-settings.json + managed-settings.d/ (admin policy, root-owned)
     (literal "/")
     (literal "/Applications")                         ; some CLIs probe /Applications/Xcode
     (literal "/Library")

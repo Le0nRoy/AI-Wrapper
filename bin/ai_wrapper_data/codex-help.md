@@ -32,10 +32,11 @@ Choices persist per-workdir via the same auto-save/auto-load mechanism as
 `c) Clear` below.
 
 ### c) Clear saved settings for this workdir
-Removes the auto-saved settings preset for the current directory, resetting
-the menu to catalog defaults on the next open. The preset file is shared
-with the Claude wrapper for the same directory; each wrapper keeps the
-other's account choice when it saves.
+Removes the Codex wrapper's auto-saved settings preset for the current
+directory (`<hash>-codex.env`; see the Claude wrapper help for the file
+layout), resetting the menu to catalog defaults on the next open. Each
+wrapper keeps its own per-workdir file, so the Claude wrapper's settings
+for the same directory are not affected.
 
 ### h) Help
 Shows this help document.

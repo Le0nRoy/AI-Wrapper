@@ -56,7 +56,7 @@ unset _wd_resolved _home_resolved
 
 # Interactive session selection (only if no arguments provided and stdin/stdout are terminals)
 if [[ $# -eq 0 && -t 0 && -t 1 ]]; then
-    # Auto-load the per-workdir preset before the menu renders so restored
+    # Auto-load this workdir's codex preset before the menu renders so restored
     # settings (including CODEX_ACCOUNT) are visible in the settings table
     # on first paint. Silent no-op when no preset file exists (first run).
     _preset_autoload
@@ -87,7 +87,7 @@ if [[ $# -eq 0 && -t 0 && -t 1 ]]; then
 fi
 
 # Non-interactive or argument pass-through. No menu runs, so load the
-# per-workdir preset (CODEX_ACCOUNT, AI_SANDBOX_* flags) directly so a
+# workdir's codex preset (CODEX_ACCOUNT, AI_SANDBOX_* flags) directly so a
 # scripted invocation still picks up settings saved from an earlier
 # interactive session in this workdir, instead of silently reverting to
 # catalog defaults.

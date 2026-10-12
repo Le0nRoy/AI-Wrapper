@@ -8,6 +8,11 @@
 # Required variables (set before sourcing):
 #   AI_WRAPPER_AGENT_NAME  - Display name (e.g. "Claude CLI")
 #   AI_AGENT_COMMAND       - Binary to run (e.g. "claude")
+#   AI_WRAPPER_AGENT_ID    - Stable agent id (e.g. "claude"); names the
+#                            per-workdir preset file <hash>-<id>.env.
+#                            Unlike AI_WRAPPER_AGENT_NAME it never gets an
+#                            account suffix, and unlike AI_AGENT_COMMAND it
+#                            is not swapped out by tests.
 #
 # Required variables (set by the calling wrapper, used by run_orchestrated_session/run_agent_session):
 #   WRAPPER_FLAGS          - Array of sandbox flags (--bind mounts, etc.)
@@ -571,33 +576,6 @@ unset _ai_n _ai_t _ai_d _ai_sev _ai_hl _ai_det _ai_cat
 # on unrecognised keys, not a hard error).
 _AI_WRAPPER_PRESET_FORMAT_VERSION="2026-05-28"
 
-# The preset file is per-workdir, not per-agent, so the Claude and Codex
-# wrappers share it. Each agent's account key is only in its own catalog:
-# _preset_autoload skips these silently (instead of the "unknown setting"
-# WARN) and _preset_autosave carries their saved values over, so saving
-# from one wrapper doesn't erase the other wrapper's account choice.
-_AI_PRESET_FOREIGN_KEYS=(CLAUDE_ACCOUNT CODEX_ACCOUNT)
-
-# Return 0 when $1 is a catalog key in this process.
-_preset_is_catalog_key() {
-    local entry
-    for entry in "${_AI_SETTINGS_LIST[@]}"; do
-        [[ "${entry%%|*}" == "${1}" ]] && return 0
-    done
-    return 1
-}
-
-# Return 0 when $1 is another agent's key (see _AI_PRESET_FOREIGN_KEYS)
-# that this process's catalog doesn't own.
-_preset_is_foreign_key() {
-    local k
-    _preset_is_catalog_key "${1}" && return 1
-    for k in "${_AI_PRESET_FOREIGN_KEYS[@]}"; do
-        [[ "${k}" == "${1}" ]] && return 0
-    done
-    return 1
-}
-
 # Parse one catalog entry into globals: _set_name _set_type _set_default
 # _set_severity _set_headline _set_detail _set_category _set_os_scope.
 # Globals because bash 3.2 lacks namerefs and returning an 8-tuple via
@@ -787,39 +765,70 @@ _render_settings_table() {
     echo "" >/dev/tty
 }
 
-# ----- Per-workdir auto-persist preset helpers -----
+# ----- Per-workdir, per-agent auto-persist preset helpers -----
 #
-# Settings are automatically saved to a per-workdir file under
-# $XDG_CONFIG_HOME/ai-wrapper/last-preset/<hash>.env where hash is
-# the first 12 hex chars of shasum -a 256 over the resolved workdir
-# path. The file header carries a human-readable "# workdir: <path>"
-# comment so users can grep to identify files.
+# Settings are automatically saved to a per-workdir, per-agent file under
+# $XDG_CONFIG_HOME/ai-wrapper/last-preset/<hash>-<agent>.env where hash
+# is the first 12 hex chars of shasum -a 256 over the resolved workdir
+# path and agent is AI_WRAPPER_AGENT_ID (set by each agent lib, e.g.
+# "claude", "codex"). Per-agent files keep the Claude and Codex wrappers
+# from clobbering each other's settings when both run in one workdir.
+# The file header carries human-readable "# workdir: <path>" and
+# "# agent: <id>" comments so users can grep to identify files.
 #
-# Three public functions:
+# Migration: releases before per-agent files wrote one shared
+# <hash>.env per workdir. _preset_autoload falls back to that legacy
+# file (read-only) until this agent's own file exists; the next
+# _preset_autosave then writes the per-agent file. The legacy file is
+# left in place so the other agents can migrate from it too, and is
+# only removed by an explicit _preset_clear.
+#
+# Public functions:
 #   _preset_autosave_path  — compute (but do not create) the file path
+#   _preset_legacy_path    — compute the pre-per-agent shared file path
 #   _preset_autosave       — write every catalog key verbatim
 #   _preset_autoload       — apply saved settings (no-op silently if no file)
-#   _preset_clear          — rm -f the file + unset AUTOLOADED_FROM
+#   _preset_clear          — rm -f the files + unset AUTOLOADED_FROM
 
-# Compute the path to the per-workdir preset file. Uses resolved CWD
-# as the identity so symlinked worktrees resolve to the same file as
-# their physical path. Does NOT create any directories.
-_preset_autosave_path() {
+# Print the preset directory + "/<hash>" prefix for the resolved CWD.
+# Uses resolved CWD as the identity so symlinked worktrees resolve to the
+# same file as their physical path. Does NOT create any directories.
+_preset_path_prefix() {
     local workdir hash dir
     workdir="$(pwd -P)"
     # shasum -a 256 outputs "<hex>  -"; take the first 12 hex chars.
     hash="$(printf '%s' "${workdir}" | shasum -a 256 | cut -c1-12)"
     dir="${XDG_CONFIG_HOME:-${HOME}/.config}/ai-wrapper/last-preset"
-    printf '%s/%s.env' "${dir}" "${hash}"
+    printf '%s/%s' "${dir}" "${hash}"
 }
 
-# Write every catalog key to the per-workdir preset file. Saves ALL
-# keys verbatim (including bool=0 and empty str/path) so a user who
+# Compute the path to this agent's per-workdir preset file. Fails loudly
+# (stderr, return 1, no output) when AI_WRAPPER_AGENT_ID is unset or not
+# a plain lowercase identifier: silently falling back to a shared name
+# would reintroduce cross-agent clobbering, and the strict pattern keeps
+# the id from injecting path separators into the filename.
+_preset_autosave_path() {
+    local agent="${AI_WRAPPER_AGENT_ID:-}"
+    if [[ ! "${agent}" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
+        echo "ERROR: AI_WRAPPER_AGENT_ID is unset or invalid ('${agent}'); per-workdir settings preset disabled." >&2
+        return 1
+    fi
+    printf '%s-%s.env' "$(_preset_path_prefix)" "${agent}"
+}
+
+# Path of the legacy shared <hash>.env written before per-agent files.
+# Read-only fallback for _preset_autoload; removed by _preset_clear.
+_preset_legacy_path() {
+    printf '%s.env' "$(_preset_path_prefix)"
+}
+
+# Write every catalog key to this agent's per-workdir preset file. Saves
+# ALL keys verbatim (including bool=0 and empty str/path) so a user who
 # explicitly disabled a previously-enabled setting sees that persist.
 # Uses temp-rename to avoid partial-write corruption.
 _preset_autosave() {
     local path dir entry cur
-    path="$(_preset_autosave_path)"
+    path="$(_preset_autosave_path)" || return 1
     dir="$(dirname "${path}")"
 
     if ! mkdir -p "${dir}" 2>/dev/null; then
@@ -831,6 +840,7 @@ _preset_autosave() {
     {
         printf '# ai-wrapper auto-preset\n'
         printf '# workdir: %s\n' "$(pwd -P)"
+        printf '# agent: %s\n' "${AI_WRAPPER_AGENT_ID}"
         printf '# saved: %s\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
         printf '# wrapper-version: %s\n' "${_AI_WRAPPER_PRESET_FORMAT_VERSION}"
         for entry in "${_AI_SETTINGS_LIST[@]}"; do
@@ -838,14 +848,6 @@ _preset_autosave() {
             cur="$(_setting_current_value "${_set_name}" "${_set_type}" "${_set_default}")"
             printf '%s=%s\n' "${_set_name}" "${cur}"
         done
-        # Carry over the other agent's keys from the previous save.
-        if [[ -f "${path}" ]]; then
-            local line
-            while IFS= read -r line || [[ -n "${line}" ]]; do
-                [[ "${line}" == *=* ]] || continue
-                _preset_is_foreign_key "${line%%=*}" && printf '%s\n' "${line}"
-            done < "${path}"
-        fi
     } > "${tmp}" 2>/dev/null || {
         rm -f "${tmp}" 2>/dev/null
         echo "WARN: _preset_autosave: failed to write ${tmp}" >/dev/tty
@@ -861,16 +863,24 @@ _preset_autosave() {
     return 0
 }
 
-# Apply the per-workdir preset to the current shell. Silent no-op when
-# no file exists (first run). WARN + skip on unknown keys or invalid
-# values — never aborts on data errors. Sets
-# AI_WRAPPER_PRESET_AUTOLOADED_FROM=<path> when >=1 setting was applied
-# so show_header can render the dim "restored from" banner line.
+# Apply this agent's per-workdir preset to the current shell. Falls back
+# to the legacy shared <hash>.env when the per-agent file doesn't exist
+# yet (see migration note above). Silent no-op when neither exists (first
+# run). WARN + skip on unknown keys or invalid values — never aborts on
+# data errors. Unknown keys in the legacy file are skipped silently: it
+# legitimately holds other agents' keys (e.g. CODEX_ACCOUNT when loading
+# from the Claude wrapper). Sets AI_WRAPPER_PRESET_AUTOLOADED_FROM=<path>
+# when >=1 setting was applied so show_header can render the dim
+# "restored from" banner line.
 _preset_autoload() {
-    local path entry line key val catalog_type applied=0
-    path="$(_preset_autosave_path)"
-    # First run: no file yet — silent no-op.
-    [[ -f "${path}" ]] || return 0
+    local path entry line key val catalog_type applied=0 legacy=0
+    path="$(_preset_autosave_path)" || return 1
+    if [[ ! -f "${path}" ]]; then
+        path="$(_preset_legacy_path)"
+        # First run: no file yet — silent no-op.
+        [[ -f "${path}" ]] || return 0
+        legacy=1
+    fi
     while IFS= read -r line || [[ -n "${line}" ]]; do
         # Skip blank lines and comments.
         [[ -z "${line}" || "${line}" == \#* ]] && continue
@@ -897,8 +907,7 @@ _preset_autoload() {
             fi
         done
         if [[ -z "${catalog_type}" ]]; then
-            # Another agent wrapper's key in the shared per-workdir file.
-            _preset_is_foreign_key "${key}" && continue
+            (( legacy )) && continue
             echo "  WARN: _preset_autoload: unknown setting: ${key}" >/dev/tty
             continue
         fi
@@ -926,12 +935,16 @@ _preset_autoload() {
     return 0
 }
 
-# Remove the per-workdir preset file and clear the AUTOLOADED_FROM
-# marker. No-op (return 0) when the file does not exist.
+# Remove this agent's per-workdir preset file and clear the
+# AUTOLOADED_FROM marker. Also removes the legacy shared <hash>.env: left
+# in place it would be picked up again by _preset_autoload's fallback and
+# silently resurrect the settings the user just cleared. Other agents'
+# per-agent files are untouched (an agent that hasn't migrated yet starts
+# from defaults). No-op (return 0) when the files do not exist.
 _preset_clear() {
     local path
-    path="$(_preset_autosave_path)"
-    rm -f "${path}" 2>/dev/null || true
+    path="$(_preset_autosave_path)" || return 1
+    rm -f "${path}" "$(_preset_legacy_path)" 2>/dev/null || true
     unset AI_WRAPPER_PRESET_AUTOLOADED_FROM
     return 0
 }
