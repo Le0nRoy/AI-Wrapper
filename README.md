@@ -1,6 +1,6 @@
 # ai-wrapper
 
-AI orchestration tools, sandboxed wrappers, and agent skills for Claude, Codex, and Cursor Agent.
+AI orchestration tools, sandboxed wrappers, and agent skills for Claude, Codex, Cursor Agent, and GitHub Copilot.
 
 Managed with [chezmoi](https://www.chezmoi.io/). Compatible with any Linux machine — no Linux desktop config required.
 
@@ -11,6 +11,7 @@ Managed with [chezmoi](https://www.chezmoi.io/). Compatible with any Linux machi
 | `bin/executable_claude_wrapper.bash` | `~/bin/claude_wrapper` | Sandboxed Claude CLI launcher with account selection |
 | `bin/executable_codex_wrapper.bash` | `~/bin/codex_wrapper` | Sandboxed Codex CLI launcher with account selection |
 | `bin/executable_cursor_agent_wrapper.bash` | `~/bin/cursor_agent_wrapper` | Sandboxed Cursor Agent launcher |
+| `bin/executable_copilot_wrapper.bash` | `~/bin/copilot_wrapper` | Sandboxed GitHub Copilot CLI launcher |
 | `bin/executable_setup_ai_kube_access.bash` | `~/bin/setup_ai_kube_access` | Kubernetes RBAC setup for AI agents |
 | `bin/executable_setup_kind.bash` | `~/bin/setup_kind` | kind + kubectl installer for AI sandboxing |
 | `bin/ai_agent_universal_wrapper.bash` | `~/bin/ai_agent_universal_wrapper.bash` | Bubblewrap sandbox library (sourced by wrappers) |
@@ -25,7 +26,7 @@ Managed with [chezmoi](https://www.chezmoi.io/). Compatible with any Linux machi
 - [`chezmoi`](https://www.chezmoi.io/) installed
 - Linux: `bubblewrap` (`bwrap`) for sandbox wrappers, `kernel.unprivileged_userns_clone = 1` in sysctl
 - macOS: `sandbox-exec` (ships with the OS)
-- The target AI CLI tools installed (`claude`, `codex`, `cursor-agent` as applicable)
+- The target AI CLI tools installed (`claude`, `codex`, `cursor-agent`, `copilot` as applicable)
 
 ## Setup
 
