@@ -19,6 +19,9 @@ check_agent_binary
 
 WRAPPER_FLAGS=()
 
+# Bind shared Git metadata for worktrees after validating its path and links.
+_wrapper_bind_git_common_dir
+
 # Keep Copilot runtime state in its standard home paths while preventing broad
 # access to unrelated system directories.
 _wrapper_add_bind "${HOME}/.copilot"
@@ -29,9 +32,8 @@ if [[ -d "${HOME}/.local/share/copilot" ]]; then
     _wrapper_add_bind "${HOME}/.local/share/copilot"
 fi
 
-# Copilot defaults to a permissive CLI flow, but the actual permission model is
-# controlled by command flags. Match the other wrappers' default autonomy.
-AGENT_FLAGS=(--allow-all)
+# Auto-approve all tools, filesystem paths, and URLs inside the OS sandbox.
+AGENT_FLAGS=(--allow-all-tools --allow-all-paths --allow-all-urls)
 
 if _wd_resolved="$(_realpath "$(pwd -P)")" && _home_resolved="$(_realpath "${HOME}")"; then
     _check_workdir_breadth "copilot" "${_wd_resolved%/}" "${_home_resolved%/}"
@@ -46,6 +48,8 @@ if [[ $# -eq 0 && -t 0 && -t 1 ]]; then
     if declare -f _extra_post_menu_setup >/dev/null 2>&1; then
         _extra_post_menu_setup
     fi
+
+    _copilot_enable_unrestricted_mode
 
     case "${WRAPPER_MENU_CHOICE}" in
         orchestrate)
@@ -65,4 +69,5 @@ _preset_autoload
 if declare -f _extra_post_menu_setup >/dev/null 2>&1; then
     _extra_post_menu_setup
 fi
+_copilot_enable_unrestricted_mode
 run_sandboxed_agent "${AI_AGENT_COMMAND}" -- "${WRAPPER_FLAGS[@]}" -- "${AGENT_FLAGS[@]}" "$@"
