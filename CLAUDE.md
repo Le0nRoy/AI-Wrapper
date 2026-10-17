@@ -9,7 +9,7 @@ All rules for Claude Code (and other AI agents) are maintained in a single sourc
 ## This Repository
 
 This is the **`ai-wrapper`** chezmoi-managed repository containing:
-- AI agent sandbox wrappers (`claude_wrapper`, `codex_wrapper`, `cursor_agent_wrapper`)
+- AI agent sandbox wrappers (`claude_wrapper`, `codex_wrapper`, `cursor_agent_wrapper`, `copilot_wrapper`)
 - User-level AI agent policies (`AGENTS.md`) deployed to `~/`
 - User-level skills (`~/.agents/skills/`) for AI workflow automation
 - AI orchestration configs (`bin/ai_wrapper_data/`)
