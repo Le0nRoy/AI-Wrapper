@@ -462,6 +462,11 @@ _run_sandboxed_agent_linux() {
         bwrap_args+=(--bind "${HOME_DIR}/bin" "${HOME_DIR}/bin")
     fi
 
+    # Add ~/.local/bin directory read-only if it exists (for user-installed CLIs like agy)
+    if [[ -d "${HOME_DIR}/.local/bin" ]]; then
+        bwrap_args+=(--ro-bind "${HOME_DIR}/.local/bin" "${HOME_DIR}/.local/bin")
+    fi
+
     # Add ~/ai-wrapper/.agents directory if it exists (agent skills content)
     if [[ -d "${HOME_DIR}/ai-wrapper/.agents" ]]; then
         bwrap_args+=(--bind "${HOME_DIR}/ai-wrapper/.agents" "${HOME_DIR}/ai-wrapper/.agents")
@@ -476,7 +481,7 @@ _run_sandboxed_agent_linux() {
         --clearenv
         --setenv HOME "${HOME_DIR}"
         --setenv USER "${USER:-$(id -un)}"
-        --setenv PATH "${HOME_DIR}/bin:/usr/bin:/usr/sbin:/bin:/sbin"
+        --setenv PATH "${HOME_DIR}/bin:${HOME_DIR}/.local/bin:/usr/bin:/usr/sbin:/bin:/sbin"
         --setenv LANG "${LANG:-en_US.UTF-8}"
         --setenv TERM "${TERM:-xterm-256color}"
         --chdir "${WORKDIR}"

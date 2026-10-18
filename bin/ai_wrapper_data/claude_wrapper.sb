@@ -201,7 +201,10 @@
     (subpath "/usr/lib")
     (subpath "/Library/Apple")
     (subpath "/Library/Frameworks")
-    (subpath "/opt/homebrew"))
+    (subpath "/opt/homebrew")
+    (subpath (string-append (param "HOME_DIR") "/bin"))
+    (subpath (string-append (param "HOME_DIR") "/.local/bin"))
+    (subpath (string-append (param "HOME_DIR") "/.gemini")))
 
 ;; Standard special files
 (allow file-read*
@@ -251,6 +254,8 @@
     ;; advisory (text rules consumed by the agent), not credential vehicles.
     (literal (string-append (param "HOME_DIR") "/AGENTS.md"))
     (literal (string-append (param "HOME_DIR") "/CLAUDE.md"))
+    (subpath (string-append (param "HOME_DIR") "/bin"))
+    (subpath (string-append (param "HOME_DIR") "/.local/bin"))
     (subpath (string-append (param "HOME_DIR") "/.config/git"))                  ; git XDG global config (~/.config/git/ignore et al.)
     (subpath (string-append (param "HOME_DIR") "/Library/Preferences"))
     (subpath (string-append (param "HOME_DIR") "/Library/Application Support/com.anthropic.claudefordesktop"))
