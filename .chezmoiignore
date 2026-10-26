@@ -3,8 +3,11 @@
 .claude.json
 .codex
 .cursor
+.copilot
 .config/cursor
+.config/github-copilot
 .local/share/cursor-agent
+.local/share/copilot
 
 # Repository documentation — not deployed to ~/
 README.md
