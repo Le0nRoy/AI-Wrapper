@@ -218,6 +218,31 @@ if command -v git >/dev/null 2>&1; then
     _ok "${FAKE_HOME}/repos/nogit/.git" >/dev/null
     assert_eq "$?" "1" "validator rejects a .git without HEAD/objects/refs"
 
+    # Submodule common-dir relaxation: only the verified
+    # ~/.local/share/<repo>/.git/modules/<name> layout may skip the
+    # sensitive-location and basename rules.
+    _ok "${nested_common}" "${nested_wt}" >/dev/null
+    assert_eq "$?" "0" "validator accepts a verified submodule worktree common dir"
+    _fake_gitdir() { mkdir -p "${1}/objects" "${1}/refs" && : >"${1}/HEAD" && : >"${1}/config"; }
+    share="${FAKE_HOME}/.local/share"
+    _fake_gitdir "${share}/noparent/.git/modules/m"
+    out="$(_ok "${share}/noparent/.git/modules/m")"
+    assert_contains "${out}" "sensitive location" "submodule: parent .git without HEAD/objects/refs rejected"
+    _fake_gitdir "${FAKE_HOME}/repos/realparent/.git/modules/m"
+    _fake_gitdir "${FAKE_HOME}/repos/realparent/.git"
+    mkdir -p "${share}/symparent"
+    ln -s "${FAKE_HOME}/repos/realparent/.git" "${share}/symparent/.git"
+    out="$(_ok "${share}/symparent/.git/modules/m")"
+    assert_contains "${out}" "sensitive location" "submodule: symlinked parent .git rejected"
+    _fake_gitdir "${share}/sup/.git"
+    for bad in foo.git .git a/b; do
+        _fake_gitdir "${share}/sup/.git/modules/${bad}"
+        out="$(_ok "${share}/sup/.git/modules/${bad}")"
+        assert_contains "${out}" "sensitive location" "submodule: modules/${bad} rejected"
+    done
+    out="$(_ok "${FAKE_HOME}/repos/realparent/.git/modules/m")"
+    assert_contains "${out}" "basename 'm'" "submodule: modules/<name> outside ~/.local/share rejected"
+
     # End-to-end on Linux: a legit worktree can commit / branch / checkout
     # inside the sandbox, but cannot write hooks/, config, another
     # worktree's entry, or its own commondir link.
