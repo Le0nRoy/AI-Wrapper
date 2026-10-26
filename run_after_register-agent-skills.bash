@@ -1,7 +1,7 @@
 #!/bin/bash
-# Deploys ~/ai-wrapper/.agents/skills into ~/.claude/skills (via
-# setup_skills.bash) so Claude Code discovers agent skills. Runs on every
-# chezmoi apply.
+# Deploys ~/ai-wrapper/.agents/skills into ~/.claude/skills and
+# ~/.gemini/config/skills (via setup_skills.bash) so Claude Code and
+# Antigravity CLI discover agent skills. Runs on every chezmoi apply.
 #
 # Must be an `after_` script: scripts without before_/after_ interleave with
 # file application in plain ASCII order of their (attribute-stripped) target

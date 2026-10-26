@@ -476,7 +476,7 @@ _run_sandboxed_agent_linux() {
         --clearenv
         --setenv HOME "${HOME_DIR}"
         --setenv USER "${USER:-$(id -un)}"
-        --setenv PATH "${HOME_DIR}/bin:/usr/bin:/usr/sbin:/bin:/sbin"
+        --setenv PATH "${HOME_DIR}/bin:/usr/bin:/usr/sbin:/bin:/sbin:${HOME_DIR}/.local/bin"
         --setenv LANG "${LANG:-en_US.UTF-8}"
         --setenv TERM "${TERM:-xterm-256color}"
         --chdir "${WORKDIR}"

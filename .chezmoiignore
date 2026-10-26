@@ -4,6 +4,7 @@
 .codex
 .cursor
 .copilot
+.gemini
 .config/cursor
 .config/github-copilot
 .local/share/cursor-agent

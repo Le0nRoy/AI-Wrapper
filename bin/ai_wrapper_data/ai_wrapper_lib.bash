@@ -1366,6 +1366,16 @@ run_agent_session() {
 
     case "${action}" in
         resume)
+            # Agents whose session resume requires dynamic resolution or a
+            # pre-launch conversation picker (e.g. agy: `--conversation=<id>`
+            # selected from conversation_summaries.db) define
+            # _agent_resume_args in their lib to populate AI_RESUME_ARGS.
+            if declare -f _agent_resume_args >/dev/null 2>&1; then
+                if ! _agent_resume_args; then
+                    return 1
+                fi
+                resume_args=("${AI_RESUME_ARGS[@]:---resume}")
+            fi
             if [[ "${AI_RESUME_ARGS_FIRST:-0}" == "1" ]]; then
                 # Resume is a subcommand (e.g. `codex resume`): it must
                 # precede the agent flags so they parse as its options.

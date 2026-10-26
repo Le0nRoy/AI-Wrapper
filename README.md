@@ -1,6 +1,6 @@
 # ai-wrapper
 
-AI orchestration tools, sandboxed wrappers, and agent skills for Claude, Codex, Cursor Agent, and GitHub Copilot.
+AI orchestration tools, sandboxed wrappers, and agent skills for Claude, Codex, Antigravity (`agy`), Cursor Agent, and GitHub Copilot.
 
 Managed with [chezmoi](https://www.chezmoi.io/). Compatible with any Linux machine — no Linux desktop config required.
 
@@ -10,13 +10,14 @@ Managed with [chezmoi](https://www.chezmoi.io/). Compatible with any Linux machi
 |----------------|---------------|-------------|
 | `bin/executable_claude_wrapper.bash` | `~/bin/claude_wrapper` | Sandboxed Claude CLI launcher with account selection |
 | `bin/executable_codex_wrapper.bash` | `~/bin/codex_wrapper` | Sandboxed Codex CLI launcher with account selection |
+| `bin/executable_agy_wrapper.bash` | `~/bin/agy_wrapper` | Sandboxed Antigravity CLI (`agy`) launcher with account selection |
 | `bin/executable_cursor_agent_wrapper.bash` | `~/bin/cursor_agent_wrapper` | Sandboxed Cursor Agent launcher |
 | `bin/executable_copilot_wrapper.bash` | `~/bin/copilot_wrapper` | Sandboxed GitHub Copilot CLI launcher |
 | `bin/executable_setup_ai_kube_access.bash` | `~/bin/setup_ai_kube_access` | Kubernetes RBAC setup for AI agents |
 | `bin/executable_setup_kind.bash` | `~/bin/setup_kind` | kind + kubectl installer for AI sandboxing |
 | `bin/ai_agent_universal_wrapper.bash` | `~/bin/ai_agent_universal_wrapper.bash` | Bubblewrap sandbox library (sourced by wrappers) |
 | `bin/ai_wrapper_data/` | `~/bin/ai_wrapper_data/` | Prompt templates and per-agent wrapper libs |
-| `dot_agents/skills/` | `~/.agents/skills/` | Agent skills (synced to `~/.claude/skills/` via `setup_skills.bash`) |
+| `dot_agents/skills/` | `~/.agents/skills/` | Agent skills (synced to `~/.claude/skills/` and `~/.gemini/config/skills/` via `setup_skills.bash`) |
 | `AGENTS.md` | `~/AGENTS.md` | System-wide AI agent rules |
 | `CLAUDE.md` | `~/CLAUDE.md` | Claude Code guidelines redirect |
 
@@ -26,7 +27,7 @@ Managed with [chezmoi](https://www.chezmoi.io/). Compatible with any Linux machi
 - [`chezmoi`](https://www.chezmoi.io/) installed
 - Linux: `bubblewrap` (`bwrap`) for sandbox wrappers, `kernel.unprivileged_userns_clone = 1` in sysctl
 - macOS: `sandbox-exec` (ships with the OS)
-- The target AI CLI tools installed (`claude`, `codex`, `cursor-agent`, `copilot` as applicable)
+- The target AI CLI tools installed (`claude`, `codex`, `agy`, `cursor-agent`, `copilot` as applicable)
 
 ## Setup
 
@@ -47,7 +48,7 @@ CHEZMOI_SOURCE_DIR="$HOME/.local/share/ai-wrapper" chezmoi apply
 
 ## Skills
 
-Skills are deployed to `~/.agents/skills/` and synced into `~/.claude/skills/` on every `chezmoi apply` by `run_always_register-agent-skills.bash` (via `~/bin/setup_skills.bash`). Claude Code discovers them automatically via the skills directory.
+Skills are deployed to `~/.agents/skills/` and synced into `~/.claude/skills/` and `~/.gemini/config/skills/` on every `chezmoi apply` by `run_after_register-agent-skills.bash` (via `~/bin/setup_skills.bash`). Claude Code and Antigravity CLI discover them automatically via their respective skills directories.
 
 ## Sandbox Architecture
 
