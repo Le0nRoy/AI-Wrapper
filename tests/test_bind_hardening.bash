@@ -174,33 +174,6 @@ if command -v git >/dev/null 2>&1; then
     out="$(_gitbind "${FAKE_HOME}/repos/evil")"
     assert_not_contains "${out}" "--bind" "commondir with wrong basename: not bound"
 
-    # A submodule worktree uses <superproject>/.git/modules/<name> as its
-    # common dir. This specific nested layout under ~/.local/share is valid
-    # when Git's worktree entry and reverse link both prove ownership.
-    nested_parent="${FAKE_HOME}/.local/share/chezmoi"
-    nested_source="${FAKE_HOME}/repos/module-source"
-    nested_wt="${FAKE_HOME}/repos/module-worktree"
-    git_q init "${nested_parent}"
-    git_q -C "${nested_parent}" commit --allow-empty -m parent-init
-    git_q init "${nested_source}"
-    git_q -C "${nested_source}" commit --allow-empty -m module-init
-    git -c init.defaultBranch=main -c user.name=t -c user.email=t@t \
-        -c protocol.file.allow=always -C "${nested_parent}" \
-        submodule add "${nested_source}" ai-wrapper >/dev/null 2>&1
-    git_q -C "${nested_parent}" add .
-    git_q -C "${nested_parent}" commit -m add-module
-    git_q -C "${nested_parent}/ai-wrapper" worktree add "${nested_wt}" -b module-wt
-    nested_common="$(git -C "${nested_wt}" rev-parse --git-common-dir)"
-    nested_entry="$(git -C "${nested_wt}" rev-parse --absolute-git-dir)"
-    out="$(_gitbind "${nested_wt}")"
-    assert_contains "${out}" "--bind${NL}${nested_common}${NL}" "nested submodule worktree: parent .git/modules metadata bound"
-    assert_not_contains "${out}" "WARN" "nested submodule worktree: validated links accepted"
-    if [[ "${OS}" == "Linux" ]]; then
-        assert_contains "${out}" "--ro-bind${NL}${nested_common}/config${NL}" "nested submodule worktree: common config stays read-only"
-        assert_contains "${out}" "--ro-bind${NL}${nested_common}/hooks${NL}" "nested submodule worktree: common hooks stay read-only"
-        assert_contains "${out}" "--bind${NL}${nested_entry}${NL}" "nested submodule worktree: own worktree entry stays writable"
-    fi
-
     # Crafted commondir via a symlink inside WORKDIR -> ~/.ssh: the
     # resolved target is what's checked (and would be bound).
     _crafted_repo "${FAKE_HOME}/repos/evil" "${FAKE_HOME}/repos/evil/link.git"

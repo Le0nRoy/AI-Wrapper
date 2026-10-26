@@ -24,4 +24,3 @@ tests/
 # chezmoi walks the filesystem, not the git index, so without this it finds
 # and re-executes their run_ scripts as if they were real deployment sources.
 worktrees/
-.worktrees/

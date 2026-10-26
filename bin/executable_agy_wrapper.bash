@@ -47,6 +47,11 @@ WRAPPER_FLAGS=()
 # Shared .git of a `git worktree` checkout (see ai_wrapper_lib.bash).
 _wrapper_bind_git_common_dir
 
+# User-installed CLI binaries (agy is commonly installed in ~/.local/bin).
+if [[ -d "${HOME}/.local/bin" ]]; then
+    _wrapper_add_ro_bind "${HOME}/.local/bin"
+fi
+
 # Antigravity CLI flags — full autonomy within the OS sandbox boundary.
 AGENT_FLAGS=(
     --dangerously-skip-permissions

@@ -69,7 +69,13 @@ _agy_list_conversations() {
     [[ -d "${cli_dir}" ]] || return 0
 
     if command -v python3 >/dev/null 2>&1; then
-        python3 - "${cli_dir}" "${workdir}" "${limit}" <<'PY' 2>/dev/null
+        {
+            if [[ "${AI_WRAPPER_DEBUG:-0}" == "1" ]]; then
+                python3 - "${cli_dir}" "${workdir}" "${limit}"
+            else
+                python3 - "${cli_dir}" "${workdir}" "${limit}" 2>/dev/null
+            fi
+        } <<'PY'
 import glob, json, os, re, sqlite3, sys
 from urllib.parse import unquote, urlparse
 

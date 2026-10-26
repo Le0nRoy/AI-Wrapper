@@ -203,8 +203,7 @@
     (subpath "/Library/Frameworks")
     (subpath "/opt/homebrew")
     (subpath (string-append (param "HOME_DIR") "/bin"))
-    (subpath (string-append (param "HOME_DIR") "/.local/bin"))
-    (subpath (string-append (param "HOME_DIR") "/.gemini")))
+    (subpath (string-append (param "HOME_DIR") "/.local/bin")))
 
 ;; Standard special files
 (allow file-read*

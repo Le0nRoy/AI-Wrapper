@@ -209,6 +209,11 @@ assert_eq "$?" "1" "_agy_rename_conversation rejects path-traversal ID"
 )
 assert_eq "$?" "1" "_agy_delete_conversation rejects path-traversal ID"
 
+err_out="$( ( _load agy; AI_WRAPPER_DEBUG=0 _agy_list_conversations "${FAKE_HOME}/.gemini" "${FAKE_HOME}/work" "not-an-int" ) 2>&1 )"
+assert_not_contains "${err_out}" "ValueError" "_agy_list_conversations: stderr suppressed when AI_WRAPPER_DEBUG=0"
+err_out="$( ( _load agy; AI_WRAPPER_DEBUG=1 _agy_list_conversations "${FAKE_HOME}/.gemini" "${FAKE_HOME}/work" "not-an-int" ) 2>&1 )"
+assert_contains "${err_out}" "ValueError" "_agy_list_conversations: stderr exposed when AI_WRAPPER_DEBUG=1"
+
 if command -v agy >/dev/null 2>&1; then
     prompt_file="${REPO_ROOT}/bin/ai_wrapper_data/orchestrator-prompt.md"
     ( cd "${FAKE_HOME}/work" && HOME="${REAL_HOME}" agy --dangerously-skip-permissions --prompt-interactive "$(cat "${prompt_file}")" --help >/dev/null 2>&1 )
