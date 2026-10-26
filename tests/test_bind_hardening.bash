@@ -174,6 +174,33 @@ if command -v git >/dev/null 2>&1; then
     out="$(_gitbind "${FAKE_HOME}/repos/evil")"
     assert_not_contains "${out}" "--bind" "commondir with wrong basename: not bound"
 
+    # A submodule worktree uses <superproject>/.git/modules/<name> as its
+    # common dir. This specific nested layout under ~/.local/share is valid
+    # when Git's worktree entry and reverse link both prove ownership.
+    nested_parent="${FAKE_HOME}/.local/share/chezmoi"
+    nested_source="${FAKE_HOME}/repos/module-source"
+    nested_wt="${FAKE_HOME}/repos/module-worktree"
+    git_q init "${nested_parent}"
+    git_q -C "${nested_parent}" commit --allow-empty -m parent-init
+    git_q init "${nested_source}"
+    git_q -C "${nested_source}" commit --allow-empty -m module-init
+    git -c init.defaultBranch=main -c user.name=t -c user.email=t@t \
+        -c protocol.file.allow=always -C "${nested_parent}" \
+        submodule add "${nested_source}" ai-wrapper >/dev/null 2>&1
+    git_q -C "${nested_parent}" add .
+    git_q -C "${nested_parent}" commit -m add-module
+    git_q -C "${nested_parent}/ai-wrapper" worktree add "${nested_wt}" -b module-wt
+    nested_common="$(git -C "${nested_wt}" rev-parse --git-common-dir)"
+    nested_entry="$(git -C "${nested_wt}" rev-parse --absolute-git-dir)"
+    out="$(_gitbind "${nested_wt}")"
+    assert_contains "${out}" "--bind${NL}${nested_common}${NL}" "nested submodule worktree: parent .git/modules metadata bound"
+    assert_not_contains "${out}" "WARN" "nested submodule worktree: validated links accepted"
+    if [[ "${OS}" == "Linux" ]]; then
+        assert_contains "${out}" "--ro-bind${NL}${nested_common}/config${NL}" "nested submodule worktree: common config stays read-only"
+        assert_contains "${out}" "--ro-bind${NL}${nested_common}/hooks${NL}" "nested submodule worktree: common hooks stay read-only"
+        assert_contains "${out}" "--bind${NL}${nested_entry}${NL}" "nested submodule worktree: own worktree entry stays writable"
+    fi
+
     # Crafted commondir via a symlink inside WORKDIR -> ~/.ssh: the
     # resolved target is what's checked (and would be bound).
     _crafted_repo "${FAKE_HOME}/repos/evil" "${FAKE_HOME}/repos/evil/link.git"
@@ -190,6 +217,31 @@ if command -v git >/dev/null 2>&1; then
     mkdir -p "${FAKE_HOME}/repos/nogit/.git"
     _ok "${FAKE_HOME}/repos/nogit/.git" >/dev/null
     assert_eq "$?" "1" "validator rejects a .git without HEAD/objects/refs"
+
+    # Submodule common-dir relaxation: only the verified
+    # ~/.local/share/<repo>/.git/modules/<name> layout may skip the
+    # sensitive-location and basename rules.
+    _ok "${nested_common}" "${nested_wt}" >/dev/null
+    assert_eq "$?" "0" "validator accepts a verified submodule worktree common dir"
+    _fake_gitdir() { mkdir -p "${1}/objects" "${1}/refs" && : >"${1}/HEAD" && : >"${1}/config"; }
+    share="${FAKE_HOME}/.local/share"
+    _fake_gitdir "${share}/noparent/.git/modules/m"
+    out="$(_ok "${share}/noparent/.git/modules/m")"
+    assert_contains "${out}" "sensitive location" "submodule: parent .git without HEAD/objects/refs rejected"
+    _fake_gitdir "${FAKE_HOME}/repos/realparent/.git/modules/m"
+    _fake_gitdir "${FAKE_HOME}/repos/realparent/.git"
+    mkdir -p "${share}/symparent"
+    ln -s "${FAKE_HOME}/repos/realparent/.git" "${share}/symparent/.git"
+    out="$(_ok "${share}/symparent/.git/modules/m")"
+    assert_contains "${out}" "sensitive location" "submodule: symlinked parent .git rejected"
+    _fake_gitdir "${share}/sup/.git"
+    for bad in foo.git .git a/b; do
+        _fake_gitdir "${share}/sup/.git/modules/${bad}"
+        out="$(_ok "${share}/sup/.git/modules/${bad}")"
+        assert_contains "${out}" "sensitive location" "submodule: modules/${bad} rejected"
+    done
+    out="$(_ok "${FAKE_HOME}/repos/realparent/.git/modules/m")"
+    assert_contains "${out}" "basename 'm'" "submodule: modules/<name> outside ~/.local/share rejected"
 
     # End-to-end on Linux: a legit worktree can commit / branch / checkout
     # inside the sandbox, but cannot write hooks/, config, another

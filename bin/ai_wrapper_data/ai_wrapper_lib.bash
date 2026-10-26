@@ -334,9 +334,17 @@ _wrapper_bind_git_common_dir() {
 #   (a) a real directory (not a symlink) strictly under $HOME;
 #   (b) not a sensitive location per _sandbox_sensitive_dir_kind (the same
 #       classifier the sandbox applies to WORKDIR / AI_SANDBOX_EXTRA_*_DIRS:
-#       system dirs, $HOME, anything under a $HOME dotfile dir);
+#       system dirs, $HOME, anything under a $HOME dotfile dir), unless it
+#       is a verified submodule common dir (see (c));
 #   (c) shaped like a git dir: config + HEAD files plus objects/ and refs/
-#       dirs, and named `.git` (normal repo) or `<name>.git` (bare repo);
+#       dirs, and named `.git` (normal repo) or `<name>.git` (bare repo).
+#       Exception: a submodule worktree's common dir at exactly
+#       ~/.local/share/<repo>/.git/modules/<name> (e.g. a submodule of the
+#       chezmoi source), where <repo> and <name> are single path segments
+#       not starting with `.`, <name> doesn't end in `.git`, and the parent
+#       <repo>/.git is itself a real git dir. Only this verified layout
+#       skips (b) and the basename rule. Submodule names containing `/`
+#       (.git/modules/libs/foo) are not supported;
 #   (d) forward link: git's gitdir for WORKDIR resolves to exactly
 #       <common>/worktrees/<name> (one path component);
 #   (e) reverse link: <common>/worktrees/<name>/gitdir — written by
@@ -350,6 +358,7 @@ _wrapper_bind_git_common_dir() {
 # outside the rules can be granted explicitly via AI_SANDBOX_EXTRA_RW_DIRS.
 _wrapper_git_common_dir_ok() {
     local dir="${1%/}" home="${2%/}" wd="${3%/}" kind base git_dir name top back
+    local parent_git_dir repo_name module_name submodule
     # Fail closed if the classifier (ai_agent_universal_wrapper.bash)
     # wasn't sourced first.
     if ! declare -f _sandbox_sensitive_dir_kind >/dev/null 2>&1; then
@@ -361,14 +370,41 @@ _wrapper_git_common_dir_ok() {
     if [[ -z "${home}" || "${dir}" != "${home}"/* ]]; then
         echo "not strictly under \$HOME"; return 1
     fi
-    if kind="$(_sandbox_sensitive_dir_kind "${dir}" "${home}")"; then
+    # A submodule worktree's common dir is <superproject>/.git/modules/<name>:
+    # it carries the submodule's name instead of a .git suffix and, for
+    # chezmoi-style sources, lives in the sensitive ~/.local/share. Accept
+    # only the exact single-segment layout ~/.local/share/<repo>/.git/
+    # modules/<name> whose parent .git is a real git dir; only a verified
+    # layout may skip the sensitive-location and basename rules below.
+    submodule=0
+    case "${dir}" in
+        "${home}"/.local/share/?*/.git/modules/?*)
+            repo_name="${dir#"${home}/.local/share/"}"
+            repo_name="${repo_name%%/*}"
+            module_name="${dir##*/}"
+            parent_git_dir="${home}/.local/share/${repo_name}/.git"
+            if [[ "${dir}" == "${parent_git_dir}/modules/${module_name}" \
+                    && "${repo_name}" != .* && "${module_name}" != .* \
+                    && "${module_name}" != *.git \
+                    && ! -L "${parent_git_dir}" && -d "${parent_git_dir}" \
+                    && ! -L "${parent_git_dir}/modules" && -d "${parent_git_dir}/modules" \
+                    && -f "${parent_git_dir}/HEAD" && ! -L "${parent_git_dir}/HEAD" \
+                    && -f "${parent_git_dir}/config" && -d "${parent_git_dir}/objects" \
+                    && -d "${parent_git_dir}/refs" ]]; then
+                submodule=1
+            fi
+            ;;
+    esac
+    if (( ! submodule )) && kind="$(_sandbox_sensitive_dir_kind "${dir}" "${home}")"; then
         echo "sensitive location (${kind})"; return 1
     fi
     base="${dir##*/}"
-    case "${base}" in
-        .git|?*.git) ;;
-        *) echo "basename '${base}' is not .git or <name>.git"; return 1 ;;
-    esac
+    if (( ! submodule )); then
+        case "${base}" in
+            .git|?*.git) ;;
+            *) echo "basename '${base}' is not .git or <name>.git"; return 1 ;;
+        esac
+    fi
     if [[ ! -f "${dir}/HEAD" || -L "${dir}/HEAD" || ! -f "${dir}/config" \
             || ! -d "${dir}/objects" || ! -d "${dir}/refs" ]]; then
         echo "does not look like a git dir (config, HEAD, objects/, refs/)"; return 1
