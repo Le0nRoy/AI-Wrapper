@@ -331,10 +331,12 @@ _wrapper_bind_git_common_dir() {
 # RESOLVED_COMMON_DIR RESOLVED_HOME RESOLVED_WORKDIR. On success prints the
 # resolved worktree entry dir (<common>/worktrees/<name>) and returns 0;
 # otherwise prints the rejection reason and returns 1. Rules:
-#   (a) a real directory (not a symlink) strictly under $HOME;
-#   (b) not a sensitive location per _sandbox_sensitive_dir_kind (the same
-#       classifier the sandbox applies to WORKDIR / AI_SANDBOX_EXTRA_*_DIRS:
-#       system dirs, $HOME, anything under a $HOME dotfile dir);
+#   (a) a real directory (not a symlink) strictly under $HOME; ordinary
+#       common dirs must not be sensitive. Submodule common dirs are allowed
+#       only under ~/.local/share/<repo>/.git/modules/<name>, with a valid
+#       parent .git directory;
+#   (b) not a sensitive location per _sandbox_sensitive_dir_kind, except for
+#       the verified submodule layout above;
 #   (c) shaped like a git dir: config + HEAD files plus objects/ and refs/
 #       dirs, and named `.git` (normal repo) or `<name>.git` (bare repo);
 #   (d) forward link: git's gitdir for WORKDIR resolves to exactly
@@ -350,6 +352,7 @@ _wrapper_bind_git_common_dir() {
 # outside the rules can be granted explicitly via AI_SANDBOX_EXTRA_RW_DIRS.
 _wrapper_git_common_dir_ok() {
     local dir="${1%/}" home="${2%/}" wd="${3%/}" kind base git_dir name top back
+    local modules_dir parent_git_dir repo_name module_name
     # Fail closed if the classifier (ai_agent_universal_wrapper.bash)
     # wasn't sourced first.
     if ! declare -f _sandbox_sensitive_dir_kind >/dev/null 2>&1; then
@@ -362,12 +365,41 @@ _wrapper_git_common_dir_ok() {
         echo "not strictly under \$HOME"; return 1
     fi
     if kind="$(_sandbox_sensitive_dir_kind "${dir}" "${home}")"; then
-        echo "sensitive location (${kind})"; return 1
+        case "${dir}" in
+            "${home}"/.local/share/*/.git/modules/*) ;;
+            *) echo "sensitive location (${kind})"; return 1 ;;
+        esac
     fi
     base="${dir##*/}"
     case "${base}" in
         .git|?*.git) ;;
-        *) echo "basename '${base}' is not .git or <name>.git"; return 1 ;;
+        *)
+            # A submodule worktree's common dir is stored at
+            # <superproject>/.git/modules/<name>, so it has the submodule's
+            # name rather than a .git suffix. Allow only this exact layout
+            # under ~/.local/share/<repo> and verify the parent gitdir too.
+            case "${dir}" in
+                "${home}"/.local/share/*/.git/modules/*)
+                    modules_dir="${dir%/*}"
+                    parent_git_dir="${modules_dir%/modules}"
+                    repo_name="${parent_git_dir#"${home}/.local/share/"}"
+                    repo_name="${repo_name%/.git}"
+                    module_name="${dir##*/}"
+                    if [[ -z "${repo_name}" || "${repo_name}" == */* || "${repo_name}" == .* \
+                            || -z "${module_name}" || "${module_name}" == */* \
+                            || "${parent_git_dir}" != "${home}/.local/share/${repo_name}/.git" \
+                            || -L "${parent_git_dir}" || ! -d "${parent_git_dir}" \
+                            || ! -f "${parent_git_dir}/HEAD" || -L "${parent_git_dir}/HEAD" \
+                            || ! -f "${parent_git_dir}/config" || ! -d "${parent_git_dir}/objects" \
+                            || ! -d "${parent_git_dir}/refs" ]]; then
+                        echo "not a verified submodule gitdir under ~/.local/share"; return 1
+                    fi
+                    ;;
+                *)
+                    echo "basename '${base}' is not .git or <name>.git"; return 1
+                    ;;
+            esac
+            ;;
     esac
     if [[ ! -f "${dir}/HEAD" || -L "${dir}/HEAD" || ! -f "${dir}/config" \
             || ! -d "${dir}/objects" || ! -d "${dir}/refs" ]]; then
