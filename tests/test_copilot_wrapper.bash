@@ -29,6 +29,30 @@ _copilot_enable_unrestricted_mode
 assert_eq "${AI_SANDBOX_PASS_ENV}" "COPILOT_ALLOW_ALL,COPILOT_ASSISTED_APPROVAL" \
     "required Copilot env vars are allowlisted when the list is empty"
 
+# Direct tests for the shared allowlist helper (_sandbox_pass_env_add).
+AI_SANDBOX_PASS_ENV=""
+_sandbox_pass_env_add NEW_VAR
+assert_eq "${AI_SANDBOX_PASS_ENV}" "NEW_VAR" "helper adds to an empty allowlist"
+
+unset AI_SANDBOX_PASS_ENV
+_sandbox_pass_env_add NEW_VAR
+assert_eq "${AI_SANDBOX_PASS_ENV}" "NEW_VAR" "helper adds when the allowlist is unset"
+
+AI_SANDBOX_PASS_ENV="A_VAR,  NEW_VAR  ,B_VAR"
+_sandbox_pass_env_add NEW_VAR
+assert_eq "${AI_SANDBOX_PASS_ENV}" "A_VAR,  NEW_VAR  ,B_VAR" \
+    "helper is idempotent when the name is listed with surrounding whitespace"
+
+AI_SANDBOX_PASS_ENV="A_VAR"
+_sandbox_pass_env_add NEW_VAR
+_sandbox_pass_env_add NEW_VAR
+assert_eq "${AI_SANDBOX_PASS_ENV}" "A_VAR,NEW_VAR" "helper does not duplicate a name added twice"
+
+AI_SANDBOX_PASS_ENV="A_VAR"
+_sandbox_pass_env_add A_VAR_EXTRA
+assert_eq "${AI_SANDBOX_PASS_ENV}" "A_VAR,A_VAR_EXTRA" \
+    "helper matches whole entries, not name prefixes"
+
 _stub_runner() { run_sandboxed_agent() { printf '%s\n' "$@"; }; }
 _copilot_argv() {
     (
