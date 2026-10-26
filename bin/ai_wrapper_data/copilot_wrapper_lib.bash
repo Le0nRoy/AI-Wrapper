@@ -24,26 +24,8 @@ _agent_system_prompt_args() {
 # Disable it explicitly, then pass the no-prompt workspace-trust setting
 # through the sandbox's scrubbed environment using its explicit env allowlist.
 _copilot_enable_unrestricted_mode() {
-    local entry name pass_env="${AI_SANDBOX_PASS_ENV:-}"
-    local -a pass_env_vars=()
-    IFS=',' read -r -a pass_env_vars <<<"${pass_env}"
-    for name in COPILOT_ALLOW_ALL COPILOT_ASSISTED_APPROVAL; do
-        local found=0
-        for entry in "${pass_env_vars[@]}"; do
-            entry="${entry#"${entry%%[![:space:]]*}"}"
-            entry="${entry%"${entry##*[![:space:]]}"}"
-            if [[ "${entry}" == "${name}" ]]; then
-                found=1
-                break
-            fi
-        done
-        if [[ "${found}" -eq 0 ]]; then
-            [[ -n "${pass_env}" ]] && pass_env+=","
-            pass_env+="${name}"
-            pass_env_vars+=("${name}")
-        fi
-    done
-    export AI_SANDBOX_PASS_ENV="${pass_env}"
+    _sandbox_pass_env_add COPILOT_ALLOW_ALL
+    _sandbox_pass_env_add COPILOT_ASSISTED_APPROVAL
     export COPILOT_ALLOW_ALL=true
     export COPILOT_ASSISTED_APPROVAL=false
 }

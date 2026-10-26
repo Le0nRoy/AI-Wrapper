@@ -23,6 +23,24 @@ function echo_log() {
     echo -e "[$(date "+%F %T")] ${log_level}: $*" >&2
 }
 
+# Append NAME to the comma-separated AI_SANDBOX_PASS_ENV allowlist unless it
+# is already listed (whitespace around entries is ignored). Exports the
+# updated list. Used by wrappers that must pass their own env vars through
+# the sandbox's scrubbed environment.
+_sandbox_pass_env_add() {
+    local name="${1}" entry pass_env="${AI_SANDBOX_PASS_ENV:-}"
+    local -a pass_env_vars=()
+    IFS=',' read -r -a pass_env_vars <<<"${pass_env}"
+    for entry in "${pass_env_vars[@]}"; do
+        entry="${entry#"${entry%%[![:space:]]*}"}"
+        entry="${entry%"${entry##*[![:space:]]}"}"
+        [[ "${entry}" == "${name}" ]] && return 0
+    done
+    [[ -n "${pass_env}" ]] && pass_env+=","
+    pass_env+="${name}"
+    export AI_SANDBOX_PASS_ENV="${pass_env}"
+}
+
 # Classify a directory path against the sandbox's sensitive-location
 # rules. Prints one of:
 #   system  - "" / a filesystem root or top-level system location
