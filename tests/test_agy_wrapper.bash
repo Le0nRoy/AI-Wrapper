@@ -222,6 +222,26 @@ del_brain_exists=0
 [[ -d "${del_profile}/antigravity-cli/brain/${del_cid}" ]] && del_brain_exists=1
 assert_eq "${del_brain_exists}" "1" "... without deleting conversation artifacts"
 
+# A database subprocess that exits nonzero without any output must still
+# fail the delete before artifacts are touched.
+printf 'placeholder' >"${del_profile}/antigravity-cli/conversation_summaries.db"
+err_out="$( ( _load agy; python3() { cat >/dev/null; return 1; }; _agy_delete_conversation "${del_profile}" "${del_cid}" ) 2>&1 )"; rc=$?
+assert_eq "${rc}" "1" "_agy_delete_conversation fails when python3 exits nonzero silently"
+assert_contains "${err_out}" "python3 failed" "... and reports an actionable error"
+del_brain_exists=0
+[[ -d "${del_profile}/antigravity-cli/brain/${del_cid}" ]] && del_brain_exists=1
+assert_eq "${del_brain_exists}" "1" "... without deleting conversation artifacts"
+assert_eq "$(cat "${del_profile}/antigravity-cli/conversation_summaries.db")" "placeholder" \
+    "... and leaves the database untouched"
+
+# The SQLite busy timeout is one named setting shared by both backends.
+err_out="$( ( export AGY_DB_BUSY_TIMEOUT_MS=abc; _load agy; _agy_delete_conversation "${del_profile}" "${del_cid}" ) 2>&1 )"; rc=$?
+assert_eq "${rc}" "1" "_agy_delete_conversation rejects a non-integer AGY_DB_BUSY_TIMEOUT_MS"
+assert_contains "${err_out}" "AGY_DB_BUSY_TIMEOUT_MS" "... and names the invalid setting"
+del_brain_exists=0
+[[ -d "${del_profile}/antigravity-cli/brain/${del_cid}" ]] && del_brain_exists=1
+assert_eq "${del_brain_exists}" "1" "... without deleting conversation artifacts"
+
 # A failed artifact removal is propagated instead of reported as success.
 rm -f "${del_profile}/antigravity-cli/conversation_summaries.db"
 err_out="$( ( _load agy; rm() { return 1; }; _agy_delete_conversation "${del_profile}" "${del_cid}" ) 2>&1 )"; rc=$?

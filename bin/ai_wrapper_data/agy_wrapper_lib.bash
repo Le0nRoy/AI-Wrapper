@@ -43,6 +43,10 @@ export AGY_ACCOUNT="${AGY_ACCOUNT:-private}"
 # interactive resume conversation picker).
 _AGY_ACTIVE_PROFILE_DIR=""
 
+# How long a conversation delete waits for a locked conversation_summaries.db
+# before failing (milliseconds). Shared by the python3 and sqlite3 backends.
+AGY_DEFAULT_DB_BUSY_TIMEOUT_MS=1000
+
 # List available account profile names (suffixes of ~/.gemini-<name>/),
 # one per line.
 _agy_list_account_profiles() {
@@ -297,15 +301,21 @@ _agy_delete_conversation() {
     local cli_dir="${profile_dir}/antigravity-cli"
     local db_path="${cli_dir}/conversation_summaries.db"
     local -a ids_to_remove=("${cid}")
+    local busy_timeout_ms="${AGY_DB_BUSY_TIMEOUT_MS:-${AGY_DEFAULT_DB_BUSY_TIMEOUT_MS}}"
+
+    if [[ ! "${busy_timeout_ms}" =~ ^[0-9]+$ ]]; then
+        wrapper_log "ERROR" "Invalid AGY_DB_BUSY_TIMEOUT_MS: '${busy_timeout_ms}' (expected milliseconds)"
+        return 1
+    fi
 
     if [[ -f "${db_path}" ]]; then
         local db_out="" db_err=""
         if command -v python3 >/dev/null 2>&1; then
-            if ! db_out="$(python3 - "${db_path}" "${cid}" 2>&1 <<'PY'
+            if ! db_out="$(python3 - "${db_path}" "${cid}" "${busy_timeout_ms}" 2>&1 <<'PY'
 import sqlite3, sys
-db_path, cid = sys.argv[1], sys.argv[2]
+db_path, cid, busy_timeout_ms = sys.argv[1], sys.argv[2], int(sys.argv[3])
 try:
-    conn = sqlite3.connect(db_path, timeout=1)
+    conn = sqlite3.connect(db_path, timeout=busy_timeout_ms / 1000)
     with conn:
         cur = conn.cursor()
         cur.execute("SELECT conversation_id FROM conversation_summaries WHERE parent_conversation_id = ?", (cid,))
@@ -319,11 +329,11 @@ for c in children:
     print(c)
 PY
             )"; then
-                db_err="${db_out}"
+                db_err="${db_out:-python3 failed}"
             fi
         elif command -v sqlite3 >/dev/null 2>&1; then
             local esc_cid="${cid//\'/\'\'}"
-            if ! db_err="$(sqlite3 -cmd '.timeout 1000' "${db_path}" "DELETE FROM conversation_summaries WHERE conversation_id = '${esc_cid}' OR parent_conversation_id = '${esc_cid}';" 2>&1)"; then
+            if ! db_err="$(sqlite3 -cmd ".timeout ${busy_timeout_ms}" "${db_path}" "DELETE FROM conversation_summaries WHERE conversation_id = '${esc_cid}' OR parent_conversation_id = '${esc_cid}';" 2>&1)"; then
                 db_err="${db_err:-sqlite3 failed}"
             else
                 db_err=""
