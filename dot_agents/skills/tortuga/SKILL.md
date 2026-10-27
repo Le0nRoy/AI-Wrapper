@@ -26,7 +26,7 @@ Use the terminal/shell tool. Prefix below with `python3 <this-skill-directory>/s
 --repo OWNER/REPO run list --limit 10
 ```
 
-Omit leading `--repo` only when the current Git origin is the intended target. In a non-Git directory it is mandatory. Show the resolved target before the first write. Never fall back to Tortuga's own source repository.
+Omit leading `--repo` only when the current Git origin is the intended target. In a non-Git directory it is mandatory. Show the resolved target before the first write. Never fall back to Tortuga's own source repository. Prefer numeric selectors; URL selectors must name the same github.com repository (the helper rejects others before requesting a token). Override subprocess deadlines with `TORTUGA_GIT_TIMEOUT` (default 10s) and `TORTUGA_TOKEN_TIMEOUT` (default 45s).
 
 ## Authorized task actions
 Read requirements and current labels/state before writing. Only after the user authorizes that action:

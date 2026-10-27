@@ -13,6 +13,11 @@ import sys
 from urllib.parse import urlsplit
 
 DEFAULT_HOME = Path('/Data/Everything/ProgrammingWorkspace/Tortuga-Infra/Tortuga-AI')
+# Seconds; the token issuer depends on local infrastructure, so allow overrides.
+DEFAULT_GIT_TIMEOUT = 10
+DEFAULT_TOKEN_TIMEOUT = 45
+# Free-text flags whose values may legitimately mention other repositories.
+TEXT_FLAGS = {'-b', '--body', '-t', '--title'}
 
 
 def validate_repo(value):
@@ -37,6 +42,32 @@ def repo_from_remote(remote):
     return validate_repo(value)
 
 
+def timeout_from_env(name, default):
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        value = 0
+    if not 0 < value < float('inf'):
+        raise ValueError(name + ' must be a positive number of seconds')
+    return value
+
+
+def check_locators(args, repo):
+    """Reject URL selectors that would make gh ignore --repo and target another repository."""
+    for index, arg in enumerate(args):
+        if index and args[index - 1] in TEXT_FLAGS:
+            continue
+        if not re.match(r'https?://', arg, re.IGNORECASE):
+            continue
+        parsed = urlsplit(arg)
+        owner_repo = '/'.join(parsed.path.strip('/').split('/')[:2])
+        if parsed.hostname not in {'github.com', 'www.github.com'} or owner_repo.lower() != repo.lower():
+            raise ValueError('URL selector does not match target ' + repo + '; use a number or a matching URL')
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--repo', help='Explicit OWNER/REPO; otherwise resolve current Git origin')
@@ -47,18 +78,21 @@ def main(argv=None):
         if args.repo:
             repo = validate_repo(args.repo)
         else:
-            result = subprocess.run(['git', 'remote', 'get-url', 'origin'], capture_output=True, text=True, timeout=10)
+            result = subprocess.run(['git', 'remote', 'get-url', 'origin'], capture_output=True, text=True,
+                                    timeout=timeout_from_env('TORTUGA_GIT_TIMEOUT', DEFAULT_GIT_TIMEOUT))
             if result.returncode:
                 raise ValueError('No Git origin here; pass --repo OWNER/REPO')
             repo = repo_from_remote(result.stdout)
         # One target only: prevent overrides hidden among forwarded gh arguments.
         if any(a in {'-R', '--repo'} or a.startswith('--repo=') or a.startswith('-R') for a in args.args):
             raise ValueError('Set the target using this wrapper\'s leading --repo only')
+        check_locators(args.args, repo)
         if args.command == 'repo' and args.args:
             raise ValueError('repo only shows the resolved target; use issue/pr/run for operations')
+        token_timeout = timeout_from_env('TORTUGA_TOKEN_TIMEOUT', DEFAULT_TOKEN_TIMEOUT)
         home = Path(os.environ.get('TORTUGA_HOME', str(DEFAULT_HOME))).expanduser()
         token = subprocess.run(['make', '-s', 'get-github-token', 'REPO=' + repo], cwd=home,
-                               capture_output=True, text=True, timeout=45)
+                               capture_output=True, text=True, timeout=token_timeout)
         if token.returncode:
             print('Tortuga App token unavailable for ' + repo + '; check App installation and local setup.', file=sys.stderr)
             return 1

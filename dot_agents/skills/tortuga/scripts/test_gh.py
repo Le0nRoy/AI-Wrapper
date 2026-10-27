@@ -41,6 +41,35 @@ class TargetTests(unittest.TestCase):
             self.assertEqual(gh.main(['--repo', 'Owner/Repo', 'issue', 'list', '--repo', 'Other/Repo']), 1)
             run.assert_not_called()
 
+    def test_refuses_foreign_positional_url_before_token_creation(self):
+        for url in ['https://github.com/Owner/Other/issues/1', 'https://github.com/Other/Repo/pull/2',
+                    'https://ghe.example.com/Owner/Repo/issues/3']:
+            with patch.object(gh.subprocess, 'run') as run, contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(gh.main(['--repo', 'Owner/Repo', 'issue', 'comment', url, '--body', 'x']), 1)
+                run.assert_not_called()
+
+    def test_accepts_matching_positional_url_and_url_body_text(self):
+        argv = ['--repo', 'Owner/Repo', 'pr', 'comment', 'https://github.com/owner/repo/pull/2',
+                '--body', 'https://github.com/Other/Repo/issues/1']
+        results = [subprocess.CompletedProcess([], 0, 'opaque-fixture\n', ''),
+                   subprocess.CompletedProcess([], 0)]
+        with patch.object(gh.subprocess, 'run', side_effect=results) as run:
+            self.assertEqual(gh.main(argv), 0)
+        self.assertEqual(run.call_args_list[1].args[0][:5],
+                         ['gh', 'pr', 'comment', 'https://github.com/owner/repo/pull/2', '--body'])
+
+    def test_timeouts_are_configurable(self):
+        results = [subprocess.CompletedProcess([], 0, 'opaque-fixture\n', ''),
+                   subprocess.CompletedProcess([], 0)]
+        with patch.dict(gh.os.environ, {'TORTUGA_TOKEN_TIMEOUT': '7'}), \
+                patch.object(gh.subprocess, 'run', side_effect=results) as run:
+            self.assertEqual(gh.main(['--repo', 'Owner/Repo', 'issue', 'list']), 0)
+        self.assertEqual(run.call_args_list[0].kwargs['timeout'], 7)
+        with patch.dict(gh.os.environ, {'TORTUGA_TOKEN_TIMEOUT': 'soon'}), \
+                patch.object(gh.subprocess, 'run') as run, contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(gh.main(['--repo', 'Owner/Repo', 'issue', 'list']), 1)
+            run.assert_not_called()
+
     def test_malformed_token_is_never_echoed(self):
         result = subprocess.CompletedProcess([], 0, 'opaque-fixture\nsecond-value', '')
         output = io.StringIO()
