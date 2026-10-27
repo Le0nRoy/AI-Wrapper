@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Copy the skills deployed to ~/ai-wrapper/.agents/skills/ into
-# ~/.claude/skills/ and ~/.gemini/config/skills/ so Claude Code and
-# Antigravity CLI (agy) can discover them. Existing entries in the target
+# every wrapped client's native skill directory so the installed coding
+# clients can discover them. Existing entries in the target
 # directories are left untouched — this script never overwrites a
 # non-managed directory, and only refreshes copies that carry our marker
 # file (.setup_skills_managed).
@@ -22,15 +22,28 @@ set -u -o pipefail
 SKILLS_SRC="${HOME}/ai-wrapper/.agents/skills"
 SKILLS_DSTS=(
     "${HOME}/.claude/skills"
+    "${HOME}/.codex/skills"
     "${HOME}/.gemini/config/skills"
+    "${HOME}/.cursor/skills"
+    "${HOME}/.copilot/skills"
 )
+
+# Named account profiles replace the default client config directory inside
+# the sandbox, so each existing profile needs its own managed skill copies.
+for profile_dir in "${HOME}"/.claude-* "${HOME}"/.codex-*; do
+    [[ -d "${profile_dir}" ]] && SKILLS_DSTS+=("${profile_dir}/skills")
+done
+for profile_dir in "${HOME}"/.gemini-*; do
+    [[ -d "${profile_dir}" ]] && SKILLS_DSTS+=("${profile_dir}/config/skills")
+done
 MARKER=".setup_skills_managed"
 
 print_help() {
     cat <<'EOF'
 Copy the skills deployed to ~/ai-wrapper/.agents/skills/ into
-~/.claude/skills/ and ~/.gemini/config/skills/ so Claude Code and
-Antigravity CLI (agy) can discover them. A marker file (.setup_skills_managed)
+the native skill directories for Claude Code, Codex, Antigravity CLI,
+Cursor Agent, and GitHub Copilot CLI. Existing named account profiles are
+included. A marker file (.setup_skills_managed)
 inside each copy records its source path so future runs can refresh the copy
 in place without clobbering user-managed directories.
 

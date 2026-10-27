@@ -333,14 +333,13 @@ silently activate every knob it ships.
 ## Skills
 
 Skills live in `~/ai-wrapper/.agents/skills/`. The setup script
-`setup_skills.bash` copies each one into `~/.claude/skills/<name>` so
-Claude Code discovers them (copies, not symlinks — sandbox-exec on macOS
-resolves file rules against the canonical real path, and the sandbox
-binds `~/.claude` RW but not `~/ai-wrapper/.agents`, so a symlink there
-would be read-denied). Each managed copy carries a
+`setup_skills.bash` copies each one into every wrapped client's native skill
+directory, including existing named account profiles. Copies are used instead
+of symlinks because sandbox-exec on macOS resolves file rules against the
+canonical real path. Each managed copy carries a
 `.setup_skills_managed` marker file recording its source path, so reruns
-refresh the copy in place; non-managed entries already in
-`~/.claude/skills/` are left untouched.
+refresh the copy in place; non-managed entries in destination skill
+directories are left untouched.
 
 Run setup with:
 ```sh
@@ -348,18 +347,11 @@ Run setup with:
 ```
 
 Key skills:
-- `orchestrator-mode` — Full feature delivery orchestration
-- `writing-plans` — Implementation plan creation
-- `implementing-tasks` — TDD task execution with file ownership and self-review
-- `planning-tests` — Test strategy design (produces test plan for automation-tester)
-- `writing-automated-tests` — AAA-structured test writing with isolation and control cases
-- `updating-documentation` — Post-review doc updates (README, env vars, changelog)
-- `subagent-driven-development` — Same-session plan execution with reviews
-- `executing-plans` — Parallel session plan execution
-- `requesting-code-review` — Code review dispatch
-- `using-git-worktrees` — Isolated workspace creation
-- `finishing-a-development-branch` — Branch completion and merge options
-- `find-skills` — Discover installable skills
+- `orchestrator-mode` — Delegated investigation, planning, and implementation
+- `session-retro` — Session analysis and reusable lessons
+- `caveman` — Concise responses without losing technical substance
+- `ponytail` — Smallest complete solution and evidence-based scope pushback
+- `tortuga` — On-demand use of the existing GitHub runner
 
 ## Keyboard Shortcuts
 

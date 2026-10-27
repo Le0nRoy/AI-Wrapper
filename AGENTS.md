@@ -13,7 +13,7 @@ These rules apply to **Claude Code** (and any other AI agents) working on **any 
 
 | Resource | Location |
 |----------|----------|
-| User-level skills | `~/.agents/skills/` (copied into `~/.claude/skills/` and `~/.gemini/config/skills/` by `setup_skills.bash`; each managed copy carries a `.setup_skills_managed` marker so reruns refresh it in place) |
+| User-level skills | `~/.agents/skills/` (copied into every wrapped client's native skill directory by `setup_skills.bash`; named Claude, Codex, and Antigravity profiles are included, and each managed copy carries a `.setup_skills_managed` marker) |
 | Orchestrator prompt | `~/bin/ai_wrapper_data/orchestrator-prompt.md` |
 | Installed plugins | `~/.claude/settings.json` → `enabledPlugins` |
 | Plugin marketplace | `~/.claude/plugins/marketplaces/claude-plugins-official/plugins/` |
@@ -23,7 +23,6 @@ These rules apply to **Claude Code** (and any other AI agents) working on **any 
 **Key skills (always relevant):**
 - `coding-standards` — naming, nesting, no magic numbers, no race conditions
 - `qa-automation` — test structure, isolation, integration patterns
-- `requesting-code-review` — review process + legal compliance checks
 - `chezmoi-workflow` — **required when working in this repo**
 - `ai-sandboxing` — bubblewrap sandbox architecture and restrictions
 - `common-automation-verifier` — project setup verification
@@ -123,8 +122,6 @@ Squash already done — you have 1 clean commit to review.
 
 - Never push without explicit user instruction
 - Feature work on `feat/`, fixes on `fix/`, docs on `docs/`
-- See `using-git-worktrees` skill for isolated feature work
-- See `finishing-a-development-branch` skill for branch completion
 
 ### Do Not
 
@@ -148,7 +145,7 @@ Squash already done — you have 1 clean commit to review.
 | Testing docs | `docs/TESTING.md` | New test infra, coverage changes |
 | Legal compliance | `docs/legal/` or `docs/COMPLIANCE.md` | Data handling, PII, new integrations |
 
-**Legal docs required when:** feature handles user data, stores PII, processes payments, integrates with external services. See `requesting-code-review` skill for the legal compliance checklist.
+**Legal docs required when:** feature handles user data, stores PII, processes payments, or integrates with external services.
 
 ---
 
