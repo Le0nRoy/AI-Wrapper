@@ -57,8 +57,18 @@ def timeout_from_env(name, default):
 
 def check_locators(args, repo):
     """Reject URL selectors that would make gh ignore --repo and target another repository."""
-    for index, arg in enumerate(args):
-        if index and args[index - 1] in TEXT_FLAGS:
+    # Mirror gh's flag parser: a text flag consumes the next argument verbatim,
+    # even one that looks like a flag, and a bare -- ends flag parsing.
+    flags_done = False
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        index += 1
+        if not flags_done and arg == '--':
+            flags_done = True
+            continue
+        if not flags_done and arg in TEXT_FLAGS:
+            index += 1
             continue
         if not re.match(r'https?://', arg, re.IGNORECASE):
             continue

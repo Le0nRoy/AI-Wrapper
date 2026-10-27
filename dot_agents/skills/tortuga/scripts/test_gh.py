@@ -48,6 +48,14 @@ class TargetTests(unittest.TestCase):
                 self.assertEqual(gh.main(['--repo', 'Owner/Repo', 'issue', 'comment', url, '--body', 'x']), 1)
                 run.assert_not_called()
 
+    def test_consumed_flag_like_body_cannot_hide_foreign_url(self):
+        for args in [['--body', '--body', 'https://github.com/Owner/Other/issues/1'],
+                     ['-b', '-t', 'https://github.com/Owner/Other/issues/1'],
+                     ['--', 'https://github.com/Owner/Other/issues/1']]:
+            with patch.object(gh.subprocess, 'run') as run, contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(gh.main(['--repo', 'Owner/Repo', 'issue', 'comment', *args]), 1)
+                run.assert_not_called()
+
     def test_accepts_matching_positional_url_and_url_body_text(self):
         argv = ['--repo', 'Owner/Repo', 'pr', 'comment', 'https://github.com/owner/repo/pull/2',
                 '--body', 'https://github.com/Other/Repo/issues/1']
