@@ -106,4 +106,21 @@ for destination in "${destinations[@]}"; do
 done
 [[ "$(cat "${FAKE_HOME}/.codex/skills/writing-plans/SKILL.md")" == mine ]] || fail "unmanaged skill touched on rerun"
 
+# Relative links: every local Markdown link in a shared skill must resolve to a
+# committed file, and that companion file must reach each managed copy.
+link_re='\]\(([^)#[:space:]]+)'
+while IFS= read -r -d '' doc; do
+    rel_doc="${doc#"${REPO_ROOT}/dot_agents/skills/"}"
+    while IFS= read -r target; do
+        [[ "${target}" =~ ^[a-z][a-z0-9+.-]*: ]] && continue
+        [[ -e "$(dirname "${doc}")/${target}" ]] \
+            || fail "${rel_doc} links to missing ${target}"
+        for destination in "${destinations[@]}"; do
+            [[ -e "${FAKE_HOME}/${destination}/$(dirname "${rel_doc}")/${target}" ]] \
+                || fail "${destination}/${rel_doc} link target ${target} not deployed"
+        done
+        checks=$((checks + 1))
+    done < <(grep -oE "${link_re}" "${doc}" | sed -E 's/^\]\(//')
+done < <(find "${REPO_ROOT}/dot_agents/skills" -name '*.md' -print0)
+
 echo "${checks} skill destination checks passed"
