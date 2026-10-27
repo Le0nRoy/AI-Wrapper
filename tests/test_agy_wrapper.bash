@@ -209,6 +209,45 @@ assert_eq "$?" "1" "_agy_rename_conversation rejects path-traversal ID"
 )
 assert_eq "$?" "1" "_agy_delete_conversation rejects path-traversal ID"
 
+# A failed index update (corrupt/locked DB) must fail the delete and leave
+# artifacts in place so the index and on-disk state stay consistent.
+del_profile="${FAKE_HOME}/.gemini-delfail"
+del_cid="44444444-dddd-eeee-ffff-000000000000"
+mkdir -p "${del_profile}/antigravity-cli/brain/${del_cid}"
+printf 'not a sqlite database' >"${del_profile}/antigravity-cli/conversation_summaries.db"
+err_out="$( ( _load agy; _agy_delete_conversation "${del_profile}" "${del_cid}" ) 2>&1 )"; rc=$?
+assert_eq "${rc}" "1" "_agy_delete_conversation fails when the index update fails"
+assert_contains "${err_out}" "Failed to update" "... and reports the database error"
+del_brain_exists=0
+[[ -d "${del_profile}/antigravity-cli/brain/${del_cid}" ]] && del_brain_exists=1
+assert_eq "${del_brain_exists}" "1" "... without deleting conversation artifacts"
+
+# A failed artifact removal is propagated instead of reported as success.
+rm -f "${del_profile}/antigravity-cli/conversation_summaries.db"
+err_out="$( ( _load agy; rm() { return 1; }; _agy_delete_conversation "${del_profile}" "${del_cid}" ) 2>&1 )"; rc=$?
+assert_eq "${rc}" "1" "_agy_delete_conversation fails when an artifact cannot be removed"
+assert_contains "${err_out}" "Failed to remove ${del_profile}/antigravity-cli/brain/${del_cid}" \
+    "... and names the artifact left behind"
+
+# The picker reports partial batch failures instead of a blanket success.
+out="$(
+    cd "${FAKE_HOME}/work" || exit 1
+    _load agy; _stub_runner
+    _AGY_ACTIVE_PROFILE_DIR="${del_profile}"
+    _agy_list_conversations() {
+        printf '%s\t%s\t%s\t%s\t%s\n' \
+            "aaaaaaaa-0000-0000-0000-000000000000" "2026-10-18 01:00" 1 here "Ok" \
+            "bbbbbbbb-0000-0000-0000-000000000000" "2026-10-18 02:00" 1 here "Stuck"
+    }
+    _agy_delete_conversation() { [[ "${2}" == aaaaaaaa-* ]]; }
+    AGY_RESUME_PICK=$'d 1,2\ny\nq'
+    export AGY_RESUME_PICK
+    run_agent_session resume
+)"
+assert_contains "${out}" "Failed to delete conversation [bbbbbbbb]." "resume picker: reports the failed deletion"
+assert_contains "${out}" "Deleted 1 of 2 conversations ([aaaaaaaa])." "resume picker: reports partial batch success"
+assert_not_contains "${out}" "Deleted 2 conversations" "resume picker: no blanket success on partial failure"
+
 err_out="$( ( _load agy; AI_WRAPPER_DEBUG=0 _agy_list_conversations "${FAKE_HOME}/.gemini" "${FAKE_HOME}/work" "not-an-int" ) 2>&1 )"
 assert_not_contains "${err_out}" "ValueError" "_agy_list_conversations: stderr suppressed when AI_WRAPPER_DEBUG=0"
 err_out="$( ( _load agy; AI_WRAPPER_DEBUG=1 _agy_list_conversations "${FAKE_HOME}/.gemini" "${FAKE_HOME}/work" "not-an-int" ) 2>&1 )"
