@@ -23,14 +23,9 @@ WRAPPER_FLAGS=()
 _wrapper_bind_git_common_dir
 
 # Keep Copilot runtime state in its standard home paths while preventing broad
-# access to unrelated system directories.
-_wrapper_add_bind "${HOME}/.copilot"
-if [[ -d "${HOME}/.config/github-copilot" ]]; then
-    _wrapper_add_bind "${HOME}/.config/github-copilot"
-fi
-if [[ -d "${HOME}/.local/share/copilot" ]]; then
-    _wrapper_add_bind "${HOME}/.local/share/copilot"
-fi
+# access to unrelated system directories. Symlinked config paths are refused
+# when they resolve outside $HOME or into credential directories.
+_copilot_bind_config_dirs || exit 1
 
 # Auto-approve all tools, filesystem paths, and URLs inside the OS sandbox.
 AGENT_FLAGS=(--allow-all-tools --allow-all-paths --allow-all-urls)
@@ -44,6 +39,9 @@ if [[ $# -eq 0 && -t 0 && -t 1 ]]; then
     _preset_autoload
     show_main_menu
     _preset_autosave
+    # Apply toggle-dependent binds AFTER the menu so flips made in the
+    # Settings sub-menu reach WRAPPER_FLAGS.
+    _apply_post_menu_binds
 
     if declare -f _extra_post_menu_setup >/dev/null 2>&1; then
         _extra_post_menu_setup
@@ -66,6 +64,7 @@ if [[ $# -eq 0 && -t 0 && -t 1 ]]; then
 fi
 
 _preset_autoload
+_apply_post_menu_binds
 if declare -f _extra_post_menu_setup >/dev/null 2>&1; then
     _extra_post_menu_setup
 fi

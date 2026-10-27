@@ -53,6 +53,59 @@ _sandbox_pass_env_add A_VAR_EXTRA
 assert_eq "${AI_SANDBOX_PASS_ENV}" "A_VAR,A_VAR_EXTRA" \
     "helper matches whole entries, not name prefixes"
 
+echo "-- Copilot config binds"
+NL=$'\n'
+_copilot_binds() {
+    (
+        WRAPPER_FLAGS=()
+        _copilot_bind_config_dirs || exit 1
+        printf '%s\n' "${WRAPPER_FLAGS[@]}"
+    ) 2>&1
+}
+_reset_copilot_home() {
+    rm -rf "${FAKE_HOME}/.copilot" "${FAKE_HOME}/.config/github-copilot" \
+        "${FAKE_HOME}/.local/share/copilot"
+}
+REAL_FAKE_HOME="$(_realpath "${FAKE_HOME}")"
+mkdir -p "${FAKE_HOME}/.ssh" "${FAKE_HOME}/.config" "${FAKE_HOME}/.local/share"
+OUTSIDE_DIR="$(mktemp -d)"
+
+_reset_copilot_home
+out="$(_copilot_binds)"; rc=$?
+assert_eq "${rc}" "0" "fresh home: Copilot config binds succeed"
+assert_contains "${out}" "${REAL_FAKE_HOME}/.copilot" "fresh home: ~/.copilot is created and bound"
+assert_not_contains "${out}" "github-copilot" "fresh home: missing optional config dir is skipped"
+
+for cfg in .copilot .config/github-copilot .local/share/copilot; do
+    for target in "${FAKE_HOME}/.ssh" "${OUTSIDE_DIR}"; do
+        _reset_copilot_home
+        ln -s "${target}" "${FAKE_HOME}/${cfg}"
+        out="$(_copilot_binds)"; rc=$?
+        assert_eq "${rc}" "1" "HOME/${cfg} symlink to ${target##*/} is refused"
+        assert_contains "${out}" "ERROR: ${FAKE_HOME}/${cfg} is a symlink" "... with a symlink error"
+        assert_not_contains "${out}" "--bind" "... before any bind is added"
+    done
+done
+
+_reset_copilot_home
+mkdir -p "${FAKE_HOME}/.config"
+printf 'x' >"${FAKE_HOME}/.config/github-copilot"
+out="$(_copilot_binds)"; rc=$?
+assert_eq "${rc}" "1" "non-directory Copilot config path is refused"
+assert_contains "${out}" "is not a directory" "... with a type error"
+
+_reset_copilot_home
+mkdir -p "${FAKE_HOME}/copilot-state"
+ln -s "${FAKE_HOME}/copilot-state" "${FAKE_HOME}/.copilot"
+out="$(_copilot_binds)"; rc=$?
+assert_eq "${rc}" "0" "HOME/.copilot symlink inside HOME is accepted"
+if [[ "$(uname -s)" == "Linux" ]]; then
+    assert_contains "${out}" "--bind${NL}${REAL_FAKE_HOME}/copilot-state${NL}${FAKE_HOME}/.copilot" \
+        "... and bound from its resolved source at the standard path"
+fi
+_reset_copilot_home
+rm -rf "${OUTSIDE_DIR}" "${FAKE_HOME}/copilot-state"
+
 _stub_runner() { run_sandboxed_agent() { printf '%s\n' "$@"; }; }
 _copilot_argv() {
     (
@@ -65,7 +118,6 @@ _copilot_argv() {
         esac
     )
 }
-NL=$'\n'
 SEP="--"
 assert_eq "$(_copilot_argv start)" \
     "copilot${NL}${SEP}${NL}${SEP}${NL}--allow-all-tools${NL}--allow-all-paths${NL}--allow-all-urls" \
@@ -78,6 +130,25 @@ if command -v copilot >/dev/null 2>&1; then
     copilot --allow-all-tools --allow-all-paths --allow-all-urls --help >/dev/null 2>&1
     assert_eq "$?" "0" "installed Copilot CLI accepts explicit unrestricted flags"
 fi
+
+# Argument passthrough applies the shared post-menu binds: with GitLab
+# passthrough enabled, file-based glab auth is bound read-only.
+mkdir -p "${FAKE_HOME}/stubbin" "${FAKE_HOME}/work" "${FAKE_HOME}/.config/glab-cli"
+printf '#!/bin/bash\n' >"${FAKE_HOME}/stubbin/copilot"
+chmod +x "${FAKE_HOME}/stubbin/copilot"
+cat >"${FAKE_HOME}/stub-profile.bash" <<'PROFILE'
+run_sandboxed_agent() { printf 'ARG=%s\n' "$@"; }
+PROFILE
+_glab_out() {
+    (cd "${FAKE_HOME}/work" && PATH="${FAKE_HOME}/stubbin:${PATH}" \
+        AI_WRAPPER_EXTRA_PROFILE="${FAKE_HOME}/stub-profile.bash" AI_SANDBOX_PASS_GITLAB="${1}" \
+        bash "${REPO_ROOT}/bin/executable_copilot_wrapper.bash" --prompt test </dev/null 2>&1)
+}
+out="$(_glab_out 1)"
+assert_contains "${out}" "ARG=--ro-bind${NL}ARG=${FAKE_HOME}/.config/glab-cli" \
+    "AI_SANDBOX_PASS_GITLAB=1 binds the glab config read-only"
+out="$(_glab_out 0)"
+assert_not_contains "${out}" "glab-cli" "glab config is not bound without GitLab passthrough"
 
 if [[ "$(uname -s)" == "Linux" ]] && command -v bwrap >/dev/null 2>&1; then
     mkdir -p "${FAKE_HOME}/bin" "${FAKE_HOME}/work"
