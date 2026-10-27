@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Verify every wrapped client and existing named profile receives each shared skill.
+# Verify every wrapped client and existing named profile receives each shared
+# skill, that retired skills from a previous deployment leave discovery roots
+# on upgrade, and that managed copies refresh while unmanaged ones survive.
 
 set -uo pipefail
 
@@ -13,6 +15,26 @@ mkdir -p \
     "${FAKE_HOME}/.codex-work" \
     "${FAKE_HOME}/.gemini-work"
 cp -a "${REPO_ROOT}/dot_agents/skills" "${FAKE_HOME}/ai-wrapper/.agents/skills"
+
+fail() {
+    echo "FAIL: $*"
+    exit 1
+}
+
+# Upgrade fixture: a retired skill left behind by chezmoi in the source root,
+# a managed client copy of it, an unmanaged copy with the same name, and an
+# unrelated user skill.
+SRC="${FAKE_HOME}/ai-wrapper/.agents/skills"
+ARCHIVE="${FAKE_HOME}/ai-wrapper/.retired-skills"
+mkdir -p "${SRC}/writing-plans" \
+    "${FAKE_HOME}/.claude/skills/writing-plans" \
+    "${FAKE_HOME}/.codex/skills/writing-plans" \
+    "${FAKE_HOME}/.claude/skills/user-skill"
+echo old > "${SRC}/writing-plans/SKILL.md"
+echo old > "${FAKE_HOME}/.claude/skills/writing-plans/SKILL.md"
+printf '%s\n' "${SRC}/writing-plans" > "${FAKE_HOME}/.claude/skills/writing-plans/.setup_skills_managed"
+echo mine > "${FAKE_HOME}/.codex/skills/writing-plans/SKILL.md"
+echo mine > "${FAKE_HOME}/.claude/skills/user-skill/SKILL.md"
 
 if ! HOME="${FAKE_HOME}" bash "${REPO_ROOT}/bin/executable_setup_skills.bash" >/dev/null; then
     echo "FAIL: setup_skills.bash returned nonzero"
@@ -46,5 +68,24 @@ for destination in "${destinations[@]}"; do
         checks=$((checks + 1))
     done
 done
+
+[[ -e "${SRC}/writing-plans" ]] && fail "retired skill still in source discovery root"
+[[ -f "${ARCHIVE}/source/writing-plans/SKILL.md" ]] || fail "retired source skill not archived"
+[[ -e "${FAKE_HOME}/.claude/skills/writing-plans" ]] && fail "retired managed copy still discoverable"
+[[ -f "${ARCHIVE}/.claude_skills/writing-plans/SKILL.md" ]] || fail "retired managed copy not archived"
+[[ "$(cat "${FAKE_HOME}/.codex/skills/writing-plans/SKILL.md")" == mine ]] || fail "unmanaged same-name skill touched"
+[[ "$(cat "${FAKE_HOME}/.claude/skills/user-skill/SKILL.md")" == mine ]] || fail "unrelated user skill touched"
+[[ -e "${FAKE_HOME}/.cursor/skills/writing-plans" ]] && fail "retired skill copied to a new client"
+checks=$((checks + 7))
+
+# Managed refresh: a source change reaches every managed copy on rerun.
+echo refreshed >> "${SRC}/caveman/SKILL.md"
+HOME="${FAKE_HOME}" bash "${REPO_ROOT}/bin/executable_setup_skills.bash" >/dev/null || fail "rerun returned nonzero"
+for destination in "${destinations[@]}"; do
+    cmp -s "${SRC}/caveman/SKILL.md" "${FAKE_HOME}/${destination}/caveman/SKILL.md" \
+        || fail "managed copy not refreshed in ${destination}"
+    checks=$((checks + 1))
+done
+[[ "$(cat "${FAKE_HOME}/.codex/skills/writing-plans/SKILL.md")" == mine ]] || fail "unmanaged skill touched on rerun"
 
 echo "${checks} skill destination checks passed"
