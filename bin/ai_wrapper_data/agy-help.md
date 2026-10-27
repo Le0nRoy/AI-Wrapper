@@ -29,6 +29,9 @@ prioritizing the current working directory. From the picker you can:
   conversations (and their `brain/` artifacts and child subagent entries) with
   confirmation. A single invalid token aborts the batch without deleting
   anything.
+  If `conversation_summaries.db` is locked, the delete waits up to
+  `AGY_DB_BUSY_TIMEOUT_MS` (default 1000 ms) and then fails without touching
+  any artifacts.
 - Press `c` to resume the most recent conversation via `--continue`, or `q` to
   cancel.
 

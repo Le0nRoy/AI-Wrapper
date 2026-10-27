@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Copy the skills deployed to ~/ai-wrapper/.agents/skills/ into
-# ~/.claude/skills/ and ~/.gemini/config/skills/ so Claude Code and
-# Antigravity CLI (agy) can discover them. Existing entries in the target
+# every wrapped client's native skill directory so the installed coding
+# clients can discover them. Existing entries in the target
 # directories are left untouched — this script never overwrites a
 # non-managed directory, and only refreshes copies that carry our marker
 # file (.setup_skills_managed).
@@ -22,17 +22,51 @@ set -u -o pipefail
 SKILLS_SRC="${HOME}/ai-wrapper/.agents/skills"
 SKILLS_DSTS=(
     "${HOME}/.claude/skills"
+    "${HOME}/.codex/skills"
     "${HOME}/.gemini/config/skills"
+    "${HOME}/.cursor/skills"
+    "${HOME}/.copilot/skills"
 )
+
+# Named account profiles replace the default client config directory inside
+# the sandbox, so each existing profile needs its own managed skill copies.
+for profile_dir in "${HOME}"/.claude-* "${HOME}"/.codex-*; do
+    [[ -d "${profile_dir}" ]] && SKILLS_DSTS+=("${profile_dir}/skills")
+done
+for profile_dir in "${HOME}"/.gemini-*; do
+    [[ -d "${profile_dir}" ]] && SKILLS_DSTS+=("${profile_dir}/config/skills")
+done
 MARKER=".setup_skills_managed"
+
+# Skills dropped from the shared set. Chezmoi never deletes a deployed file
+# once its source entry is gone, so on upgraded installs these linger in
+# SKILLS_SRC (and would be re-copied to new clients). They are archived,
+# together with their managed client copies, outside every discovery root.
+# Unmanaged copies with the same name are user content and are left alone.
+RETIRED_SKILLS=(
+    executing-plans
+    find-skills
+    finishing-a-development-branch
+    implementing-tasks
+    planning-tests
+    requesting-code-review
+    subagent-driven-development
+    updating-documentation
+    using-git-worktrees
+    writing-automated-tests
+    writing-plans
+)
+RETIRED_ARCHIVE="${HOME}/ai-wrapper/.retired-skills"
 
 print_help() {
     cat <<'EOF'
 Copy the skills deployed to ~/ai-wrapper/.agents/skills/ into
-~/.claude/skills/ and ~/.gemini/config/skills/ so Claude Code and
-Antigravity CLI (agy) can discover them. A marker file (.setup_skills_managed)
+the native skill directories for Claude Code, Codex, Antigravity CLI,
+Cursor Agent, and GitHub Copilot CLI. Existing named account profiles are
+included. A marker file (.setup_skills_managed)
 inside each copy records its source path so future runs can refresh the copy
-in place without clobbering user-managed directories.
+in place without clobbering user-managed directories. Retired shared skills
+and their managed copies are moved to ~/ai-wrapper/.retired-skills/.
 
 Usage:
   ./setup_skills.bash            # copy missing skills, refresh managed ones
@@ -97,10 +131,49 @@ do_copy() {
     printf '%s\n' "${src}" > "${dest}/${MARKER}"
 }
 
+# archive_skill <path> <bucket> — move <path> to RETIRED_ARCHIVE/<bucket>/,
+# never overwriting an earlier archive. Honours the outer `dry` flag. Counts
+# only completed moves; a failure is recorded so setup exits nonzero.
+archive_skill() {
+    local path="$1" bucket="$2" target
+    target="${RETIRED_ARCHIVE}/${bucket}/$(basename "${path}")"
+    [[ -e "${target}" ]] && target="${target}.$(date +%Y%m%d%H%M%S).$$"
+    echo "RETIRE  ${path} -> ${target}"
+    if [[ "${dry}" -eq 1 ]]; then
+        retired=$((retired + 1))
+        return 0
+    fi
+    if mkdir -p "$(dirname "${target}")" && mv "${path}" "${target}"; then
+        retired=$((retired + 1))
+    else
+        echo "ERROR   failed to archive ${path}; it remains discoverable" >&2
+        retire_failed=$((retire_failed + 1))
+    fi
+}
+
 copied=0
 updated=0
 replaced=0
 skipped=0
+retired=0
+retire_failed=0
+
+# Managed copies record the source path, so check them before the source
+# itself is moved away.
+for skills_dst in "${SKILLS_DSTS[@]}"; do
+    [[ -d "${skills_dst}" && ! -L "${skills_dst}" ]] || continue
+    for name in "${RETIRED_SKILLS[@]}"; do
+        dest="${skills_dst}/${name}"
+        if [[ -d "${dest}" && ! -L "${dest}" && -f "${dest}/${MARKER}" ]] \
+            && [[ "$(cat "${dest}/${MARKER}" 2>/dev/null)" == "${SKILLS_SRC}/${name}" ]]; then
+            bucket="${skills_dst#"${HOME}"/}"
+            archive_skill "${dest}" "${bucket//\//_}"
+        fi
+    done
+done
+for name in "${RETIRED_SKILLS[@]}"; do
+    [[ -d "${SKILLS_SRC}/${name}" && ! -L "${SKILLS_SRC}/${name}" ]] && archive_skill "${SKILLS_SRC}/${name}" source
+done
 
 for skills_dst in "${SKILLS_DSTS[@]}"; do
     # A stale top-level symlink (from a prior symlink-based setup) would make
@@ -118,6 +191,8 @@ for skills_dst in "${SKILLS_DSTS[@]}"; do
     for skill_path in "${SKILLS_SRC}"/*/; do
         [[ -d "${skill_path}" ]] || continue
         name="$(basename "${skill_path}")"
+        # Reachable in dry mode or after a failed archive; never redeploy.
+        [[ " ${RETIRED_SKILLS[*]} " == *" ${name} "* ]] && continue
         src="${skill_path%/}"
         dest="${skills_dst}/${name}"
 
@@ -178,8 +253,13 @@ for skills_dst in "${SKILLS_DSTS[@]}"; do
 done
 
 echo ""
-echo "Copied: ${copied}, Updated: ${updated}, Replaced: ${replaced}, Skipped: ${skipped}"
+echo "Copied: ${copied}, Updated: ${updated}, Replaced: ${replaced}, Skipped: ${skipped}, Retired: ${retired}"
 
 if [[ "${dry}" -eq 1 ]]; then
     echo "(dry run — no changes made)"
+fi
+
+if [[ "${retire_failed}" -gt 0 ]]; then
+    echo "ERROR: ${retire_failed} retired skill(s) could not be archived" >&2
+    exit 1
 fi

@@ -30,6 +30,40 @@ _copilot_enable_unrestricted_mode() {
     export COPILOT_ASSISTED_APPROVAL=false
 }
 
+# Bind one Copilot config directory RW at its standard path. A symlinked
+# path gets the shared config-symlink guard (target under $HOME, outside
+# credential dirs) and is bound from its resolved source. Missing optional
+# paths are skipped; ~/.copilot is created so the first run can initialize
+# it. Prints an ERROR and returns 1 on refusal. Args: PATH [required]
+_copilot_bind_config_path() {
+    local p="${1}" required="${2:-}" src
+    _wrapper_check_config_symlink "${p}" || return 1
+    if [[ -e "${p}" && ! -d "${p}" ]]; then
+        echo "ERROR: ${p} exists but is not a directory. Move or remove it before launching." >&2
+        return 1
+    fi
+    if [[ ! -e "${p}" ]]; then
+        [[ -n "${required}" ]] || return 0
+        if [[ -L "${p}" ]] || ! mkdir -p "${p}"; then
+            echo "ERROR: failed to create ${p}" >&2
+            return 1
+        fi
+    fi
+    if ! src="$(_realpath "${p}")" || [[ -z "${src}" ]]; then
+        echo "ERROR: cannot resolve ${p}" >&2
+        return 1
+    fi
+    _wrapper_add_bind "${src}" "${p}"
+}
+
+# Keep Copilot runtime state in its standard home paths. Returns 1 when any
+# path is refused.
+_copilot_bind_config_dirs() {
+    _copilot_bind_config_path "${HOME}/.copilot" required || return 1
+    _copilot_bind_config_path "${HOME}/.config/github-copilot" || return 1
+    _copilot_bind_config_path "${HOME}/.local/share/copilot" || return 1
+}
+
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     echo "This script is meant to be sourced, not executed directly." >&2
     exit 1

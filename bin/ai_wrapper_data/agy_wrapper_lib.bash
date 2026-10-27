@@ -43,6 +43,10 @@ export AGY_ACCOUNT="${AGY_ACCOUNT:-private}"
 # interactive resume conversation picker).
 _AGY_ACTIVE_PROFILE_DIR=""
 
+# How long a conversation delete waits for a locked conversation_summaries.db
+# before failing (milliseconds). Shared by the python3 and sqlite3 backends.
+AGY_DEFAULT_DB_BUSY_TIMEOUT_MS=1000
+
 # List available account profile names (suffixes of ~/.gemini-<name>/),
 # one per line.
 _agy_list_account_profiles() {
@@ -282,7 +286,9 @@ PY
 
 # Delete a saved conversation (and any child subagent records) from
 # `<profile_dir>/antigravity-cli/conversation_summaries.db`, `brain/<cid>`,
-# and `conversations/<cid>*`.
+# and `conversations/<cid>*`. The index is updated first; when that fails
+# (locked/read-only/corrupt DB, no SQLite client) no artifacts are touched.
+# Returns 1 when the index update or any artifact removal fails.
 _agy_delete_conversation() {
     local profile_dir="${1}"
     local cid="${2}"
@@ -295,33 +301,57 @@ _agy_delete_conversation() {
     local cli_dir="${profile_dir}/antigravity-cli"
     local db_path="${cli_dir}/conversation_summaries.db"
     local -a ids_to_remove=("${cid}")
+    local busy_timeout_ms="${AGY_DB_BUSY_TIMEOUT_MS:-${AGY_DEFAULT_DB_BUSY_TIMEOUT_MS}}"
+
+    if [[ ! "${busy_timeout_ms}" =~ ^[0-9]+$ ]]; then
+        wrapper_log "ERROR" "Invalid AGY_DB_BUSY_TIMEOUT_MS: '${busy_timeout_ms}' (expected milliseconds)"
+        return 1
+    fi
 
     if [[ -f "${db_path}" ]]; then
+        local db_out="" db_err=""
         if command -v python3 >/dev/null 2>&1; then
-            local child_id
-            while IFS= read -r child_id; do
-                [[ -n "${child_id}" && "${child_id}" =~ ^[a-zA-Z0-9_-]+$ ]] && ids_to_remove+=("${child_id}")
-            done < <(python3 - "${db_path}" "${cid}" <<'PY' 2>/dev/null
+            if ! db_out="$(python3 - "${db_path}" "${cid}" "${busy_timeout_ms}" 2>&1 <<'PY'
 import sqlite3, sys
-db_path, cid = sys.argv[1], sys.argv[2]
-conn = sqlite3.connect(db_path)
-cur = conn.cursor()
-cur.execute("SELECT conversation_id FROM conversation_summaries WHERE parent_conversation_id = ?", (cid,))
-children = [r[0] for r in cur.fetchall() if r and r[0]]
-cur.execute("DELETE FROM conversation_summaries WHERE conversation_id = ? OR parent_conversation_id = ?", (cid, cid))
-conn.commit()
-conn.close()
+db_path, cid, busy_timeout_ms = sys.argv[1], sys.argv[2], int(sys.argv[3])
+try:
+    conn = sqlite3.connect(db_path, timeout=busy_timeout_ms / 1000)
+    with conn:
+        cur = conn.cursor()
+        cur.execute("SELECT conversation_id FROM conversation_summaries WHERE parent_conversation_id = ?", (cid,))
+        children = [r[0] for r in cur.fetchall() if r and r[0]]
+        cur.execute("DELETE FROM conversation_summaries WHERE conversation_id = ? OR parent_conversation_id = ?", (cid, cid))
+    conn.close()
+except sqlite3.Error as exc:
+    sys.stderr.write("%s\n" % exc)
+    sys.exit(1)
 for c in children:
     print(c)
 PY
-            )
+            )"; then
+                db_err="${db_out:-python3 failed}"
+            fi
         elif command -v sqlite3 >/dev/null 2>&1; then
             local esc_cid="${cid//\'/\'\'}"
-            sqlite3 "${db_path}" "DELETE FROM conversation_summaries WHERE conversation_id = '${esc_cid}' OR parent_conversation_id = '${esc_cid}';" 2>/dev/null || true
+            if ! db_err="$(sqlite3 -cmd ".timeout ${busy_timeout_ms}" "${db_path}" "DELETE FROM conversation_summaries WHERE conversation_id = '${esc_cid}' OR parent_conversation_id = '${esc_cid}';" 2>&1)"; then
+                db_err="${db_err:-sqlite3 failed}"
+            else
+                db_err=""
+            fi
+        else
+            db_err="neither python3 nor sqlite3 is available"
         fi
+        if [[ -n "${db_err}" ]]; then
+            wrapper_log "ERROR" "Failed to update ${db_path} for conversation '${cid}': ${db_err}"
+            return 1
+        fi
+        local child_id
+        while IFS= read -r child_id; do
+            [[ -n "${child_id}" && "${child_id}" =~ ^[a-zA-Z0-9_-]+$ ]] && ids_to_remove+=("${child_id}")
+        done <<<"${db_out}"
     fi
 
-    local target_id target_path
+    local target_id target_path failed=0
     for target_id in "${ids_to_remove[@]}"; do
         [[ -n "${target_id}" && "${target_id}" =~ ^[a-zA-Z0-9_-]+$ ]] || continue
         for target_path in \
@@ -330,16 +360,19 @@ PY
             "${cli_dir}/conversations/${target_id}.pb" \
             "${cli_dir}/conversations/${target_id}.json"
         do
-            if [[ -L "${target_path}" ]]; then
-                rm -f "${target_path}" 2>/dev/null || true
-            elif [[ -d "${target_path}" ]]; then
-                rm -rf "${target_path}" 2>/dev/null || true
-            elif [[ -f "${target_path}" ]]; then
-                rm -f "${target_path}" 2>/dev/null || true
+            [[ -L "${target_path}" || -e "${target_path}" ]] || continue
+            if [[ -d "${target_path}" && ! -L "${target_path}" ]]; then
+                rm -rf "${target_path}" 2>/dev/null
+            else
+                rm -f "${target_path}" 2>/dev/null
+            fi
+            if [[ -L "${target_path}" || -e "${target_path}" ]]; then
+                wrapper_log "ERROR" "Failed to remove ${target_path}"
+                failed=1
             fi
         done
     done
-    return 0
+    return "${failed}"
 }
 
 # Resolve a user token (1-based list number or UUID / prefix) against the
@@ -605,8 +638,11 @@ _agent_resume_args() {
                     case "${confirm}" in
                         y|Y|yes|YES)
                             local del_cid del_failed=0
+                            local -a del_done=()
                             for del_cid in "${del_cids[@]}"; do
-                                if ! _agy_delete_conversation "${profile_dir}" "${del_cid}"; then
+                                if _agy_delete_conversation "${profile_dir}" "${del_cid}"; then
+                                    del_done+=("[${del_cid%%-*}]")
+                                else
                                     echo "Failed to delete conversation [${del_cid%%-*}]." >"${out_fd}"
                                     del_failed=1
                                 fi
@@ -617,6 +653,8 @@ _agent_resume_args() {
                                 else
                                     echo "Deleted ${#del_cids[@]} conversations (${del_shorts[*]})." >"${out_fd}"
                                 fi
+                            elif (( ${#del_done[@]} > 0 )); then
+                                echo "Deleted ${#del_done[@]} of ${#del_cids[@]} conversations (${del_done[*]})." >"${out_fd}"
                             fi
                             # Refresh and re-render the list
                             break
