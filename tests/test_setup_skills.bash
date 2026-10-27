@@ -78,6 +78,24 @@ done
 [[ -e "${FAKE_HOME}/.cursor/skills/writing-plans" ]] && fail "retired skill copied to a new client"
 checks=$((checks + 7))
 
+# Obstructed archive: a regular file where the source bucket should be makes
+# retirement fail; setup must exit nonzero, keep the source intact, and not
+# count the failed move as retired.
+mkdir -p "${SRC}/executing-plans"
+echo old > "${SRC}/executing-plans/SKILL.md"
+mv "${ARCHIVE}/source" "${ARCHIVE}/source.saved"
+touch "${ARCHIVE}/source"
+if output="$(HOME="${FAKE_HOME}" bash "${REPO_ROOT}/bin/executable_setup_skills.bash" 2>&1)"; then
+    fail "setup succeeded despite an obstructed archive"
+fi
+[[ "$(cat "${SRC}/executing-plans/SKILL.md")" == old ]] || fail "retired source lost after failed archive"
+[[ "${output}" == *"Retired: 0"* ]] || fail "failed archive counted as retired"
+rm -f "${ARCHIVE}/source"
+mv "${ARCHIVE}/source.saved" "${ARCHIVE}/source"
+HOME="${FAKE_HOME}" bash "${REPO_ROOT}/bin/executable_setup_skills.bash" >/dev/null || fail "retry after clearing obstruction failed"
+[[ -e "${SRC}/executing-plans" ]] && fail "retired source not archived on retry"
+checks=$((checks + 4))
+
 # Managed refresh: a source change reaches every managed copy on rerun.
 echo refreshed >> "${SRC}/caveman/SKILL.md"
 HOME="${FAKE_HOME}" bash "${REPO_ROOT}/bin/executable_setup_skills.bash" >/dev/null || fail "rerun returned nonzero"

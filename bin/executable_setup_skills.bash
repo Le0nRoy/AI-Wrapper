@@ -132,16 +132,23 @@ do_copy() {
 }
 
 # archive_skill <path> <bucket> — move <path> to RETIRED_ARCHIVE/<bucket>/,
-# never overwriting an earlier archive. Honours the outer `dry` flag.
+# never overwriting an earlier archive. Honours the outer `dry` flag. Counts
+# only completed moves; a failure is recorded so setup exits nonzero.
 archive_skill() {
     local path="$1" bucket="$2" target
     target="${RETIRED_ARCHIVE}/${bucket}/$(basename "${path}")"
     [[ -e "${target}" ]] && target="${target}.$(date +%Y%m%d%H%M%S).$$"
     echo "RETIRE  ${path} -> ${target}"
-    retired=$((retired + 1))
-    [[ "${dry}" -eq 1 ]] && return 0
-    mkdir -p "$(dirname "${target}")"
-    mv "${path}" "${target}"
+    if [[ "${dry}" -eq 1 ]]; then
+        retired=$((retired + 1))
+        return 0
+    fi
+    if mkdir -p "$(dirname "${target}")" && mv "${path}" "${target}"; then
+        retired=$((retired + 1))
+    else
+        echo "ERROR   failed to archive ${path}; it remains discoverable" >&2
+        retire_failed=$((retire_failed + 1))
+    fi
 }
 
 copied=0
@@ -149,6 +156,7 @@ updated=0
 replaced=0
 skipped=0
 retired=0
+retire_failed=0
 
 # Managed copies record the source path, so check them before the source
 # itself is moved away.
@@ -183,7 +191,7 @@ for skills_dst in "${SKILLS_DSTS[@]}"; do
     for skill_path in "${SKILLS_SRC}"/*/; do
         [[ -d "${skill_path}" ]] || continue
         name="$(basename "${skill_path}")"
-        # Only reachable in dry mode, where retired sources are not moved.
+        # Reachable in dry mode or after a failed archive; never redeploy.
         [[ " ${RETIRED_SKILLS[*]} " == *" ${name} "* ]] && continue
         src="${skill_path%/}"
         dest="${skills_dst}/${name}"
@@ -249,4 +257,9 @@ echo "Copied: ${copied}, Updated: ${updated}, Replaced: ${replaced}, Skipped: ${
 
 if [[ "${dry}" -eq 1 ]]; then
     echo "(dry run — no changes made)"
+fi
+
+if [[ "${retire_failed}" -gt 0 ]]; then
+    echo "ERROR: ${retire_failed} retired skill(s) could not be archived" >&2
+    exit 1
 fi
