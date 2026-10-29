@@ -241,11 +241,21 @@ del_brain_exists=0
 assert_eq "${del_brain_exists}" "1" "... without deleting conversation artifacts"
 
 # A failed artifact removal is propagated instead of reported as success.
+# Removal runs in the host helper (not rm), so make the artifact really
+# undeletable: a read-only conversation dir with content. Root ignores
+# directory permissions, so the check needs an unprivileged user.
 rm -f "${del_profile}/antigravity-cli/conversation_summaries.db"
-err_out="$( ( _load agy; rm() { return 1; }; _agy_delete_conversation "${del_profile}" "${del_cid}" ) 2>&1 )"; rc=$?
-assert_eq "${rc}" "1" "_agy_delete_conversation fails when an artifact cannot be removed"
-assert_contains "${err_out}" "Failed to remove ${del_profile}/antigravity-cli/brain/${del_cid}" \
-    "... and names the artifact left behind"
+if [[ "$(id -u)" != "0" ]]; then
+    : >"${del_profile}/antigravity-cli/brain/${del_cid}/artifact"
+    chmod 0500 "${del_profile}/antigravity-cli/brain/${del_cid}"
+    err_out="$( ( _load agy; _agy_delete_conversation "${del_profile}" "${del_cid}" ) 2>&1 )"; rc=$?
+    chmod 0700 "${del_profile}/antigravity-cli/brain/${del_cid}"
+    assert_eq "${rc}" "1" "_agy_delete_conversation fails when an artifact cannot be removed"
+    assert_contains "${err_out}" "Failed to remove ${del_profile}/antigravity-cli/brain/${del_cid}" \
+        "... and names the artifact left behind"
+else
+    echo "  skip - undeletable-artifact check (running as root)"
+fi
 
 # The picker reports partial batch failures instead of a blanket success.
 out="$(
