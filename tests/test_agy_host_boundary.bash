@@ -106,7 +106,7 @@ echo "-- checkout import shadowing never executes on the host"
 checkout="${FAKE_HOME}/checkout"
 canary_dir="${FAKE_HOME}/import-canary"
 mkdir -p "${checkout}" "${canary_dir}"
-for mod in json sqlite3 re os stat errno secrets signal glob traceback urllib sitecustomize usercustomize; do
+for mod in json sqlite3 re os stat errno secrets signal glob traceback urllib contextlib fcntl shutil tempfile time sitecustomize usercustomize; do
     printf 'open(%s, "w").write("ran")\n' "'${canary_dir}/${mod}'" >"${checkout}/${mod}.py"
 done
 p="$(_profile shadow)"
@@ -499,6 +499,39 @@ out="$(
 )"; rc=$?
 assert_eq "${rc}" "1" "approval refused when a wrapper --bind exposes the preset dir"
 
+# A plugin hook that can add binds after the trust decision makes the
+# preset's writability unknowable, so the approval is refused; a plugin
+# without such hooks does not affect it.
+for hook in _extra_post_menu_setup _extra_sandbox_setup; do
+    plugin="${FAKE_HOME}/plugin-${hook}.bash"
+    printf '%s() { WRAPPER_FLAGS+=(--bind "%s/.config"); bwrap_args+=(--bind "%s/.config" "%s/.config"); binds_rw+=("%s/.config"); }\n' \
+        "${hook}" "${FAKE_HOME}" "${FAKE_HOME}" "${FAKE_HOME}" "${FAKE_HOME}" >"${plugin}"
+    printf '{"k":1}\n' >"${dot}/settings.json"
+    before="$(_fp "${dot}/settings.json")"
+    out="$(
+        cd "${WORK}" || exit 1
+        _load
+        AI_WRAPPER_EXTRA_PROFILE="${plugin}" _load_extra_profile
+        WRAPPER_FLAGS=()
+        AGY_SETTINGS_TRUSTED_PROFILE="${p}" AGY_SETTINGS_TRUSTED_TARGET="${dot}/settings.json" \
+            _agy_configure_sandbox_permissions "${p}" 2>&1
+    )"; rc=$?
+    assert_eq "${rc}" "1" "approval refused when a plugin defines ${hook} (late sandbox binds)"
+    assert_contains "${out}" "cannot be determined" "${hook}: ... explaining that writability is unknown"
+    assert_eq "$(_fp "${dot}/settings.json")" "${before}" "${hook}: ... and the approved target is untouched"
+done
+plugin="${FAKE_HOME}/plugin-header.bash"
+printf '_extra_header_extras() { :; }\n' >"${plugin}"
+out="$(
+    cd "${WORK}" || exit 1
+    _load
+    AI_WRAPPER_EXTRA_PROFILE="${plugin}" _load_extra_profile
+    WRAPPER_FLAGS=()
+    AGY_SETTINGS_TRUSTED_PROFILE="${p}" AGY_SETTINGS_TRUSTED_TARGET="${dot}/settings.json" \
+        _agy_configure_sandbox_permissions "${p}" 2>&1 && echo CONFIGURED
+)"
+assert_contains "${out}" "CONFIGURED" "a plugin without bind hooks does not block the approval"
+
 # ---------------------------------------------------------------------------
 echo "-- deterministic race injection around the embedded helper"
 HELPER="${FAKE_HOME}/agy_host_helper.py"
@@ -506,7 +539,7 @@ awk 'index($0, "_agy_host_py() {") == 1 {f=1; next} f && $0 == "PY" {exit} f && 
 HARNESS_DIR="$(mktemp -d "${FAKE_HOME}/harness.XXXXXX")"
 cat >"${HARNESS_DIR}/inject.py" <<'PY'
 """Run the embedded helper with one os/sqlite3 call wrapped by a scenario."""
-import os, sqlite3, sys
+import fcntl, os, sqlite3, sys, time
 
 helper, scenario, swap_a, swap_b = sys.argv[1:5]
 state = {"calls": 0}
@@ -521,7 +554,33 @@ def concurrent_write(path, always):
             handle.write('{"writer": %d}\n' % state["calls"])
         os.utime(path, ns=(state["calls"] * 10**9, state["calls"] * 10**9))
 
-real_fsync, real_connect, real_open = os.fsync, sqlite3.connect, os.open
+real_fsync, real_connect, real_open, real_rename = os.fsync, sqlite3.connect, os.open, os.rename
+PROBE_PREFIX = "agy-sqlite-probe-"
+
+def profile_db(args):
+    """True for the helper's connect() of the profile database (not its probe)."""
+    return bool(args) and str(args[0]).startswith("file:conversation_summaries.db")
+
+class HookedConnection(sqlite3.Connection):
+    """Swap a path right before the helper's first UPDATE/DELETE statement."""
+    def execute(self, sql, *args):
+        if state["calls"] == 0 and sql.lstrip().upper().startswith(("UPDATE", "DELETE")):
+            state["calls"] += 1
+            if scenario == "sidecar-write":
+                os.symlink(swap_b, swap_a)
+            elif scenario == "ancestor-write":
+                swap_to_symlink(swap_a, swap_b)
+        return super().execute(sql, *args)
+
+def drop_probe_symlinks(args):
+    """Emulate an SQLite that follows symlinked sidecars: let probe writes succeed."""
+    path = str(args[0]) if args else ""
+    if PROBE_PREFIX not in path:
+        return
+    probe_dir = os.path.dirname(path.split("?", 1)[0].replace("file:", "", 1))
+    for entry in os.listdir(probe_dir):
+        if os.path.islink(os.path.join(probe_dir, entry)):
+            os.unlink(os.path.join(probe_dir, entry))
 
 def fsync(fd):
     real_fsync(fd)
@@ -534,9 +593,42 @@ def fsync(fd):
         swap_to_symlink(swap_a, swap_b)
 
 def connect(*args, **kwargs):
-    if scenario == "db-swap":
-        swap_to_symlink(swap_a, swap_b)
+    if scenario == "sqlite-follows":
+        drop_probe_symlinks(args)
+    elif profile_db(args):
+        if scenario == "db-swap":
+            swap_to_symlink(swap_a, swap_b)
+        elif scenario == "sidecar-connect":
+            os.symlink(swap_b, swap_a)
+        elif scenario in ("sidecar-write", "ancestor-write"):
+            kwargs["factory"] = HookedConnection
     return real_connect(*args, **kwargs)
+
+def rename(src, dst, *args, **kwargs):
+    """The boundary between the final re-check and the rename of a temp file."""
+    if "agy-tmp" in str(src):
+        if scenario == "lock-probe":
+            fd = os.open(swap_a, os.O_RDONLY)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                sys.stderr.write("BOUNDARY: lock free\n")
+            except BlockingIOError:
+                sys.stderr.write("BOUNDARY: lock held\n")
+            finally:
+                os.close(fd)
+        elif scenario == "boundary-writer":
+            with open(swap_a, "w") as handle:
+                handle.write('{"uncooperative": true}\n')
+    return real_rename(src, dst, *args, **kwargs)
+
+if scenario == "lock-busy":
+    # Another wrapper instance holds the lock and never releases it; a fake
+    # clock lets the helper reach its deadline without real waiting.
+    held_fd = os.open(swap_a, os.O_RDONLY)
+    fcntl.flock(held_fd, fcntl.LOCK_EX)
+    clock = [0.0]
+    time.monotonic = lambda: clock[0]
+    time.sleep = lambda seconds: clock.__setitem__(0, clock[0] + seconds)
 
 def open_(path, flags, *args, **kwargs):
     if scenario == "leaf-swap" and path == os.path.basename(swap_a) and kwargs.get("dir_fd") is not None \
@@ -545,9 +637,9 @@ def open_(path, flags, *args, **kwargs):
         swap_to_symlink(swap_a, swap_b)
     return real_open(path, flags, *args, **kwargs)
 
-os.fsync, sqlite3.connect, os.open = fsync, connect, open_
-# The wrapper forwards dir_fd, so advertise it like the real os.open.
-os.supports_dir_fd = set() if scenario == "no-dir-fd" else set(os.supports_dir_fd) | {open_}
+os.fsync, sqlite3.connect, os.open, os.rename = fsync, connect, open_, rename
+# The wrappers forward dir_fd, so advertise them like the real calls.
+os.supports_dir_fd = set() if scenario == "no-dir-fd" else set(os.supports_dir_fd) | {open_, rename}
 sys.argv = [helper] + sys.argv[5:]
 with open(helper) as handle:
     code = compile(handle.read(), helper, "exec")
@@ -607,6 +699,104 @@ echo keep >"${FAKE_HOME}/leafswap-target/file"
 out="$(_inject leaf-swap "${p}/antigravity-cli/brain/${CID}" "${FAKE_HOME}/leafswap-target" delete "${p}" "${CID}" 1000)"; rc=$?
 assert_eq "${rc}" "1" "artifact swap between check and removal fails"
 assert_eq "$(cat "${FAKE_HOME}/leafswap-target/file")" "keep" "artifact swap: ... and the symlink target is untouched"
+
+# SQLite sidecars are opened by SQLite, by path. A sidecar swapped for a
+# symlink after the pre-check, or a directory swapped mid-transaction, must
+# never let SQLite modify a file outside the profile.
+_walify() { python3 -I -c 'import sqlite3,sys;c=sqlite3.connect(sys.argv[1]);c.execute("PRAGMA journal_mode=WAL");c.close()' "${1}"; }
+victim="${FAKE_HOME}/sidecar-victim"
+for spec in "-journal:DELETE" "-wal:WAL" "-shm:WAL"; do
+    suffix="${spec%%:*}"; jmode="${spec#*:}"
+    p="$(_profile "sidecar${suffix}")"
+    db="${p}/antigravity-cli/conversation_summaries.db"
+    _mkdb "${db}" "${CID}" "Real"
+    [[ "${jmode}" == "WAL" ]] && _walify "${db}"
+    printf 'victim bytes\n' >"${victim}"
+    victim_fp="$(_fp "${victim}")"
+    out="$(_inject sidecar-connect "${db}${suffix}" "${victim}" rename "${p}" "${CID}" "pwned")"; rc=$?
+    assert_eq "${rc}" "1" "${suffix} swapped for a symlink before SQLite opens it: rename fails"
+    assert_eq "$(_fp "${victim}")" "${victim_fp}" "${suffix} swap at open: ... the external file's bytes are unchanged"
+    rm -f "${db}${suffix}"  # the planted link; SQLite (rightly) refuses to read past it
+    assert_eq "$(_dbtitle "${db}" "${CID}")" "Real" "${suffix} swap at open: ... and the title is not changed"
+done
+p="$(_profile sidecarwrite)"
+db="${p}/antigravity-cli/conversation_summaries.db"
+_mkdb "${db}" "${CID}" "Real"
+printf 'victim bytes\n' >"${victim}"
+victim_fp="$(_fp "${victim}")"
+out="$(_inject sidecar-write "${db}-journal" "${victim}" rename "${p}" "${CID}" "pwned")"; rc=$?
+assert_eq "${rc}" "1" "-journal swapped for a symlink right before the UPDATE: rename fails"
+assert_eq "$(_fp "${victim}")" "${victim_fp}" "-journal swap at write: ... the external file's bytes are unchanged"
+rm -f "${db}-journal"  # the planted link; SQLite (rightly) refuses to read past it
+assert_eq "$(_dbtitle "${db}" "${CID}")" "Real" "-journal swap at write: ... and the title is not changed"
+
+# antigravity-cli/ swapped for a symlink to a directory holding same-named
+# sidecar files, right before the write: nothing there may change.
+for spec in "rename:DELETE" "delete:DELETE" "rename:WAL"; do
+    op="${spec%%:*}"; jmode="${spec#*:}"
+    p="$(_profile "ancestor-${op}-${jmode}")"
+    db="${p}/antigravity-cli/conversation_summaries.db"
+    _mkdb "${db}" "${CID}" "Real"
+    [[ "${jmode}" == "WAL" ]] && _walify "${db}"
+    mkdir -p "${p}/antigravity-cli/brain/${CID}"
+    att="${FAKE_HOME}/ancestor-attacker-${op}-${jmode}"
+    mkdir -p "${att}"
+    for suffix in -journal -wal -shm; do printf 'victim bytes\n' >"${att}/conversation_summaries.db${suffix}"; done
+    att_fp="$(_fp "${att}")$(cat "${att}"/conversation_summaries.db-*)"
+    if [[ "${op}" == "rename" ]]; then
+        out="$(_inject ancestor-write "${p}/antigravity-cli" "${att}" rename "${p}" "${CID}" "pwned")"; rc=$?
+    else
+        out="$(_inject ancestor-write "${p}/antigravity-cli" "${att}" delete "${p}" "${CID}" 1000)"; rc=$?
+    fi
+    assert_eq "${rc}" "1" "antigravity-cli swapped mid-${op} (${jmode}): fails"
+    assert_eq "$(_fp "${att}")$(cat "${att}"/conversation_summaries.db-*)" "${att_fp}" \
+        "antigravity-cli swap mid-${op} (${jmode}): ... same-named sidecars in the swapped-in dir are untouched"
+    assert_eq "$(_is test -d "${p}/antigravity-cli.moved/brain/${CID}")" "yes" \
+        "antigravity-cli swap mid-${op} (${jmode}): ... and no artifact is removed"
+done
+
+# An SQLite that would follow a symlinked sidecar is refused before the
+# profile database is opened.
+p="$(_profile sqlitefollows)"
+db="${p}/antigravity-cli/conversation_summaries.db"
+_mkdb "${db}" "${CID}" "Real"
+mkdir -p "${p}/antigravity-cli/brain/${CID}"
+out="$(_inject sqlite-follows - - rename "${p}" "${CID}" "pwned")"; rc=$?
+assert_eq "${rc}" "1" "SQLite following symlinked sidecars: rename fails closed"
+assert_contains "${out}" "refusing to open the AGY conversation database" "SQLite following symlinked sidecars: ... with an explicit error"
+assert_eq "$(_dbtitle "${db}" "${CID}")" "Real" "SQLite following symlinked sidecars: ... the database is untouched"
+assert_eq "$(_is test -e "${p}/antigravity-cli/brain/${CID}/.wrapper_title")" "no" "SQLite following symlinked sidecars: ... and no title is written"
+assert_eq "$(ls -d "${TMPDIR:-/tmp}"/agy-sqlite-probe-* 2>/dev/null | wc -l | tr -d ' ')" "0" "SQLite probe leaves no temp dirs behind"
+
+# Write coordination: every wrapper instance holds a lock on the written
+# directory across read -> final re-check -> rename.
+p="$(_profile lockprobe)"
+printf '{"a":1}\n' >"${p}/antigravity-cli/settings.json"
+out="$(_inject lock-probe "${p}/antigravity-cli" - settings "${p}" "${WORK}" "${FAKE_HOME}" "" "" "")"; rc=$?
+assert_eq "${rc}" "0" "settings update with the boundary probe succeeds (${out})"
+assert_contains "${out}" "BOUNDARY: lock held" "settings: a cooperating wrapper cannot write between the final re-check and rename"
+mkdir -p "${p}/antigravity-cli/brain/${CID}"
+out="$(_inject lock-probe "${p}/antigravity-cli/brain/${CID}" - rename "${p}" "${CID}" "Locked")"; rc=$?
+assert_eq "${rc}" "0" "title rename with the boundary probe succeeds (${out})"
+assert_contains "${out}" "BOUNDARY: lock held" "title: a cooperating wrapper cannot write between the final re-check and rename"
+
+p="$(_profile lockbusy)"
+printf '{"a":1}\n' >"${p}/antigravity-cli/settings.json"
+before="$(_fp "${p}/antigravity-cli/settings.json")"
+out="$(_inject lock-busy "${p}/antigravity-cli" - settings "${p}" "${WORK}" "${FAKE_HOME}" "" "" "")"; rc=$?
+assert_eq "${rc}" "1" "lock never released by another wrapper: settings update fails closed"
+assert_contains "${out}" "locked by another update" "lock never released: ... explaining why"
+assert_eq "$(_fp "${p}/antigravity-cli/settings.json")" "${before}" "lock never released: ... settings.json untouched"
+
+# Documented residual (B-μ): the lock is advisory, and a check followed by
+# rename is not a compare-and-swap. A process that does not take the lock
+# and writes exactly between the final re-check and rename loses its write.
+# Pinned so the documentation stays accurate if this ever changes.
+p="$(_profile boundarywriter)"
+printf '{"a":1}\n' >"${p}/antigravity-cli/settings.json"
+out="$(_inject boundary-writer "${p}/antigravity-cli/settings.json" - settings "${p}" "${WORK}" "${FAKE_HOME}" "" "" "")"; rc=$?
+assert_eq "${rc}" "0" "residual: non-locking writer at the re-check/rename boundary is not detected"
+assert_not_contains "$(cat "${p}/antigravity-cli/settings.json")" "uncooperative" "residual: ... and its write is lost (documented in B-μ)"
 
 # Platforms without dir_fd / O_NOFOLLOW support fail closed.
 p="$(_profile nocap)"

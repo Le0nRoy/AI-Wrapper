@@ -69,14 +69,20 @@ _agy_list_account_profiles() {
 #     antigravity-cli/, brain/, conversations/, database or title file is
 #     refused instead of followed;
 #   - files are replaced via an O_EXCL temp file + rename in the verified
-#     directory, after re-checking the file and parent are unchanged.
+#     directory, after re-checking the file and parent are unchanged, while
+#     holding an advisory flock on that directory (serialises wrapper
+#     instances; non-cooperating writers are not blocked, see B-μ);
+#   - before any profile database is opened, a probe in a private temp dir
+#     proves the linked SQLite refuses symlinked -journal/-wal/-shm files and
+#     refuses to write once the database path has moved; otherwise the
+#     SQLite operation is refused before it starts.
 # Platforms lacking dir_fd/O_NOFOLLOW support fail closed. Python 3 is
 # required for every mutating operation; there is no jq/sqlite3 fallback
 # because neither can enforce the same boundary.
 # Usage: _agy_host_py <list|rename|delete|settings> ARGS...
 _agy_host_py() {
     python3 -I - "$@" <<'PY'
-import errno, json, os, re, secrets, signal, sqlite3, stat, sys, traceback
+import contextlib, errno, fcntl, json, os, re, secrets, shutil, signal, sqlite3, stat, sys, tempfile, time, traceback
 from urllib.parse import unquote, urlparse
 
 CLI_DIR_NAME = "antigravity-cli"
@@ -88,6 +94,10 @@ MAX_TITLE_BYTES = 4096
 NEW_FILE_MODE = 0o600
 NEW_DIR_MODE = 0o777  # narrowed by the umask, like `mkdir -p`
 SETTINGS_WRITE_ATTEMPTS = 3
+WRITE_LOCK_TIMEOUT_SECONDS = 10
+WRITE_LOCK_POLL_SECONDS = 0.05
+SQLITE_PROBE_PREFIX = "agy-sqlite-probe-"
+SQLITE_PROBE_CANARY = b"agy sqlite probe canary\n"
 CID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 CREDENTIAL_DIRS = (
     ".ssh", ".gnupg", ".aws", ".kube", ".docker", ".colima", ".netrc", ".npmrc",
@@ -228,10 +238,39 @@ def unchanged(current, expected):
             and current.st_mtime_ns == expected.st_mtime_ns)
 
 
+@contextlib.contextmanager
+def dir_write_lock(dir_fd, display):
+    """Hold an exclusive advisory flock on `dir_fd` for a read-modify-replace.
+    Every wrapper instance takes it, so two wrappers never interleave their
+    updates. It is advisory: a process that does not take it (agy itself, a
+    sandboxed agent) is not blocked. A holder that never releases it makes
+    the update fail after WRITE_LOCK_TIMEOUT_SECONDS instead of proceeding."""
+    deadline = time.monotonic() + WRITE_LOCK_TIMEOUT_SECONDS
+    while True:
+        try:
+            fcntl.flock(dir_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise Refused("%s is locked by another update (waited %ds); not modifying it"
+                              % (display, WRITE_LOCK_TIMEOUT_SECONDS))
+            time.sleep(WRITE_LOCK_POLL_SECONDS)
+        except OSError as exc:
+            raise Refused("cannot lock %s (%s); refusing to update it without coordinating writers"
+                          % (display, exc.strerror or exc))
+    try:
+        yield
+    finally:
+        fcntl.flock(dir_fd, fcntl.LOCK_UN)
+
+
 def atomic_replace(dir_fd, name, data, expected, display, verify_parent):
     """Write `data` to a fresh O_EXCL temp file in `dir_fd` and rename it over
-    `name`. Refuses when `name` no longer matches `expected` (None = absent),
-    so a concurrent writer's update is reported instead of silently lost."""
+    `name`. Refuses when `name` no longer matches `expected` (None = absent)
+    at the final re-check. This is not a compare-and-swap: a write by a
+    process that does not hold dir_write_lock() landing between that
+    re-check and the rename is lost (documented in B-μ). Callers hold
+    dir_write_lock(dir_fd) across the read and this call."""
     mode = stat.S_IMODE(expected.st_mode) & 0o777 if expected is not None else NEW_FILE_MODE
     tmp_name = ".%s.agy-tmp-%s" % (name, secrets.token_hex(8))
     tmp_fd = os.open(tmp_name, TEMP_CREATE_FLAGS, NEW_FILE_MODE, dir_fd=dir_fd)
@@ -294,6 +333,86 @@ def verify_sqlite_opened(held_fd, expected):
     raise Refused("SQLite opened a different file than the verified database (path replaced concurrently?)")
 
 
+def probe_sqlite_case(root, name, journal_mode, sidecar):
+    """One probe: does this SQLite write through a symlinked `sidecar`
+    (or, with sidecar=None, write after the database path moved)?
+    Returns a description of the unsafe behaviour, or None."""
+    case_dir = os.path.join(root, name)
+    os.mkdir(case_dir, 0o700)
+    db_path = os.path.join(case_dir, "probe.db")
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA journal_mode=%s" % journal_mode)
+    conn.execute("CREATE TABLE t (x)")
+    conn.commit()
+    conn.close()
+    canary = os.path.join(root, name + ".canary")
+    with open(canary, "wb") as handle:
+        handle.write(SQLITE_PROBE_CANARY)
+    swapped_in = os.path.join(root, name + ".swapped-in")
+    if sidecar is not None:
+        os.symlink(canary, db_path + sidecar)
+    conn = None
+    wrote = False
+    try:
+        conn = sqlite3.connect("file:%s?mode=rw" % db_path, uri=True)
+        conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+        if sidecar is None:
+            # Move the directory away and plant a symlink to another one,
+            # as a concurrent same-UID process could do mid-transaction.
+            os.rename(case_dir, case_dir + ".moved")
+            os.mkdir(swapped_in, 0o700)
+            os.symlink(swapped_in, case_dir)
+        with conn:
+            conn.execute("INSERT INTO t VALUES (1)")
+        wrote = True
+    except sqlite3.Error:
+        pass
+    finally:
+        if conn is not None:
+            conn.close()
+    with open(canary, "rb") as handle:
+        if handle.read() != SQLITE_PROBE_CANARY:
+            return "writes through a symlinked %s file" % sidecar
+    if sidecar is None:
+        if os.listdir(swapped_in):
+            return "creates rollback-journal files in a directory swapped in for the database's"
+        if wrote:
+            return "keeps writing after the database path moved"
+    elif wrote or not os.path.islink(db_path + sidecar):
+        return "accepts a symlinked %s file" % sidecar
+    return None
+
+
+SQLITE_PROBE_CASES = (
+    ("journal", "DELETE", "-journal"),
+    ("wal", "WAL", "-wal"),
+    ("shm", "WAL", "-shm"),
+    ("moved", "DELETE", None),
+)
+_sqlite_probe_passed = []
+
+
+def require_safe_sqlite():
+    """Refuse unless this SQLite build refuses symlinked -journal/-wal/-shm
+    files (it opens them by path, with O_NOFOLLOW) and refuses writes once
+    the database path has moved (SQLITE_READONLY_DBMOVED). Both are SQLite
+    behaviours the helper cannot enforce itself, so they are proven on the
+    running library, in a private temp dir, before any profile database is
+    opened."""
+    if _sqlite_probe_passed:
+        return
+    root = tempfile.mkdtemp(prefix=SQLITE_PROBE_PREFIX)
+    try:
+        for name, journal_mode, sidecar in SQLITE_PROBE_CASES:
+            problem = probe_sqlite_case(root, name, journal_mode, sidecar)
+            if problem:
+                raise Refused("the SQLite library in use (%s) %s; refusing to open the AGY conversation database"
+                              % (sqlite3.sqlite_version, problem))
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    _sqlite_probe_passed.append(True)
+
+
 class Profile:
     """The resolved selected profile, opened without following symlinks."""
 
@@ -326,6 +445,7 @@ def open_database(profile, cli_fd, readonly, timeout):
         raise Refused("refusing symlinked database %s" % db_display)
     if not stat.S_ISREG(st.st_mode):
         raise Refused("%s is not a regular file" % db_display)
+    require_safe_sqlite()
     for suffix in SQLITE_SIDECAR_SUFFIXES:
         side = leaf_stat(cli_fd, DB_NAME + suffix)
         if side is not None and not stat.S_ISREG(side.st_mode):
@@ -340,7 +460,11 @@ def open_database(profile, cli_fd, readonly, timeout):
     if not same_file(held_st, st):
         os.close(held_fd)
         raise Refused("%s was replaced while it was being opened" % db_display)
-    # Relative to the verified directory; SQLite resolves it via getcwd().
+    # Relative to the verified directory; SQLite resolves it via getcwd() and
+    # opens the sidecars by path. A sidecar swapped for a symlink after the
+    # check above is refused by SQLite itself (no-follow open), and a
+    # directory swapped mid-transaction makes SQLite refuse the write
+    # (database moved); require_safe_sqlite() proved both on this library.
     os.fchdir(cli_fd)
     conn = sqlite3.connect("file:%s?mode=%s" % (DB_NAME, "ro" if readonly else "rw"),
                            uri=True, timeout=timeout)
@@ -559,11 +683,13 @@ def cmd_rename(profile_dir, cid, new_title):
         conv_fd = open_child_dir(brain_fd, cid, conv_path, create=True)
     if conv_fd is None:
         return 0
-    expected = None
-    if title_st is not None:
-        _, expected = read_regular(conv_fd, TITLE_NAME, title_path, expected=title_st)
-    atomic_replace(conv_fd, TITLE_NAME, (new_title + "\n").encode("utf-8"), expected, title_path,
-                   lambda: verify_dir_still_at(conv_path, conv_fd))
+    with dir_write_lock(conv_fd, conv_path):
+        expected = None
+        title_st = leaf_stat(conv_fd, TITLE_NAME)
+        if title_st is not None:
+            _, expected = read_regular(conv_fd, TITLE_NAME, title_path, expected=title_st)
+        atomic_replace(conv_fd, TITLE_NAME, (new_title + "\n").encode("utf-8"), expected, title_path,
+                       lambda: verify_dir_still_at(conv_path, conv_fd))
     return 0
 
 
@@ -701,16 +827,17 @@ def update_settings_once(profile, cli_fd, workdir, home, trust_profile, trust_ta
         dir_fd, name, display, dir_path = trusted_settings_target(
             profile, cli_fd, home, trust_profile, trust_target, trust_refusal)
         verify_parent = lambda: verify_dir_still_at(dir_path, dir_fd)  # noqa: E731
-        st = leaf_stat(dir_fd, name)
     elif st is None or stat.S_ISREG(st.st_mode):
         dir_fd, name, display = cli_fd, SETTINGS_NAME, settings_path
         verify_parent = lambda: profile.verify_cli(cli_fd)  # noqa: E731
     else:
         raise Refused("%s exists but is not a regular file." % settings_path)
-    raw, expected = None, None
-    if st is not None:
-        raw, expected = read_regular(dir_fd, name, display, expected=st)
-    atomic_replace(dir_fd, name, merge_settings(raw, workdir, display), expected, display, verify_parent)
+    with dir_write_lock(dir_fd, display):
+        st = leaf_stat(dir_fd, name)
+        raw, expected = None, None
+        if st is not None:
+            raw, expected = read_regular(dir_fd, name, display, expected=st)
+        atomic_replace(dir_fd, name, merge_settings(raw, workdir, display), expected, display, verify_parent)
 
 
 def cmd_settings(profile_dir, workdir, home, trust_profile, trust_target, trust_refusal):
@@ -1196,6 +1323,11 @@ _agy_canonical_path() {
     printf '%s%s' "${resolved%/}" "${rest}"
 }
 
+# Plugin hooks that run after the trust decision and can add RW binds
+# (_extra_post_menu_setup to WRAPPER_FLAGS, _extra_sandbox_setup to the
+# final bwrap/Seatbelt bind lists). What they expose is unknown until launch.
+_AGY_LATE_BIND_HOOKS=(_extra_post_menu_setup _extra_sandbox_setup)
+
 # Succeeds when PATH (canonicalized) lies inside a location the sandbox
 # exposes read-write: WORKDIR, the profile dir, the wrapper's fixed RW binds,
 # AI_SANDBOX_EXTRA_RW_DIRS, every --bind already in WRAPPER_FLAGS, and the
@@ -1204,7 +1336,8 @@ _agy_path_sandbox_writable() {
     local path profile_dir="${2}" root
     path="$(_agy_canonical_path "${1}")"
     local -a roots=("$(pwd -P)" "${profile_dir}" "${HOME}/bin" "${HOME}/.kind"
-        "${HOME}/kind_dot_kube" "${HOME}/ai-wrapper/.agents")
+        "${HOME}/kind_dot_kube" "${HOME}/ai-wrapper/.agents" "${HOME}/Android"
+        "${XDG_RUNTIME_DIR:-}")
     local -a flags=(${WRAPPER_FLAGS[@]+"${WRAPPER_FLAGS[@]}"})
     local i
     for (( i = 0; i < ${#flags[@]}; i++ )); do
@@ -1261,8 +1394,14 @@ _agy_configure_sandbox_permissions() {
     trust_profile="$(_agy_expand_tilde "${AGY_SETTINGS_TRUSTED_PROFILE:-}")"
     trust_target="$(_agy_expand_tilde "${AGY_SETTINGS_TRUSTED_TARGET:-}")"
     if [[ -n "${trust_profile}" || -n "${trust_target}" ]]; then
+        local hook late_hook=""
+        for hook in "${_AGY_LATE_BIND_HOOKS[@]}"; do
+            declare -f "${hook}" >/dev/null 2>&1 && late_hook="${hook}" && break
+        done
         if [[ -z "${trust_profile}" || -z "${trust_target}" ]]; then
             trust_refusal="AGY_SETTINGS_TRUSTED_PROFILE and AGY_SETTINGS_TRUSTED_TARGET must both be set"
+        elif [[ -n "${late_hook}" ]]; then
+            trust_refusal="the AI_WRAPPER_EXTRA_PROFILE plugin defines ${late_hook}, which can add sandbox binds after this check, so whether the preset directory is writable inside the sandbox cannot be determined"
         elif ! preset_dir="$(dirname "$(_preset_autosave_path)")"; then
             trust_refusal="the per-workdir preset location cannot be determined"
         elif _agy_path_sandbox_writable "${preset_dir}" "${profile_dir}"; then
