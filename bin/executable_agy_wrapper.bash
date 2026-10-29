@@ -16,8 +16,9 @@
 #   ~/.gemini-<name>/ (bound at ~/.gemini) instead of the default ~/.gemini,
 #   or pick "Account profile" from the s) Settings menu
 # - Full autonomy inside the OS sandbox: passes `--dangerously-skip-permissions`
-#   and configures `antigravity-cli/settings.json` with `always-proceed` tool
-#   and artifact policies, workspace trust, and outer-sandbox compatibility
+#   and checks (read-only) that `antigravity-cli/settings.json` has
+#   `always-proceed` tool and artifact policies, workspace trust, and
+#   outer-sandbox compatibility; the launch fails with instructions otherwise
 # - Git worktree support (shared .git bound RW), glab config bind when
 #   AI_SANDBOX_PASS_GITLAB=1, AI_WRAPPER_EXTRA_PROFILE plugin hooks
 

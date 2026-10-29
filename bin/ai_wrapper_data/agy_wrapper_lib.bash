@@ -60,24 +60,25 @@ _agy_list_account_profiles() {
 }
 
 # Host-side filesystem helper for the operations above the OS sandbox:
-# conversation listing/rename/delete and settings.json updates. It runs on
-# the host before the sandbox exists, so:
+# conversation listing/rename/delete and read-only settings.json validation.
+# It runs on the host before the sandbox exists, so:
 #   - `python3 -I` keeps the CWD (a possibly hostile checkout), PYTHONPATH and
 #     user site-packages off sys.path: a checkout `json.py` never executes;
 #   - every path under the resolved profile is opened component by component
 #     with O_NOFOLLOW and directory-relative (*at) calls, so a symlinked
 #     antigravity-cli/, brain/, conversations/, database or title file is
 #     refused instead of followed;
-#   - files are replaced via an O_EXCL temp file + rename in the verified
-#     directory, after re-checking the file and parent are unchanged, while
-#     holding an advisory flock on that directory (serialises wrapper
+#   - settings.json is only read and checked, never created or rewritten;
+#   - the rename title file is replaced via an O_EXCL temp file + rename in
+#     the verified directory, after re-checking the file and parent are
+#     unchanged, while holding an advisory flock on that directory (serialises wrapper
 #     instances; non-cooperating writers are not blocked, see B-μ);
 #   - before any profile database is opened, a probe in a private temp dir
 #     proves the linked SQLite refuses symlinked -journal/-wal/-shm files and
 #     refuses to write once the database path has moved; otherwise the
 #     SQLite operation is refused before it starts.
 # Platforms lacking dir_fd/O_NOFOLLOW support fail closed. Python 3 is
-# required for every mutating operation; there is no jq/sqlite3 fallback
+# required for every operation but listing; there is no jq/sqlite3 fallback
 # because neither can enforce the same boundary.
 # Usage: _agy_host_py <list|rename|delete|settings> ARGS...
 _agy_host_py() {
@@ -93,12 +94,20 @@ SETTINGS_NAME = "settings.json"
 MAX_TITLE_BYTES = 4096
 NEW_FILE_MODE = 0o600
 NEW_DIR_MODE = 0o777  # narrowed by the umask, like `mkdir -p`
-SETTINGS_WRITE_ATTEMPTS = 3
 WRITE_LOCK_TIMEOUT_SECONDS = 10
 WRITE_LOCK_POLL_SECONDS = 0.05
 SQLITE_PROBE_PREFIX = "agy-sqlite-probe-"
 SQLITE_PROBE_CANARY = b"agy sqlite probe canary\n"
 CID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+# (key, required value, why the sandboxed launch needs it)
+REQUIRED_SETTINGS = (
+    ("toolPermission", "always-proceed", "tool calls must not block on approval prompts"),
+    ("artifactReviewPolicy", "always-proceed", "artifact edits must not block on review prompts"),
+    ("allowNonWorkspaceAccess", True,
+     "sandbox-bound paths outside the workspace (/tmp, ~/bin, extra dirs) must be reachable"),
+    ("enableTerminalSandbox", False, "agy's nested terminal sandbox conflicts with the outer OS sandbox"),
+)
+TRUSTED_WORKSPACES_KEY = "trustedWorkspaces"
 CREDENTIAL_DIRS = (
     ".ssh", ".gnupg", ".aws", ".kube", ".docker", ".colima", ".netrc", ".npmrc",
     ".pypirc", ".config/gcloud", ".config/glab-cli", ".local/share/glab-cli",
@@ -264,13 +273,15 @@ def dir_write_lock(dir_fd, display):
         fcntl.flock(dir_fd, fcntl.LOCK_UN)
 
 
-def atomic_replace(dir_fd, name, data, expected, display, verify_parent):
+def atomic_replace(dir_fd, name, data, expected, display, verify_parent, before_commit=None):
     """Write `data` to a fresh O_EXCL temp file in `dir_fd` and rename it over
-    `name`. Refuses when `name` no longer matches `expected` (None = absent)
-    at the final re-check. This is not a compare-and-swap: a write by a
-    process that does not hold dir_write_lock() landing between that
-    re-check and the rename is lost (documented in B-μ). Callers hold
-    dir_write_lock(dir_fd) across the read and this call."""
+    `name`. `before_commit` runs once the temp file is written, so a failure
+    to write here is reported before it makes any other change. Refuses when
+    `name` no longer matches `expected` (None = absent) at the final
+    re-check. This is not a compare-and-swap: a write by a process that does
+    not hold dir_write_lock() landing between that re-check and the rename
+    is lost (documented in B-μ). Callers hold dir_write_lock(dir_fd) across
+    the read and this call."""
     mode = stat.S_IMODE(expected.st_mode) & 0o777 if expected is not None else NEW_FILE_MODE
     tmp_name = ".%s.agy-tmp-%s" % (name, secrets.token_hex(8))
     tmp_fd = os.open(tmp_name, TEMP_CREATE_FLAGS, NEW_FILE_MODE, dir_fd=dir_fd)
@@ -281,6 +292,8 @@ def atomic_replace(dir_fd, name, data, expected, display, verify_parent):
             handle.flush()
             os.fchmod(handle.fileno(), mode)
             os.fsync(handle.fileno())
+        if before_commit is not None:
+            before_commit()
         if not unchanged(leaf_stat(dir_fd, name), expected):
             raise ConcurrentChange("%s changed while it was being updated; not overwriting it" % display)
         verify_parent()
@@ -655,13 +668,31 @@ def check_cid(cid):
         raise Refused("invalid conversation ID: %r" % cid)
 
 
+def update_index_title(conn, db_path, cid, new_title):
+    """Set the index title; returns the number of rows changed."""
+    try:
+        with conn:
+            cur = conn.execute("UPDATE conversation_summaries SET title = ? WHERE conversation_id = ?",
+                               (new_title, cid))
+    except sqlite3.Error as exc:
+        raise Refused("cannot update the title in %s: %s" % (db_path, exc))
+    finally:
+        conn.close()
+    return cur.rowcount
+
+
 def cmd_rename(profile_dir, cid, new_title):
+    """Rename in the index (when present) and in brain/<cid>/.wrapper_title,
+    which the picker shows in preference to the index title. Every path is
+    validated, and the title directory locked and its temp file written,
+    before the index is changed."""
     check_cid(cid)
     profile = Profile(profile_dir)
     cli_fd = profile.cli()
     brain_path = os.path.join(profile.cli_path, "brain")
     conv_path = os.path.join(brain_path, cid)
     title_path = os.path.join(conv_path, TITLE_NAME)
+    db_path = os.path.join(profile.cli_path, DB_NAME)
     brain_fd = open_child_dir(cli_fd, "brain", brain_path) if cli_fd is not None else None
     conv_fd = open_child_dir(brain_fd, cid, conv_path) if brain_fd is not None else None
     title_st = leaf_stat(conv_fd, TITLE_NAME) if conv_fd is not None else None
@@ -671,25 +702,39 @@ def cmd_rename(profile_dir, cid, new_title):
     conn = None
     if cli_fd is not None:
         conn, _ = open_database(profile, cli_fd, readonly=False, timeout=5)
-    if conn is not None:
-        with conn:
-            conn.execute("UPDATE conversation_summaries SET title = ? WHERE conversation_id = ?",
-                         (new_title, cid))
-        conn.close()
+    if conn is not None and conv_fd is None:
+        # No conversation dir, so no title file can override the index.
+        if update_index_title(conn, db_path, cid, new_title) == 0:
+            raise Refused("conversation %s is not in %s and has no %s; nothing was renamed"
+                          % (cid, db_path, conv_path))
         profile.verify_cli(cli_fd)
-    elif conv_fd is None:
+        return 0
+    if conv_fd is None:
         cli_fd = profile.cli(create=True)
         brain_fd = open_child_dir(cli_fd, "brain", brain_path, create=True)
         conv_fd = open_child_dir(brain_fd, cid, conv_path, create=True)
-    if conv_fd is None:
-        return 0
-    with dir_write_lock(conv_fd, conv_path):
-        expected = None
-        title_st = leaf_stat(conv_fd, TITLE_NAME)
-        if title_st is not None:
-            _, expected = read_regular(conv_fd, TITLE_NAME, title_path, expected=title_st)
-        atomic_replace(conv_fd, TITLE_NAME, (new_title + "\n").encode("utf-8"), expected, title_path,
-                       lambda: verify_dir_still_at(conv_path, conv_fd))
+
+    def update_index():
+        if conn is not None:
+            update_index_title(conn, db_path, cid, new_title)
+            profile.verify_cli(cli_fd)
+            index_updated.append(True)
+
+    index_updated = []
+    try:
+        with dir_write_lock(conv_fd, conv_path):
+            expected = None
+            title_st = leaf_stat(conv_fd, TITLE_NAME)
+            if title_st is not None:
+                _, expected = read_regular(conv_fd, TITLE_NAME, title_path, expected=title_st)
+            atomic_replace(conv_fd, TITLE_NAME, (new_title + "\n").encode("utf-8"), expected, title_path,
+                           lambda: verify_dir_still_at(conv_path, conv_fd), before_commit=update_index)
+    except (Refused, OSError) as exc:
+        reason = exc if isinstance(exc, Refused) else "cannot write %s: %s" % (title_path, exc.strerror or exc)
+        if index_updated:
+            reason = "%s (the title in %s was already updated, but the picker shows %s, which still holds the old title)" \
+                % (reason, db_path, title_path)
+        raise Refused(reason)
     return 0
 
 
@@ -752,26 +797,90 @@ def cmd_delete(profile_dir, cid, busy_timeout_ms):
     return 0 if ok else 1
 
 
-def merge_settings(raw, workdir, display):
-    data = {}
-    if raw is not None and raw.strip():
-        try:
-            data = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, ValueError) as exc:
-            raise Refused("%s is not valid JSON (%s); refusing to overwrite it. Fix or remove the file." % (display, exc))
-        if not isinstance(data, dict):
-            raise Refused("%s does not hold a JSON object; refusing to overwrite it. Fix or remove the file." % display)
-    data["toolPermission"] = "always-proceed"
-    data["artifactReviewPolicy"] = "always-proceed"
-    data["allowNonWorkspaceAccess"] = True
-    data["enableTerminalSandbox"] = False
-    trusted = data.get("trustedWorkspaces")
+def workspace_path(entry):
+    if not isinstance(entry, str) or not entry:
+        return None
+    if entry.startswith("file://"):
+        entry = unquote(urlparse(entry).path)
+    return os.path.normpath(entry)
+
+
+def settings_problems(data, workdir):
+    """Human-readable list of what `data` lacks for a sandboxed launch."""
+    problems = []
+    for key, required, why in REQUIRED_SETTINGS:
+        if key not in data:
+            problems.append("%s is missing; required: %s (%s)" % (json.dumps(key), json.dumps(required), why))
+        elif data[key] != required or type(data[key]) is not type(required):
+            problems.append("%s is %s; required: %s (%s)"
+                            % (json.dumps(key), json.dumps(data[key]), json.dumps(required), why))
+    trusted = data.get(TRUSTED_WORKSPACES_KEY)
     if not isinstance(trusted, list):
-        trusted = []
-    if workdir not in trusted:
+        problems.append("%s is %s; required: a list that includes %s (agy must not prompt for workspace trust)"
+                        % (json.dumps(TRUSTED_WORKSPACES_KEY),
+                           "missing" if trusted is None else "not a list", json.dumps(workdir)))
+    elif workdir not in [workspace_path(entry) for entry in trusted]:
+        problems.append("%s does not include the current workspace %s (agy must not prompt for workspace trust)"
+                        % (json.dumps(TRUSTED_WORKSPACES_KEY), json.dumps(workdir)))
+    return problems
+
+
+def required_settings_snippet(data, workdir):
+    trusted = data.get(TRUSTED_WORKSPACES_KEY)
+    trusted = list(trusted) if isinstance(trusted, list) else []
+    if workdir not in [workspace_path(entry) for entry in trusted]:
         trusted.append(workdir)
-    data["trustedWorkspaces"] = trusted
-    return (json.dumps(data, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    snippet = dict((key, required) for key, required, _why in REQUIRED_SETTINGS)
+    snippet[TRUSTED_WORKSPACES_KEY] = trusted
+    return json.dumps(snippet, indent=2, ensure_ascii=False)
+
+
+def settings_refusal(display, edit_path, headline, problems, data, workdir):
+    lines = ["%s: %s" % (display, headline)]
+    lines += ["  - " + problem for problem in problems]
+    lines.append("The wrapper only reads this file; it never creates or edits it. %s %s so that it contains"
+                 " (keep your other settings), then relaunch the wrapper:"
+                 % ("Edit" if data is not None else "Create", edit_path))
+    lines.append(required_settings_snippet(data or {}, workdir))
+    return Refused("\n".join(lines))
+
+
+def cmd_settings(profile_dir, workdir, home, trust_profile, trust_target, trust_refusal):
+    """Read-only check that settings.json allows an unattended sandboxed
+    launch in `workdir`. Never creates, rewrites, chmods or replaces the file
+    (or an approved symlink target), and never creates its parent."""
+    workdir = os.path.normpath(workdir)
+    profile = Profile(profile_dir)
+    settings_path = os.path.join(profile.cli_path, SETTINGS_NAME)
+    cli_fd = profile.cli()
+    if cli_fd is None:
+        headline = "does not exist (nor does its directory %s/; create that first)" % profile.cli_path
+        raise settings_refusal(settings_path, settings_path, headline, [], None, workdir)
+    st = leaf_stat(cli_fd, SETTINGS_NAME)
+    if st is not None and stat.S_ISLNK(st.st_mode):
+        dir_fd, name, edit_path = trusted_settings_target(
+            profile, cli_fd, home, trust_profile, trust_target, trust_refusal)
+        display = "%s (-> %s)" % (settings_path, edit_path)
+    elif st is None or stat.S_ISREG(st.st_mode):
+        dir_fd, name, display, edit_path = cli_fd, SETTINGS_NAME, settings_path, settings_path
+    else:
+        raise Refused("%s exists but is not a regular file; replace it with a JSON settings file." % settings_path)
+    raw, _ = read_regular(dir_fd, name, display)
+    if raw is None:
+        raise settings_refusal(display, edit_path, "does not exist", [], None, workdir)
+    try:
+        data = json.loads(raw.decode("utf-8")) if raw.strip() else {}
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise Refused("%s is not valid JSON (%s). Fix the file by hand (the wrapper never creates or edits it), "
+                      "then relaunch the wrapper." % (display, exc))
+    if not isinstance(data, dict):
+        raise Refused("%s does not hold a JSON object. Fix the file by hand (the wrapper never creates or edits it), "
+                      "then relaunch the wrapper." % display)
+    problems = settings_problems(data, workdir)
+    if problems:
+        raise settings_refusal(display, edit_path, "not ready for a sandboxed agy launch:",
+                               problems, data, workdir)
+    return 0
 
 
 def is_canonical(path):
@@ -779,8 +888,8 @@ def is_canonical(path):
 
 
 def trusted_settings_target(profile, cli_fd, home, trust_profile, trust_target, trust_refusal):
-    """Resolve the approved write target for a symlinked settings.json.
-    Returns (dir_fd, name, display, dir_path)."""
+    """Resolve the approved target of a symlinked settings.json (read only).
+    Returns (dir_fd, name, path)."""
     settings_path = os.path.join(profile.cli_path, SETTINGS_NAME)
     link = os.readlink(SETTINGS_NAME, dir_fd=cli_fd)
     hint = ("Approve exactly this profile and target via the Settings menu "
@@ -790,7 +899,7 @@ def trusted_settings_target(profile, cli_fd, home, trust_profile, trust_target, 
         raise Refused("%s is a symlink and its trusted-target approval cannot be used: %s"
                       % (settings_path, trust_refusal))
     if not trust_profile or not trust_target:
-        raise Refused("%s is a symlink (-> %s); refusing to write through it. %s" % (settings_path, link, hint))
+        raise Refused("%s is a symlink (-> %s); refusing to read through it. %s" % (settings_path, link, hint))
     if trust_profile != profile.path:
         raise Refused("%s is a symlink, but the trusted-target approval is for profile %s, not the selected profile %s. %s"
                       % (settings_path, trust_profile, profile.path, hint))
@@ -799,58 +908,25 @@ def trusted_settings_target(profile, cli_fd, home, trust_profile, trust_target, 
                       % trust_target)
     resolved = os.path.realpath(link if os.path.isabs(link) else os.path.join(profile.cli_path, link))
     if resolved != trust_target:
-        raise Refused("%s resolves to %s, not the approved target %s; refusing to write through it."
+        raise Refused("%s resolves to %s, not the approved target %s; refusing to read through it."
                       % (settings_path, resolved, trust_target))
     home_real = os.path.realpath(home)
     if not trust_target.startswith(home_real.rstrip("/") + "/"):
-        raise Refused("approved settings target %s is outside $HOME; refusing to write it." % trust_target)
+        raise Refused("approved settings target %s is outside $HOME; refusing to use it." % trust_target)
     for cred in CREDENTIAL_DIRS:
         cred_path = os.path.join(home_real, cred)
         if trust_target == cred_path or trust_target.startswith(cred_path + "/"):
-            raise Refused("approved settings target %s is in a credential location; refusing to write it."
+            raise Refused("approved settings target %s is in a credential location; refusing to use it."
                           % trust_target)
     dir_path, name = os.path.split(trust_target)
     dir_fd = open_dir_path(dir_path)
     st = leaf_stat(dir_fd, name)
     if st is None:
-        raise Refused("approved settings target %s does not exist (dangling symlink); refusing to create it."
+        raise Refused("approved settings target %s does not exist (dangling symlink); create that file, then relaunch."
                       % trust_target)
     if not stat.S_ISREG(st.st_mode):
-        raise Refused("approved settings target %s is not a regular file; refusing to write it." % trust_target)
-    return dir_fd, name, trust_target, dir_path
-
-
-def update_settings_once(profile, cli_fd, workdir, home, trust_profile, trust_target, trust_refusal):
-    settings_path = os.path.join(profile.cli_path, SETTINGS_NAME)
-    st = leaf_stat(cli_fd, SETTINGS_NAME)
-    if st is not None and stat.S_ISLNK(st.st_mode):
-        dir_fd, name, display, dir_path = trusted_settings_target(
-            profile, cli_fd, home, trust_profile, trust_target, trust_refusal)
-        verify_parent = lambda: verify_dir_still_at(dir_path, dir_fd)  # noqa: E731
-    elif st is None or stat.S_ISREG(st.st_mode):
-        dir_fd, name, display = cli_fd, SETTINGS_NAME, settings_path
-        verify_parent = lambda: profile.verify_cli(cli_fd)  # noqa: E731
-    else:
-        raise Refused("%s exists but is not a regular file." % settings_path)
-    with dir_write_lock(dir_fd, display):
-        st = leaf_stat(dir_fd, name)
-        raw, expected = None, None
-        if st is not None:
-            raw, expected = read_regular(dir_fd, name, display, expected=st)
-        atomic_replace(dir_fd, name, merge_settings(raw, workdir, display), expected, display, verify_parent)
-
-
-def cmd_settings(profile_dir, workdir, home, trust_profile, trust_target, trust_refusal):
-    profile = Profile(profile_dir)
-    cli_fd = profile.cli(create=True)
-    last_error = None
-    for _attempt in range(SETTINGS_WRITE_ATTEMPTS):
-        try:
-            update_settings_once(profile, cli_fd, workdir, home, trust_profile, trust_target, trust_refusal)
-            return 0
-        except ConcurrentChange as exc:
-            last_error = exc
-    raise Refused("%s (gave up after %d attempts)" % (last_error, SETTINGS_WRITE_ATTEMPTS))
+        raise Refused("approved settings target %s is not a regular file; refusing to use it." % trust_target)
+    return dir_fd, name, trust_target
 
 
 def raise_exit(signum, _frame):
@@ -918,7 +994,9 @@ _agy_list_conversations() {
 # Updates `conversation_summaries.db` (when present; never created) and
 # writes `brain/<cid>/.wrapper_title` so transcript-only fallback entries and
 # subsequent picker renders reflect the custom title. Symlinked ancestors,
-# database or title file are refused before anything is modified.
+# database or title file are refused before anything is modified. Returns 1,
+# with the affected path and retry guidance, whenever the title was not
+# saved.
 _agy_rename_conversation() {
     local profile_dir="${1}"
     local cid="${2}"
@@ -944,7 +1022,8 @@ _agy_rename_conversation() {
 
     local err
     if ! err="$(_agy_host_py rename "$(_agy_canonical_profile_dir "${profile_dir}")" "${cid}" "${new_title}" 2>&1)"; then
-        wrapper_log "ERROR" "Failed to rename conversation '${cid}': ${err:-python3 failed}"
+        wrapper_log "ERROR" "Failed to rename conversation '${cid}'; the new title was not saved: ${err:-python3 failed}"
+        wrapper_log "ERROR" "Fix the cause above (permissions, a lock held by another wrapper, a file changed by a running agy), then retry the rename."
         return 1
     fi
     return 0
@@ -1366,8 +1445,8 @@ _agy_path_sandbox_writable() {
     return 1
 }
 
-# Ensure the active Antigravity profile directory has full autonomy within
-# the outer OS sandbox (bubblewrap / Seatbelt):
+# Read-only check that the active profile's antigravity-cli/settings.json
+# lets agy run unattended inside the outer OS sandbox (bubblewrap / Seatbelt):
 #   - toolPermission="always-proceed" & artifactReviewPolicy="always-proceed"
 #     so tool calls and artifact edits do not block on interactive prompts
 #   - allowNonWorkspaceAccess=true so extra sandbox-bound paths (/tmp, ~/bin,
@@ -1377,17 +1456,17 @@ _agy_path_sandbox_writable() {
 #     conflicts with outer bind mounts)
 #   - trustedWorkspaces includes the resolved WORKDIR so agy does not
 #     prompt for workspace trust on launch
-# Existing user settings (colorScheme, vimInsertFirst, editorMode, etc.),
-# and the file's permissions, are preserved. Invalid JSON is an error,
-# never reset. A symlinked settings.json is written through only to the
-# exact approved AGY_SETTINGS_TRUSTED_TARGET of this profile (the symlink is
-# kept); otherwise it is refused. See _agy_host_py for the write protocol.
-_agy_configure_sandbox_permissions() {
+# The file (or its approved symlink target) is never created, rewritten,
+# chmod'ed or replaced, and its parent is never created: when anything is
+# missing or invalid the launch fails with what to change and how to retry.
+# A symlinked settings.json is read only through the exact approved
+# AGY_SETTINGS_TRUSTED_TARGET of this profile; otherwise it is refused.
+_agy_validate_settings() {
     local profile_dir wd
     profile_dir="$(_agy_canonical_profile_dir "${1}")"
 
     if ! command -v python3 >/dev/null 2>&1; then
-        echo "ERROR: python3 is required to update ${profile_dir}/antigravity-cli/settings.json safely; install python3." >&2
+        echo "ERROR: python3 is required to check ${profile_dir}/antigravity-cli/settings.json safely; install python3 and relaunch." >&2
         return 1
     fi
 
@@ -1474,7 +1553,7 @@ _agy_sync_profile_skills() {
     return 0
 }
 
-# Resolve AGY_ACCOUNT to the profile dir, prepare sandbox permissions +
+# Resolve AGY_ACCOUNT to the profile dir, check its settings.json, sync
 # global skills, and append its bind (at ~/.gemini) to WRAPPER_FLAGS.
 # Must run AFTER _preset_autoload and the menu — AGY_ACCOUNT isn't
 # authoritative until then. Exits on invalid input, same contract as
@@ -1521,7 +1600,7 @@ _bind_agy_account() {
     bind_src="$(_realpath "${gemini_dir}")" || bind_src="${gemini_dir}"
     _AGY_ACTIVE_PROFILE_DIR="${bind_src}"
 
-    _agy_configure_sandbox_permissions "${bind_src}" || exit 1
+    _agy_validate_settings "${bind_src}" || exit 1
     _agy_sync_profile_skills "${bind_src}" || exit 1
 
     _wrapper_add_bind "${bind_src}" "${HOME}/.gemini"
