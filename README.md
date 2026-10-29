@@ -62,4 +62,9 @@ The wrappers dispatch to an OS-appropriate sandbox backend (`ai_agent_universal_
 
 Resource-limit enforcement (`RLIMIT_*` via `prlimit`) was removed 2026-09 and is not currently reintroduced on either backend; see `AGENTS.md` Section 3.
 
-See `AGENTS.md` → Section 3 (Security) and the `ai-sandboxing` skill for details.
+See `AGENTS.md` → Section 3 (Security) and `docs/security-concerns.md` for details.
+
+## Testing
+
+See `docs/testing.md` for safe test commands, test isolation (tests never
+launch an installed AI client), per-OS scope and CI mapping.

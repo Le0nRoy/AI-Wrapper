@@ -59,6 +59,7 @@ jobs:
       - run: bash tests/test_catalog_os_scope.bash
       - run: bash tests/test_help_doc_os_scope.bash
       - run: bash tests/test_setup_skills.bash
+      - run: bash tests/test_live_client_isolation.bash
       - run: python3 -B dot_agents/skills/tortuga/scripts/test_gh.py
 
   # Real bubblewrap smoke tests: actually launches sandboxed processes and
@@ -89,6 +90,7 @@ jobs:
           sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
           sysctl kernel.unprivileged_userns_clone
 
+      - run: bash tests/test_live_client_isolation.bash
       - run: bash tests/test_sandbox_common.bash
       - run: bash tests/test_extra_bind_dirs.bash
       - run: bash tests/test_codex_wrapper.bash
@@ -98,7 +100,11 @@ jobs:
 
   # macOS's built-in sandbox-exec needs no install step. Runs the same
   # cross-platform smoke tests as Linux (run_sandboxed_agent dispatches on
-  # `uname -s` internally) plus the macOS-only DRYRUN/PROFILE tests.
+  # `uname -s` internally), the macOS-only DRYRUN/PROFILE tests, and the
+  # preset suite (BSD stat; run-preset-tests.sh exits 2 off Darwin, so
+  # this job is its only CI path). Wrapper e2e tests and native macOS
+  # write-denial/account checks are not here: they are Linux-only today
+  # (see docs/testing.md).
   smoke-macos:
     runs-on: macos-latest
     steps:
@@ -106,3 +112,4 @@ jobs:
       - run: bash tests/test_sandbox_common.bash
       - run: bash tests/test_sandbox_macos_only.bash
       - run: bash tests/test_extra_bind_dirs.bash
+      - run: bash tests/run-preset-tests.sh

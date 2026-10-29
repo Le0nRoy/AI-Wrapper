@@ -22,11 +22,10 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
     exit 0
 fi
 
+FAKE_HOME="$(mktemp -d)"
+isolate_test_env "${FAKE_HOME}"
 # shellcheck source=../bin/ai_agent_universal_wrapper.bash
 source "${REPO_ROOT}/bin/ai_agent_universal_wrapper.bash"
-
-FAKE_HOME="$(mktemp -d)"
-export HOME="${FAKE_HOME}"
 mkdir -p "${FAKE_HOME}/project"
 
 cleanup() { rm -rf "${FAKE_HOME}"; }

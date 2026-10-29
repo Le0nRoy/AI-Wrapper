@@ -21,9 +21,9 @@ This is the **`ai-wrapper`** chezmoi-managed repository containing:
 | Need | Where |
 |------|-------|
 | All rules and policies | `AGENTS.md` |
-| Sandbox architecture | `ai-sandboxing` skill |
-| Chezmoi naming/workflow | `chezmoi-workflow` skill |
-| Code standards | `coding-standards` skill |
-| Test writing | `qa-automation` skill |
+| Sandbox architecture | `AGENTS.md` § 3, `README.md` → Sandbox Architecture, `docs/security-concerns.md` |
+| Chezmoi naming/workflow | `AGENTS.md` → This Repository |
+| Code standards | `AGENTS.md` § 2 |
+| Test writing and safe test commands | `AGENTS.md` § 4, `docs/testing.md` |
 | Orchestration workflow | `orchestrator-mode` skill |
 | Tortuga task operations | Shared `tortuga` skill; only on request |
