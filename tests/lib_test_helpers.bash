@@ -101,10 +101,16 @@ isolate_test_env() {
         exit 1
     fi
 
-    local _kw attrs fn_name
-    while read -r _kw attrs fn_name; do
-        [[ "${attrs}" == *x* ]] && unset -f "${fn_name}"
+    # Stop exporting every function (bash 3.2's `declare -F` does not show
+    # the export attribute, so do not filter on it), and drop any function
+    # named like a client so it cannot shadow a trap in this shell.
+    local _kw fn_name client
+    while read -r _kw fn_name; do
+        export -nf "${fn_name##* }"
     done < <(declare -F)
+    for client in ${TEST_AI_CLIENTS}; do
+        unset -f "${client}"
+    done
     unset BASH_ENV ENV CDPATH
 
     local var
@@ -139,7 +145,6 @@ isolate_test_env() {
     hash -r
 
     mkdir -p "${fake_home}/bin"
-    local client
     for client in ${TEST_AI_CLIENTS}; do
         install_live_client_trap "${fake_home}/bin/${client}"
     done
