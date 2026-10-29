@@ -20,8 +20,7 @@ source "${REPO_ROOT}/tests/lib_test_helpers.bash"
 FAKE_HOME="$(mktemp -d "${HOME}/ai-wrapper-test.XXXXXX")"
 FAKE_HOME="$(cd "${FAKE_HOME}" && pwd -P)"
 OUTSIDE="$(mktemp -d)"
-export HOME="${FAKE_HOME}"
-export XDG_CONFIG_HOME="${FAKE_HOME}/.config"
+isolate_test_env "${FAKE_HOME}"
 cleanup() { rm -rf "${FAKE_HOME}" "${OUTSIDE}"; }
 trap cleanup EXIT
 
@@ -362,4 +361,5 @@ if [[ "${OS}" == "Linux" ]] && command -v bwrap >/dev/null 2>&1; then
 fi
 rm -f "${preset_path}"
 
+assert_no_live_client_reached
 tests_summary_and_exit

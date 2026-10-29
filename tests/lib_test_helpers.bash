@@ -147,14 +147,15 @@ isolate_test_env() {
 
 # install_live_client_trap PATH — (re)install a fail-closed trap at PATH.
 # The trap never execs anything: it reports on stderr, records itself
-# under $HOME/.live-client-trap when that is writable, and exits
-# LIVE_CLIENT_TRAP_RC.
+# under $HOME/.live-client-trap when that is writable (best effort: the
+# sandbox may mount HOME read-only, so stub-output assertions remain the
+# primary in-sandbox check), and exits LIVE_CLIENT_TRAP_RC.
 install_live_client_trap() {
     local trap_path="${1}"
     cat >"${trap_path}" <<TRAP
 #!/bin/sh
 echo "LIVE_CLIENT_TRAP: unstubbed \${0##*/} reached; refusing to run a real client" >&2
-mkdir -p "${HOME}/.live-client-trap" 2>/dev/null && : >>"${HOME}/.live-client-trap/\${0##*/}" 2>/dev/null
+mkdir -p "${HOME}/.live-client-trap" 2>/dev/null && : 2>/dev/null >>"${HOME}/.live-client-trap/\${0##*/}"
 exit ${LIVE_CLIENT_TRAP_RC}
 TRAP
     chmod +x "${trap_path}"

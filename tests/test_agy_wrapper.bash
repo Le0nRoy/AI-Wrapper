@@ -17,9 +17,7 @@ source "${REPO_ROOT}/tests/lib_test_helpers.bash"
 
 FAKE_HOME="$(mktemp -d "${HOME}/ai-wrapper-test.XXXXXX")"
 FAKE_HOME="$(cd "${FAKE_HOME}" && pwd -P)"
-REAL_HOME="${HOME}"
-export HOME="${FAKE_HOME}"
-export XDG_CONFIG_HOME="${FAKE_HOME}/.config"
+isolate_test_env "${FAKE_HOME}"
 mkdir -p "${FAKE_HOME}/work"
 
 cleanup() { rm -rf "${FAKE_HOME}"; }
@@ -273,15 +271,9 @@ assert_not_contains "${err_out}" "ValueError" "_agy_list_conversations: stderr s
 err_out="$( ( _load agy; AI_WRAPPER_DEBUG=1 _agy_list_conversations "${FAKE_HOME}/.gemini" "${FAKE_HOME}/work" "not-an-int" ) 2>&1 )"
 assert_contains "${err_out}" "ValueError" "_agy_list_conversations: stderr exposed when AI_WRAPPER_DEBUG=1"
 
-if command -v agy >/dev/null 2>&1; then
-    prompt_file="${REPO_ROOT}/bin/ai_wrapper_data/orchestrator-prompt.md"
-    ( cd "${FAKE_HOME}/work" && HOME="${REAL_HOME}" agy --dangerously-skip-permissions --prompt-interactive "$(cat "${prompt_file}")" --help >/dev/null 2>&1 )
-    assert_eq "$?" "0" "real agy accepts --dangerously-skip-permissions --prompt-interactive <orchestrator prompt>"
-    ( cd "${FAKE_HOME}/work" && HOME="${REAL_HOME}" agy --dangerously-skip-permissions --conversation=11111111-aaaa-bbbb-cccc-dddddddddddd --help >/dev/null 2>&1 )
-    assert_eq "$?" "0" "real agy accepts --dangerously-skip-permissions --conversation=<uuid>"
-else
-    echo "  skip - agy not installed; real-CLI argv acceptance not checked"
-fi
+# Real-CLI flag acceptance is not checked here: tests never launch an
+# installed, possibly authenticated agy (see isolate_test_env).
+echo "  skip - real agy argv acceptance (manual check only; no live clients in tests)"
 
 # ---------------------------------------------------------------------------
 echo "-- AGY_ACCOUNT binding, permissions, and skills sync"
@@ -453,6 +445,19 @@ echo "-- end-to-end: real agy wrapper + stub agy in ~/.local/bin inside sandbox"
 if [[ "${OS}" == "Linux" ]] && command -v bwrap >/dev/null 2>&1; then
     mkdir -p "${FAKE_HOME}/.local/bin" "${FAKE_HOME}/.gemini-alt"
     echo "alt-gemini-profile" >"${FAKE_HOME}/.gemini-alt/marker"
+    # Inside bwrap, PATH is ~/bin:<system dirs>:~/.local/bin. Without the
+    # ~/bin trap, an agy in a system dir would beat the ~/.local/bin stub, so
+    # the trap is only dropped when no such agy exists; otherwise the stub
+    # also goes to ~/bin and ~/.local/bin resolution is reported as skipped.
+    if sys_agy="$(sandbox_system_client agy)"; then
+        echo "  skip - ${sys_agy} precedes ~/.local/bin on the sandbox PATH; ~/.local/bin resolution not checked"
+    else
+        rm -f "${FAKE_HOME}/bin/agy"
+    fi
+    _sync_agy_stub() {
+        chmod +x "${FAKE_HOME}/.local/bin/agy"
+        if [[ -n "${sys_agy}" ]]; then cp "${FAKE_HOME}/.local/bin/agy" "${FAKE_HOME}/bin/agy"; fi
+    }
     cat >"${FAKE_HOME}/.local/bin/agy" <<'STUB'
 #!/bin/bash
 printf 'ARGV:%s\n' "$*"
@@ -460,7 +465,8 @@ cat "${HOME}/.gemini/marker" 2>&1
 [[ -f "${HOME}/.gemini/antigravity-cli/settings.json" ]] && echo "SETTINGS_OK"
 [[ -f "${HOME}/.gemini/config/skills/orchestrator-mode/SKILL.md" ]] && echo "SKILL_OK"
 STUB
-    chmod +x "${FAKE_HOME}/.local/bin/agy"
+    _sync_agy_stub
+    assert_client_is_fake agy
 
     out="$(cd "${FAKE_HOME}/work" && PATH="${FAKE_HOME}/.local/bin:${PATH}" AGY_ACCOUNT=alt \
         bash "${REPO_ROOT}/bin/executable_agy_wrapper.bash" chat hello </dev/null 2>&1)"
@@ -487,7 +493,7 @@ STUB
 #!/bin/bash
 git log --format='LOG:%s' -1 2>&1
 STUB
-        chmod +x "${FAKE_HOME}/.local/bin/agy"
+        _sync_agy_stub
         out="$(cd "${FAKE_HOME}/wt" && PATH="${FAKE_HOME}/.local/bin:${PATH}" \
             bash "${REPO_ROOT}/bin/executable_agy_wrapper.bash" x </dev/null 2>&1)"
         assert_contains "${out}" "LOG:init" "agy wrapper: git works in a worktree inside the sandbox"
@@ -496,4 +502,5 @@ else
     echo "  skip - Linux + bwrap required"
 fi
 
+assert_no_live_client_reached
 tests_summary_and_exit
