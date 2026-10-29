@@ -502,6 +502,85 @@ resolving outside `$HOME` or into a credential location (`~/.ssh`,
 check runs before `touch`, so a dangling symlink target is never
 created. The Codex wrapper binds the resolved path.
 
+### B-μ — AGY host-side Python and profile file operations (MITIGATED, 2026-10, #44)
+
+Before launch, the agy wrapper lists/renames/deletes conversations and
+rewrote `antigravity-cli/settings.json` on the host. It ran `python3 -`
+(CWD first on `sys.path`, so a checkout `json.py` ran on the host), followed
+symlinked `antigravity-cli/`, `brain/`, `conversations/`, database and
+`.wrapper_title` paths, and wrote `settings.json.tmp.$$` (predictable,
+followed if pre-created as a symlink).
+
+**Mitigation.** One embedded helper (`_agy_host_py`, run as `python3 -I -`)
+does all of it. By owner decision, `settings.json` is no longer written at
+all: the wrapper reads it and fails the launch, listing what to change,
+when a required key or the current workspace's trust is missing. It opens the resolved profile component by component with
+`O_NOFOLLOW` and `*at` calls, refuses symlinked directories, database,
+SQLite sidecars and title files before changing anything, unlinks symlinked
+artifact leaves without traversal, opens SQLite with `mode=rw|ro` (never
+creates a database) and checks that SQLite's descriptor is the inode it
+verified. Without `python3`, or without dir-fd/`O_NOFOLLOW`/`flock`
+support, these operations fail closed; the old `jq`/`sqlite3` fallbacks
+are gone.
+
+- **SQLite sidecars.** SQLite opens `-journal`/`-wal`/`-shm` itself, by
+  path, so the helper cannot open them for it. It relies on two SQLite
+  behaviours instead: sidecars are opened with `O_NOFOLLOW`, and a write is
+  refused once the database path no longer names the open file
+  (`SQLITE_READONLY_DBMOVED`). Before any profile database is opened, the
+  helper proves both on the running library in a private temp dir (a
+  symlinked sidecar per kind, and a directory swapped mid-transaction) and
+  refuses the operation if either fails. Tests swap each sidecar for a
+  symlink at open and at write time, and swap `antigravity-cli/` for a
+  directory holding same-named sidecars; the external bytes stay unchanged.
+- **Settings are read-only.** The wrapper never creates, rewrites, chmods
+  or replaces `settings.json` or an approved symlink target, and never
+  creates `antigravity-cli/`. Tests check that file, target and parent
+  directories keep their content, inode, mode and mtime on success and on
+  every failure.
+- **Title writes (rename).** `.wrapper_title` is replaced by an `O_EXCL`
+  temp file + `renameat` in the held directory, after re-checking the file
+  (inode, size, mtime) and re-walking the parent; a changed file fails the
+  rename (nothing is reported as renamed) instead of being overwritten.
+  Every wrapper instance holds an exclusive advisory `flock` on the
+  conversation directory from the read to the rename, so two wrappers never
+  interleave; a lock held for more than 10 s fails the rename. The lock is
+  taken and the temp file written before the database title changes, so a
+  lock or permission failure leaves the database untouched. Failures name
+  the path and tell the user to retry.
+- **Trusted settings target.** A symlinked `settings.json` is read only
+  through the target approved by `AGY_SETTINGS_TRUSTED_PROFILE` +
+  `AGY_SETTINGS_TRUSTED_TARGET` (exact resolved profile and canonical
+  existing file under `$HOME`, outside credential dirs). The approval is
+  refused when the preset dir is writable inside the sandbox (WORKDIR, the
+  profile, the wrapper's fixed RW binds, `AI_SANDBOX_EXTRA_RW_DIRS`,
+  `WRAPPER_FLAGS` binds, macOS temp dirs), and also whenever an
+  `AI_WRAPPER_EXTRA_PROFILE` plugin defines `_extra_post_menu_setup` or
+  `_extra_sandbox_setup`: those run after the check and can add binds, so
+  writability cannot be determined.
+
+**Residual limits.**
+
+- **Non-cooperating title writers (accepted by the owner).** The `flock`
+  is advisory and a re-check followed by `rename` is not a compare-and-swap.
+  A process that does not take the lock (agy itself, or a sandboxed agent
+  still running on the same profile) and writes `.wrapper_title` exactly
+  between the final re-check and the rename loses that write, and the
+  wrapper cannot detect it. No portable POSIX call closes this. The owner
+  kept rename available under this limit (concurrent renames are
+  unlikely); it no longer affects `settings.json`, which is never written.
+  A test pins the behaviour so this section stays accurate.
+- A title change detected after the database title was updated (the final
+  re-check) fails the rename and says the database already holds the new
+  title while the picker still shows the old `.wrapper_title`; retrying the
+  rename resolves it.
+- SQLite's two guards are library behaviours, verified per run rather
+  than enforced by the helper. On macOS the probe dir is in `$TMPDIR`,
+  which the sandbox can write; a running agent could make the probe fail
+  (a refusal) but cannot change how the library behaves.
+- `~/bin` (which holds the deployed wrapper itself) is bound RW into the
+  sandbox. That shared-sandbox gap is tracked separately (#17).
+
 ### B-β — `_realpath` fallback chain has multiple silent branches (RESOLVED, 2026-05-24, WS6)
 
 Three resolvers tried in order: `realpath`, `perl -MCwd=abs_path`,

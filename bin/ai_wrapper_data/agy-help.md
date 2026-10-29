@@ -25,6 +25,13 @@ prioritizing the current working directory. From the picker you can:
 - Select a conversation by number (`1`-`N`, `Enter` for `1`) or UUID prefix to
   launch `agy --dangerously-skip-permissions --conversation=<id>`.
 - Press `r` (or `r <num> [new title]`) to rename a saved conversation in place.
+  The new title is written to the database and to `brain/<id>/.wrapper_title`
+  (which the picker shows first). If the rename fails (permissions, a lock
+  held by another wrapper for over 10 s, the title file changed by a running
+  agy), the picker says so, names the path, and nothing is reported as
+  renamed; fix the cause and press `r` again. A title written by a running
+  agy at the very instant of the rename can still be lost (see
+  `docs/security-concerns.md`, B-μ).
 - Press `d` (or `d <num>[,<num>...]`, e.g. `d 1,3`) to delete one or more saved
   conversations (and their `brain/` artifacts and child subagent entries) with
   confirmation. A single invalid token aborts the batch without deleting
@@ -32,6 +39,11 @@ prioritizing the current working directory. From the picker you can:
   If `conversation_summaries.db` is locked, the delete waits up to
   `AGY_DB_BUSY_TIMEOUT_MS` (default 1000 ms) and then fails without touching
   any artifacts.
+- Listing, rename and delete stay inside the selected profile: a symlinked
+  `antigravity-cli/`, `brain/`, `conversations/`, database or `.wrapper_title`
+  is refused (nothing is changed). A symlinked conversation artifact is
+  deleted by unlinking the link itself; its target is never touched. A
+  missing database is never created. These host-side steps need `python3`.
 - Press `c` to resume the most recent conversation via `--continue`, or `q` to
   cancel.
 
@@ -58,12 +70,40 @@ confines filesystem writes to `WORKDIR`, `~/.gemini`, and `/tmp`, the wrapper
 grants `agy` full autonomy inside the sandbox boundary:
 
 - Passes `--dangerously-skip-permissions` on the command line.
-- Ensures `<profile>/antigravity-cli/settings.json` has
+- Checks, read-only, that `<profile>/antigravity-cli/settings.json` has
   `toolPermission: "always-proceed"`, `artifactReviewPolicy: "always-proceed"`,
   `allowNonWorkspaceAccess: true`, `enableTerminalSandbox: false` (avoiding
-  nested-sandbox conflicts inside the outer `ai-wrapper` sandbox), and adds
-  the resolved working directory to `trustedWorkspaces`. Existing user
-  preferences in `settings.json` (theme, vim mode, etc.) are preserved.
+  nested-sandbox conflicts inside the outer `ai-wrapper` sandbox), and the
+  resolved working directory in `trustedWorkspaces`.
+
+The wrapper never creates, edits, chmods or replaces `settings.json` (nor
+its `antigravity-cli/` directory). When the file is missing, is not a JSON
+object, or any of the above is missing or different, the launch fails and
+lists each problem plus the JSON to put in the file (keep your other
+settings). Edit the file and launch again. Each new working directory has
+to be added to `trustedWorkspaces` this way. The check runs on the host
+with `python3 -I` (required; there is no `jq` fallback).
+
+### Symlinked settings.json (dotfiles)
+
+If `<profile>/antigravity-cli/settings.json` is a symlink, the launch fails
+unless you approve its exact target for that exact profile in
+`s) Settings` under "Account":
+
+- **Trusted settings.json profile** (`AGY_SETTINGS_TRUSTED_PROFILE`): the
+  resolved profile directory, e.g. `~/.gemini` or `~/.gemini-work`.
+- **Trusted settings.json target file** (`AGY_SETTINGS_TRUSTED_TARGET`): the
+  canonical path (no symlinked parents) of the existing file the symlink
+  points to, inside `$HOME` and outside credential dirs.
+
+The wrapper then checks that file (read-only, as above); edit the target
+itself to fix a failed check. The symlink is left as is. An approval for one profile
+is not used for another account. A missing, dangling, mismatched or
+non-regular target fails the launch. The approval is saved in this
+workdir's preset and is ignored when that preset directory is writable
+inside the sandbox (for example via `AI_SANDBOX_EXTRA_RW_DIRS`), or when an
+`AI_WRAPPER_EXTRA_PROFILE` plugin defines `_extra_post_menu_setup` or
+`_extra_sandbox_setup` (they can add sandbox binds after the check).
 
 ## Account switching
 
