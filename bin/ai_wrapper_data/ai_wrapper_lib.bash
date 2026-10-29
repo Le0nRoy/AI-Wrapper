@@ -806,8 +806,9 @@ _render_settings_table() {
 # Settings are automatically saved to a per-workdir, per-agent file under
 # $XDG_CONFIG_HOME/ai-wrapper/last-preset/<hash>-<agent>.env where hash
 # is the first 12 hex chars of the SHA-256 of the resolved workdir
-# path (sha256sum, or shasum -a 256 where sha256sum is absent) and agent is AI_WRAPPER_AGENT_ID (set by each agent lib, e.g.
-# "claude", "codex"). Per-agent files keep the Claude and Codex wrappers
+# path (sha256sum, or shasum -a 256 where sha256sum is absent) and
+# agent is AI_WRAPPER_AGENT_ID (set by each agent lib, e.g. "claude",
+# "codex"). Per-agent files keep the Claude and Codex wrappers
 # from clobbering each other's settings when both run in one workdir.
 # The file header carries human-readable "# workdir: <path>" and
 # "# agent: <id>" comments so users can grep to identify files.
