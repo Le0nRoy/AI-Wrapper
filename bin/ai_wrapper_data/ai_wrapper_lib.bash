@@ -805,9 +805,10 @@ _render_settings_table() {
 #
 # Settings are automatically saved to a per-workdir, per-agent file under
 # $XDG_CONFIG_HOME/ai-wrapper/last-preset/<hash>-<agent>.env where hash
-# is the first 12 hex chars of shasum -a 256 over the resolved workdir
-# path and agent is AI_WRAPPER_AGENT_ID (set by each agent lib, e.g.
-# "claude", "codex"). Per-agent files keep the Claude and Codex wrappers
+# is the first 12 hex chars of the SHA-256 of the resolved workdir
+# path (sha256sum, or shasum -a 256 where sha256sum is absent) and
+# agent is AI_WRAPPER_AGENT_ID (set by each agent lib, e.g. "claude",
+# "codex"). Per-agent files keep the Claude and Codex wrappers
 # from clobbering each other's settings when both run in one workdir.
 # The file header carries human-readable "# workdir: <path>" and
 # "# agent: <id>" comments so users can grep to identify files.
@@ -819,6 +820,12 @@ _render_settings_table() {
 # left in place so the other agents can migrate from it too, and is
 # only removed by an explicit _preset_clear.
 #
+# Fail closed: when the workdir identity cannot be computed (no usable
+# hash command, a failing one, malformed output, or an unusable pwd -P)
+# every path helper returns 1 with no output, and autosave / autoload /
+# clear write, read and delete nothing. There is deliberately no shared
+# fallback name: "<dir>/-<agent>.env" would mix settings across projects.
+#
 # Public functions:
 #   _preset_autosave_path  — compute (but do not create) the file path
 #   _preset_legacy_path    — compute the pre-per-agent shared file path
@@ -829,13 +836,34 @@ _render_settings_table() {
 # Print the preset directory + "/<hash>" prefix for the resolved CWD.
 # Uses resolved CWD as the identity so symlinked worktrees resolve to the
 # same file as their physical path. Does NOT create any directories.
+# Prints nothing and returns 1 (with an ERROR on stderr) when the
+# identity cannot be computed; see "Fail closed" above.
 _preset_path_prefix() {
-    local workdir hash dir
-    workdir="$(pwd -P)"
-    # shasum -a 256 outputs "<hex>  -"; take the first 12 hex chars.
-    hash="$(printf '%s' "${workdir}" | shasum -a 256 | cut -c1-12)"
+    local workdir tool out dir
+    local digest_re='^([0-9a-f]{64})[[:space:]]+[*]?-$'
+    if ! workdir="$(pwd -P)" || [[ "${workdir}" != /* ]]; then
+        echo "ERROR: cannot resolve the physical working directory; per-workdir settings preset disabled." >&2
+        return 1
+    fi
+    # Same SHA-256 from either tool: GNU coreutils sha256sum (Linux) or
+    # perl shasum (macOS). Both print "<64 hex>  -" for stdin. Resolved via
+    # PATH only (type -P) so a shell function cannot stand in for it.
+    if tool="$(type -P sha256sum)"; then
+        out="$(printf '%s' "${workdir}" | "${tool}")" || out=""
+    elif tool="$(type -P shasum)"; then
+        out="$(printf '%s' "${workdir}" | "${tool}" -a 256)" || out=""
+    else
+        echo "ERROR: neither sha256sum nor shasum is on PATH; per-workdir settings preset disabled (install coreutils or perl shasum)." >&2
+        return 1
+    fi
+    # Validate the whole digest line, not just a 12-char prefix, so a
+    # failing, truncated or garbled tool can never name a preset file.
+    if [[ ! "${out}" =~ ${digest_re} ]]; then
+        echo "ERROR: ${tool} did not produce a SHA-256 digest of the working directory; per-workdir settings preset disabled." >&2
+        return 1
+    fi
     dir="${XDG_CONFIG_HOME:-${HOME}/.config}/ai-wrapper/last-preset"
-    printf '%s/%s' "${dir}" "${hash}"
+    printf '%s/%s' "${dir}" "${BASH_REMATCH[1]:0:12}"
 }
 
 # Compute the path to this agent's per-workdir preset file. Fails loudly
@@ -849,13 +877,24 @@ _preset_autosave_path() {
         echo "ERROR: AI_WRAPPER_AGENT_ID is unset or invalid ('${agent}'); per-workdir settings preset disabled." >&2
         return 1
     fi
-    printf '%s-%s.env' "$(_preset_path_prefix)" "${agent}"
+    local prefix
+    prefix="$(_preset_path_prefix)" || return 1
+    printf '%s-%s.env' "${prefix}" "${agent}"
 }
 
 # Path of the legacy shared <hash>.env written before per-agent files.
 # Read-only fallback for _preset_autoload; removed by _preset_clear.
 _preset_legacy_path() {
-    printf '%s.env' "$(_preset_path_prefix)"
+    local prefix
+    prefix="$(_preset_path_prefix)" || return 1
+    printf '%s.env' "${prefix}"
+}
+
+# Record that this session's preset path could not be computed, so the
+# header says saved settings are disabled instead of staying silent.
+_preset_mark_unavailable() {
+    _AI_WRAPPER_PRESET_UNAVAILABLE=1
+    unset AI_WRAPPER_PRESET_AUTOLOADED_FROM
 }
 
 # Write every catalog key to this agent's per-workdir preset file. Saves
@@ -864,7 +903,7 @@ _preset_legacy_path() {
 # Uses temp-rename to avoid partial-write corruption.
 _preset_autosave() {
     local path dir entry cur
-    path="$(_preset_autosave_path)" || return 1
+    path="$(_preset_autosave_path)" || { _preset_mark_unavailable; return 1; }
     dir="$(dirname "${path}")"
 
     if ! mkdir -p "${dir}" 2>/dev/null; then
@@ -910,9 +949,9 @@ _preset_autosave() {
 # "restored from" banner line.
 _preset_autoload() {
     local path entry line key val catalog_type applied=0 legacy=0
-    path="$(_preset_autosave_path)" || return 1
+    path="$(_preset_autosave_path)" || { _preset_mark_unavailable; return 1; }
     if [[ ! -f "${path}" ]]; then
-        path="$(_preset_legacy_path)"
+        path="$(_preset_legacy_path)" || { _preset_mark_unavailable; return 1; }
         # First run: no file yet — silent no-op.
         [[ -f "${path}" ]] || return 0
         legacy=1
@@ -976,11 +1015,13 @@ _preset_autoload() {
 # in place it would be picked up again by _preset_autoload's fallback and
 # silently resurrect the settings the user just cleared. Other agents'
 # per-agent files are untouched (an agent that hasn't migrated yet starts
-# from defaults). No-op (return 0) when the files do not exist.
+# from defaults). No-op (return 0) when the files do not exist. Both
+# paths are computed before either is removed.
 _preset_clear() {
-    local path
-    path="$(_preset_autosave_path)" || return 1
-    rm -f "${path}" "$(_preset_legacy_path)" 2>/dev/null || true
+    local path legacy
+    path="$(_preset_autosave_path)" || { _preset_mark_unavailable; return 1; }
+    legacy="$(_preset_legacy_path)" || { _preset_mark_unavailable; return 1; }
+    rm -f "${path}" "${legacy}" 2>/dev/null || true
     unset AI_WRAPPER_PRESET_AUTOLOADED_FROM
     return 0
 }
@@ -990,8 +1031,12 @@ _preset_clear() {
 # into its own function so integration tests can call it directly
 # without invoking the full show_header (which clears the screen, etc.).
 _render_preset_banner_line() {
+    local reset='\033[0m' dim='\033[2m' yellow='\033[1;33m'
+    if [[ -n "${_AI_WRAPPER_PRESET_UNAVAILABLE:-}" ]]; then
+        printf '%bSaved settings disabled: the per-workdir preset path could not be computed (needs sha256sum or shasum on PATH and a resolvable workdir). Nothing is restored, saved or cleared.%b\n' "${yellow}" "${reset}" >/dev/tty
+        return 0
+    fi
     [[ -n "${AI_WRAPPER_PRESET_AUTOLOADED_FROM:-}" ]] || return 0
-    local reset='\033[0m' dim='\033[2m'
     printf '%b(restored from %s)%b\n' "${dim}" "${AI_WRAPPER_PRESET_AUTOLOADED_FROM}" "${reset}" >/dev/tty
 }
 

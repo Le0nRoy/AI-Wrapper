@@ -233,9 +233,6 @@ assert_eq "${out}" "" "PASS_GITLAB=0 adds no glab bind"
 
 # ---------------------------------------------------------------------------
 echo "-- per-agent per-workdir presets (claude and codex in one workdir)"
-if ! command -v shasum >/dev/null 2>&1; then
-    shasum() { sha256sum; }   # Linux hosts without perl's shasum
-fi
 # Each case gets its own workdir so preset files never leak between cases.
 _pdir() { mkdir -p "${FAKE_HOME}/preset-${1}" && printf '%s' "${FAKE_HOME}/preset-${1}"; }
 # Print the per-agent preset path for agent $1 in dir $2.

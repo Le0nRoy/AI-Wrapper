@@ -254,7 +254,9 @@ per-agent operation — no naming, no confirmation, no sub-menu required.
   `bool=0` values) to
   `${XDG_CONFIG_HOME:-$HOME/.config}/ai-wrapper/last-preset/<hash>-<agent>.env`
   where `<hash>` is the first 12 hex chars of the SHA-256 of the
-  resolved working directory path and `<agent>` is `claude`, `codex` or
+  resolved (physical) working directory path, computed with
+  `sha256sum` (GNU coreutils, Linux) or `shasum -a 256` (macOS) — one
+  of them must be on `PATH` — and `<agent>` is `claude`, `codex` or
   `cursor`. One file per workdir and agent, so running the Claude and
   Codex wrappers in the same directory never clobbers the other's
   settings.
@@ -275,6 +277,14 @@ per-agent operation — no naming, no confirmation, no sub-menu required.
   marker so the header line disappears on the next render. Other
   agents' `<hash>-<agent>.env` files are left alone. No confirmation.
   Use this as the escape hatch to start fresh from catalog defaults.
+- **Fails closed** — if the workdir hash cannot be computed (neither
+  `sha256sum` nor `shasum` on `PATH`, the command fails or prints
+  something other than a SHA-256 digest, or `pwd -P` fails), the wrapper
+  prints an `ERROR:` line, the header shows `Saved settings disabled`,
+  and nothing is restored, saved or cleared for that session. The
+  session itself still launches with the current settings; other
+  workdirs' presets are never read or touched as a fallback. Install
+  coreutils or perl's `shasum` to restore presets.
 
 The preset file is plain `KEY=VALUE` per line with a comment header
 (`# workdir: <path>` and `# agent: <id>`); you can
