@@ -58,7 +58,7 @@ that launch a real sandbox.
 |------|--------------|-------|-------|-------|
 | `test_live_client_isolation.bash` | fake home under `$HOME`, temp dir | bash | full; bwrap e2e if available | host checks; e2e skipped |
 | `test_catalog_os_scope.bash`, `test_help_doc_os_scope.bash` | none | bash | full | full |
-| `test_agy_host_boundary.bash` | fake home under `$HOME`, temp dir, sqlite dbs, symlinks | bash, python3 | full | full |
+| `test_agy_host_boundary.bash` | fake home under `$HOME`, temp dir, sqlite dbs, symlinks; checks settings.json is only read | bash, python3 | full | full |
 | `test_setup_skills.bash` | fake home under `$TMPDIR` | bash, coreutils | full | full |
 | `dot_agents/skills/tortuga/scripts/test_gh.py` | none (mocked `subprocess`) | python3 | full | full |
 | `test_sandbox_common.bash`, `test_extra_bind_dirs.bash` | launches the real sandbox, fake home | bwrap + userns / sandbox-exec | fails without bwrap/sysctl | full |
