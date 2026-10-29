@@ -502,6 +502,50 @@ resolving outside `$HOME` or into a credential location (`~/.ssh`,
 check runs before `touch`, so a dangling symlink target is never
 created. The Codex wrapper binds the resolved path.
 
+### B-μ — AGY host-side Python and profile file operations (RESOLVED, 2026-10, #44)
+
+Before launch, the agy wrapper lists/renames/deletes conversations and
+rewrites `antigravity-cli/settings.json` on the host. It ran `python3 -`
+(CWD first on `sys.path`, so a checkout `json.py` ran on the host), followed
+symlinked `antigravity-cli/`, `brain/`, `conversations/`, database and
+`.wrapper_title` paths, and wrote `settings.json.tmp.$$` (predictable,
+followed if pre-created as a symlink).
+
+**Resolution.** One embedded helper (`_agy_host_py`, run as `python3 -I -`)
+does all of it. It opens the resolved profile component by component with
+`O_NOFOLLOW` and `*at` calls, refuses symlinked directories, database,
+SQLite sidecars and title files before changing anything, unlinks symlinked
+artifact leaves without traversal, opens SQLite with `mode=rw|ro` (never
+creates a database) and checks that SQLite's descriptor is the inode it
+verified. Files are replaced by an `O_EXCL` temp file + `renameat` in the
+held directory after re-checking the file (inode, size, mtime) and
+re-walking the parent; a changed file is retried (3 attempts) instead of
+overwritten. Permissions are kept; invalid JSON fails. A symlinked
+`settings.json` is written only to the target approved by
+`AGY_SETTINGS_TRUSTED_PROFILE` + `AGY_SETTINGS_TRUSTED_TARGET` (exact
+resolved profile and canonical existing file under `$HOME`, outside
+credential dirs); the approval is ignored when the preset dir is writable
+inside the sandbox. Without `python3`, or without dir-fd/`O_NOFOLLOW`
+support, these operations fail closed; the old `jq`/`sqlite3` fallbacks
+are gone.
+
+**Residual limits.** These narrow, but do not close, races against a
+process with the user's UID writing in the profile at the same time (for
+example a still-running sandboxed agy):
+
+- The re-check before `rename` and the rename itself are two calls. A write
+  that lands between them is lost.
+- SQLite opens the database and its `-journal`/`-wal`/`-shm` files by path.
+  The main file is verified after open. A sidecar swapped for a symlink
+  after the pre-check is followed by SQLite. The helper re-walks the profile
+  afterwards and reports a swapped directory, but only after the write.
+- Preset protection checks WORKDIR, the profile, the wrapper's fixed RW
+  binds, `AI_SANDBOX_EXTRA_RW_DIRS`, `WRAPPER_FLAGS` binds and macOS temp
+  dirs. Binds added later by an `AI_WRAPPER_EXTRA_PROFILE` plugin are not
+  seen.
+- `~/bin` (which holds the deployed wrapper itself) is bound RW into the
+  sandbox. That shared-sandbox gap is tracked separately (#17).
+
 ### B-β — `_realpath` fallback chain has multiple silent branches (RESOLVED, 2026-05-24, WS6)
 
 Three resolvers tried in order: `realpath`, `perl -MCwd=abs_path`,

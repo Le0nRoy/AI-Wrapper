@@ -32,6 +32,11 @@ prioritizing the current working directory. From the picker you can:
   If `conversation_summaries.db` is locked, the delete waits up to
   `AGY_DB_BUSY_TIMEOUT_MS` (default 1000 ms) and then fails without touching
   any artifacts.
+- Listing, rename and delete stay inside the selected profile: a symlinked
+  `antigravity-cli/`, `brain/`, `conversations/`, database or `.wrapper_title`
+  is refused (nothing is changed). A symlinked conversation artifact is
+  deleted by unlinking the link itself; its target is never touched. A
+  missing database is never created. These host-side steps need `python3`.
 - Press `c` to resume the most recent conversation via `--continue`, or `q` to
   cancel.
 
@@ -63,7 +68,29 @@ grants `agy` full autonomy inside the sandbox boundary:
   `allowNonWorkspaceAccess: true`, `enableTerminalSandbox: false` (avoiding
   nested-sandbox conflicts inside the outer `ai-wrapper` sandbox), and adds
   the resolved working directory to `trustedWorkspaces`. Existing user
-  preferences in `settings.json` (theme, vim mode, etc.) are preserved.
+  preferences in `settings.json` (theme, vim mode, etc.) and the file's
+  permissions are preserved. If `settings.json` is not valid JSON the launch
+  fails instead of resetting it. This update runs on the host with
+  `python3 -I` (required; there is no `jq` fallback).
+
+### Symlinked settings.json (dotfiles)
+
+If `<profile>/antigravity-cli/settings.json` is a symlink, the launch fails
+unless you approve its exact target for that exact profile in
+`s) Settings` under "Account":
+
+- **Trusted settings.json profile** (`AGY_SETTINGS_TRUSTED_PROFILE`): the
+  resolved profile directory, e.g. `~/.gemini` or `~/.gemini-work`.
+- **Trusted settings.json target file** (`AGY_SETTINGS_TRUSTED_TARGET`): the
+  canonical path (no symlinked parents) of the existing file the symlink
+  points to, inside `$HOME` and outside credential dirs.
+
+The wrapper then updates only that file, in place via a temp file and rename
+in its directory, and leaves the symlink as is. An approval for one profile
+is not used for another account. A missing, dangling, mismatched or
+non-regular target fails the launch. The approval is saved in this
+workdir's preset and is ignored when that preset directory is writable
+inside the sandbox (for example via `AI_SANDBOX_EXTRA_RW_DIRS`).
 
 ## Account switching
 

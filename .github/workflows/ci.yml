@@ -45,7 +45,8 @@ jobs:
 
   # Pure-logic tests: settings-catalog OS-scope filtering and the
   # wrapper-help.md OS-conditional doc filter, skill deployment/retirement
-  # into a fake HOME, and the Tortuga gh helper. No real sandbox launch, so
+  # into a fake HOME, agy host-side path confinement, and the Tortuga gh
+  # helper. No real sandbox launch, so
   # these need no setup — but still run on both OSes since they exercise
   # real bash string/array handling, not just the app logic.
   logic-tests:
@@ -60,6 +61,7 @@ jobs:
       - run: bash tests/test_help_doc_os_scope.bash
       - run: bash tests/test_setup_skills.bash
       - run: bash tests/test_live_client_isolation.bash
+      - run: bash tests/test_agy_host_boundary.bash
       - run: python3 -B dot_agents/skills/tortuga/scripts/test_gh.py
 
   # Real bubblewrap smoke tests: actually launches sandboxed processes and
