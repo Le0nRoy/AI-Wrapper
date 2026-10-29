@@ -25,10 +25,6 @@ trap cleanup EXIT
 
 OS="$(uname -s)"
 NL=$'\n'
-if ! command -v shasum >/dev/null 2>&1; then
-    shasum() { sha256sum; }
-    export -f shasum
-fi
 
 _load() {
     # shellcheck source=../bin/ai_agent_universal_wrapper.bash

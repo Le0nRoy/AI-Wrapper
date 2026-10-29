@@ -260,6 +260,7 @@ _agy_trusted() {
         cd "${A}" || exit 1
         _load agy
         PATH="${1}${HOST_PATH}"
+        # shellcheck disable=SC2034  # read by _agy_validate_settings
         WRAPPER_FLAGS=()
         AGY_SETTINGS_TRUSTED_PROFILE="${FAKE_HOME}/.gemini-x" \
             AGY_SETTINGS_TRUSTED_TARGET="${FAKE_HOME}/dot/settings.json" \

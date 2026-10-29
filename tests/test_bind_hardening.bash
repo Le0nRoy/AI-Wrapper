@@ -26,10 +26,6 @@ trap cleanup EXIT
 
 OS="$(uname -s)"
 NL=$'\n'
-if ! command -v shasum >/dev/null 2>&1; then
-    shasum() { sha256sum; }   # Linux hosts without perl's shasum
-    export -f shasum          # ... also for the wrapper child processes
-fi
 
 _load() {
     # shellcheck source=../bin/ai_agent_universal_wrapper.bash

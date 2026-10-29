@@ -35,10 +35,6 @@ trap cleanup EXIT
 LIB="${REPO_ROOT}/bin/ai_wrapper_data/agy_wrapper_lib.bash"
 WORK="${FAKE_HOME}/work"
 mkdir -p "${WORK}"
-if ! command -v shasum >/dev/null 2>&1; then
-    shasum() { sha256sum; }
-    export -f shasum
-fi
 
 echo "== agy host-side boundary tests ($(uname -s)) =="
 if ! command -v python3 >/dev/null 2>&1; then
@@ -56,7 +52,7 @@ _load() {
 # Fingerprint a path (content hash, or the link target for symlinks).
 _fp() {
     if [[ -L "${1}" ]]; then printf 'link:%s' "$(readlink "${1}")"
-    elif [[ -f "${1}" ]]; then shasum -a 256 <"${1}" | cut -c1-64
+    elif [[ -f "${1}" ]]; then python3 -I -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "${1}"
     elif [[ -d "${1}" ]]; then printf 'dir:'; (cd "${1}" && find . | LC_ALL=C sort | tr '\n' ' ')
     else printf 'absent'; fi
 }
