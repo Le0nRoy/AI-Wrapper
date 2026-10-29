@@ -1470,7 +1470,7 @@ _agy_validate_settings() {
         return 1
     fi
 
-    local trust_profile trust_target trust_refusal="" preset_dir
+    local trust_profile trust_target trust_refusal="" preset_path preset_dir
     trust_profile="$(_agy_expand_tilde "${AGY_SETTINGS_TRUSTED_PROFILE:-}")"
     trust_target="$(_agy_expand_tilde "${AGY_SETTINGS_TRUSTED_TARGET:-}")"
     if [[ -n "${trust_profile}" || -n "${trust_target}" ]]; then
@@ -1482,7 +1482,7 @@ _agy_validate_settings() {
             trust_refusal="AGY_SETTINGS_TRUSTED_PROFILE and AGY_SETTINGS_TRUSTED_TARGET must both be set"
         elif [[ -n "${late_hook}" ]]; then
             trust_refusal="the AI_WRAPPER_EXTRA_PROFILE plugin defines ${late_hook}, which can add sandbox binds after this check, so whether the preset directory is writable inside the sandbox cannot be determined"
-        elif ! preset_dir="$(dirname "$(_preset_autosave_path)")"; then
+        elif ! preset_path="$(_preset_autosave_path)" || ! preset_dir="$(dirname "${preset_path}")"; then
             trust_refusal="the per-workdir preset location cannot be determined"
         elif _agy_path_sandbox_writable "${preset_dir}" "${profile_dir}"; then
             trust_refusal="the preset directory ${preset_dir} is writable inside the sandbox, so a sandboxed agent could forge the approval"
