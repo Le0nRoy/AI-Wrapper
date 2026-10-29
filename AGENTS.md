@@ -20,12 +20,10 @@ These rules apply to **Claude Code** (and any other AI agents) working on **any 
 | Sandbox settings / account switching | `s) Settings` in the wrapper's main menu — toggles `AI_SANDBOX_*` flags and the active `CLAUDE_ACCOUNT` / `CODEX_ACCOUNT` / `AGY_ACCOUNT` profile; persists per-workdir and per-agent |
 | macOS sandbox backend | `sandbox-exec` (Seatbelt), auto-selected via `uname -s` — see `bin/ai_wrapper_data/macos_sandbox_exec.bash` and `claude_wrapper.sb` |
 
-**Key skills (always relevant):**
-- `coding-standards` — naming, nesting, no magic numbers, no race conditions
-- `qa-automation` — test structure, isolation, integration patterns
-- `chezmoi-workflow` — **required when working in this repo**
-- `ai-sandboxing` — bubblewrap sandbox architecture and restrictions
-- `common-automation-verifier` — project setup verification
+**Core guidance lives in this file** (coding standards: Section 2; testing
+and isolation: Section 4; this repo's chezmoi and sandbox rules: Section 3
+and "This Repository"). In the `ai-wrapper` checkout, `README.md`,
+`docs/security-concerns.md` and `docs/testing.md` hold the details.
 
 ---
 
@@ -45,11 +43,21 @@ These rules apply to **Claude Code** (and any other AI agents) working on **any 
 - **Do not revert user's SVC changes between sessions**: if the user removed files from stage, made fixes, or reset commits between sessions — honor that state. Check `git status` and `git log` before acting, not after.
 - If you find unexpected state (untracked files, uncommitted changes, detached HEAD) — investigate and ask before overwriting
 
+**Coding standards** (when the project has none of its own):
+- Descriptive names; no single-letter names outside tight loops
+- No magic numbers — named constants
+- Early returns; keep nesting to 3 levels or fewer
+- One responsibility per function
+- No race conditions: no check-then-act on shared files, no unconditional sleeps — poll with a deadline
+
 ---
 
 ## 3. Security First
 
-See **`ai-sandboxing`** skill for sandbox architecture details.
+Sandbox architecture (this repo): `README.md` → Sandbox Architecture,
+`bin/ai_agent_universal_wrapper.bash` (Linux bubblewrap),
+`bin/ai_wrapper_data/macos_sandbox_exec.bash` + `claude_wrapper.sb` (macOS
+Seatbelt), and `docs/security-concerns.md` for known gaps and decisions.
 
 **Always:**
 - Never commit secrets, credentials, API keys, private keys, or tokens
@@ -59,7 +67,9 @@ See **`ai-sandboxing`** skill for sandbox architecture details.
 - Never modify file permissions arbitrarily
 
 **When working in this repo (chezmoi wrappers):**
-- Never weaken bubblewrap security restrictions — see `ai-sandboxing` skill
+- Never weaken bubblewrap or Seatbelt restrictions (mounts, credential
+  fences, env scrubbing, network gates); opt-in access stays behind
+  `AI_SANDBOX_*` flags that default to off
 - Rlimit enforcement is currently disabled (dropped 2026-09, both Linux and
   macOS backends) — don't reintroduce it ad hoc; re-adding it is tracked as
   a separate follow-up issue
@@ -69,13 +79,18 @@ See **`ai-sandboxing`** skill for sandbox architecture details.
 
 ## 4. Test and Validate
 
-See **`qa-automation`** skill for test structure and patterns.
-
 - Validate syntax before claiming completion: `bash -n script.bash`, `python -m py_compile`, `jq .`
 - Use dry-run modes when available
 - Test in safe environments (subshells, staging) when possible
 - Run `shellcheck` if available for bash scripts
 - Verify changes work as intended before reporting done
+- Isolate tests: fake `HOME`/XDG dirs, temp dirs cleaned up on exit, stub
+  clients. Never let a test reach a real authenticated CLI, live account,
+  or real credential/config dir
+- Cover both the success path and the rejection path
+- Report skipped or unavailable checks as skipped, never as passed
+- In this repo: see `docs/testing.md` (safe commands, `isolate_test_env`,
+  per-OS scope, CI mapping)
 
 ---
 
@@ -206,10 +221,19 @@ Squash already done — you have 1 clean commit to review.
 
 ## This Repository (Chezmoi-Specific)
 
-See **`chezmoi-workflow`** skill for:
-- File naming conventions (`dot_`, `executable_`, `private_`, `.tmpl`)
-- Deployment workflow (`chezmoi diff`, `chezmoi apply`)
-- Repository structure
-- Security-critical wrapper files
-
-**Remember:** Changes in this repo don't deploy until `chezmoi apply`. Always use `chezmoi diff` to preview before applying.
+- **Naming:** `dot_x` deploys as `.x`; `executable_x` deploys with the
+  execute bit; `private_x` deploys with owner-only permissions; `x.tmpl`
+  is rendered as a chezmoi template; `run_once_*` / `run_after_*` scripts
+  run on `chezmoi apply`. `README.md` → "What This Deploys" maps sources to
+  targets; `.chezmoiignore` lists what is never deployed (`docs/`, `tests/`,
+  `.github/`, `README.md`).
+- **Edit the source, not the target:** change files here, never the
+  deployed copies under `~/bin`, `~/.agents` or `~/`.
+- **Deploy:** `chezmoi diff` to preview, `chezmoi apply` only when the user
+  asks. Changes do not deploy until then. This repo may be a secondary
+  source: `CHEZMOI_SOURCE_DIR="$HOME/.local/share/ai-wrapper" chezmoi diff`.
+- **Security-critical files** (Section 3 applies in full):
+  `bin/ai_agent_universal_wrapper.bash`, `bin/ai_wrapper_data/macos_sandbox_exec.bash`,
+  `bin/ai_wrapper_data/claude_wrapper.sb`, `bin/ai_wrapper_data/ai_wrapper_lib.bash`,
+  `bin/ai_wrapper_data/*_wrapper_lib.bash`, `bin/executable_*_wrapper.bash`.
+- **Tests:** `docs/testing.md`. Write bash that also runs on macOS bash 3.2.
