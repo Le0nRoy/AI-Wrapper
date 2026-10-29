@@ -59,6 +59,7 @@ that launch a real sandbox.
 | `test_live_client_isolation.bash` | fake home under `$HOME`, temp dir | bash | full; bwrap e2e if available | host checks; e2e skipped |
 | `test_catalog_os_scope.bash`, `test_help_doc_os_scope.bash` | none | bash | full | full |
 | `test_agy_host_boundary.bash` | fake home under `$HOME`, temp dir, sqlite dbs, symlinks; checks settings.json is only read | bash, python3 | full | full |
+| `test_preset_identity.bash` | fake home under `$HOME`, stub `sha256sum`/`shasum` dirs, preset files | bash, python3 | full | full |
 | `test_setup_skills.bash` | fake home under `$TMPDIR` | bash, coreutils | full | full |
 | `dot_agents/skills/tortuga/scripts/test_gh.py` | none (mocked `subprocess`) | python3 | full | full |
 | `test_sandbox_common.bash`, `test_extra_bind_dirs.bash` | launches the real sandbox, fake home | bwrap + userns / sandbox-exec | fails without bwrap/sysctl | full |
@@ -73,7 +74,8 @@ is the local equivalent. Keep both in sync when adding a test file.
 
 - `lint` (Linux, macOS): `bash -n` on every script; ShellCheck on Linux.
 - `logic-tests` (Linux, macOS): catalog, help-doc, setup-skills, Tortuga
-  helper, live-client isolation canaries, agy host-side boundary.
+  helper, live-client isolation canaries, agy host-side boundary, preset
+  identity.
 - `smoke-linux`: bubblewrap installed; sandbox, extra-binds, isolation
   canaries (with e2e), codex, bind-hardening, agy, copilot.
 - `smoke-macos`: sandbox, macOS-only, extra-binds, preset suite.
