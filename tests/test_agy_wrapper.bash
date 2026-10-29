@@ -466,9 +466,12 @@ cat "${HOME}/.gemini/marker" 2>&1
 [[ -f "${HOME}/.gemini/config/skills/orchestrator-mode/SKILL.md" ]] && echo "SKILL_OK"
 STUB
     _sync_agy_stub
-    assert_client_is_fake agy
+    # Host-side launches put ~/.local/bin first, so check resolution on
+    # that same PATH (the ~/bin trap may have been removed above).
+    agy_path="${FAKE_HOME}/.local/bin:${PATH}"
+    PATH="${agy_path}" assert_client_is_fake agy
 
-    out="$(cd "${FAKE_HOME}/work" && PATH="${FAKE_HOME}/.local/bin:${PATH}" AGY_ACCOUNT=alt \
+    out="$(cd "${FAKE_HOME}/work" && PATH="${agy_path}" AGY_ACCOUNT=alt \
         bash "${REPO_ROOT}/bin/executable_agy_wrapper.bash" chat hello </dev/null 2>&1)"
     rc=$?
     assert_eq "${rc}" "0" "wrapper launches stub agy from ~/.local/bin inside sandbox"
@@ -478,7 +481,7 @@ STUB
     assert_contains "${out}" "SKILL_OK" "orchestrator-mode skill is visible inside the sandbox"
 
     _fresh_dir="$(mktemp -d "${FAKE_HOME}/work-invalid-XXXXXX")"
-    out="$(cd "${_fresh_dir}" && PATH="${FAKE_HOME}/.local/bin:${PATH}" AGY_ACCOUNT='x;y' \
+    out="$(cd "${_fresh_dir}" && PATH="${agy_path}" AGY_ACCOUNT='x;y' \
         bash "${REPO_ROOT}/bin/executable_agy_wrapper.bash" chat hello </dev/null 2>&1)"
     rc=$?
     assert_eq "${rc}" "1" "wrapper refuses an invalid AGY_ACCOUNT before launch"
@@ -494,7 +497,7 @@ STUB
 git log --format='LOG:%s' -1 2>&1
 STUB
         _sync_agy_stub
-        out="$(cd "${FAKE_HOME}/wt" && PATH="${FAKE_HOME}/.local/bin:${PATH}" \
+        out="$(cd "${FAKE_HOME}/wt" && PATH="${agy_path}" \
             bash "${REPO_ROOT}/bin/executable_agy_wrapper.bash" x </dev/null 2>&1)"
         assert_contains "${out}" "LOG:init" "agy wrapper: git works in a worktree inside the sandbox"
     fi

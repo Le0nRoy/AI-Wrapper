@@ -98,6 +98,22 @@ assert_eq "$(claude 2>/dev/null; echo "rc=$?")" "rc=${LIVE_CLIENT_TRAP_RC}" "...
 install_live_client_trap "${FAKE_HOME}/bin/codex"
 rm -rf "${HOME}/.live-client-trap"
 
+# A stub in ~/.local/bin with its ~/bin trap removed (the agy e2e layout)
+# resolves to the stub only when ~/.local/bin is on the evaluation PATH;
+# otherwise the live client in a system-like dir wins.
+mkdir -p "${FAKE_HOME}/.local/bin"
+printf '#!/bin/sh\necho STUB\n' >"${FAKE_HOME}/.local/bin/agy"
+chmod +x "${FAKE_HOME}/.local/bin/agy"
+rm -f "${FAKE_HOME}/bin/agy"
+hash -r
+PATH="${FAKE_HOME}/.local/bin:${PATH}" assert_client_is_fake agy
+assert_eq "$(PATH="${FAKE_HOME}/.local/bin:${PATH}" agy)" "STUB" "... and runs the ~/.local/bin stub"
+assert_eq "$(command -v agy)" "${LIVE_DIR}/bin/agy" "without ~/.local/bin on PATH the trap-less agy is not fake"
+install_live_client_trap "${FAKE_HOME}/bin/agy"
+rm -f "${FAKE_HOME}/.local/bin/agy"
+hash -r
+assert_client_is_fake agy
+
 echo "-- end-to-end: un-stubbed client inside the sandbox"
 if [[ "${OS}" == "Linux" ]] && command -v bwrap >/dev/null 2>&1; then
     mkdir -p "${FAKE_HOME}/work"
