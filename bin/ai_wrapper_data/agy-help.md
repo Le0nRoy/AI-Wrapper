@@ -71,7 +71,9 @@ grants `agy` full autonomy inside the sandbox boundary:
   preferences in `settings.json` (theme, vim mode, etc.) and the file's
   permissions are preserved. If `settings.json` is not valid JSON the launch
   fails instead of resetting it. This update runs on the host with
-  `python3 -I` (required; there is no `jq` fallback).
+  `python3 -I` (required; there is no `jq` fallback). Concurrent wrapper
+  launches on one profile take turns; a write by agy itself in the same
+  instant can still be lost (see `docs/security-concerns.md`, B-μ).
 
 ### Symlinked settings.json (dotfiles)
 
@@ -90,7 +92,9 @@ in its directory, and leaves the symlink as is. An approval for one profile
 is not used for another account. A missing, dangling, mismatched or
 non-regular target fails the launch. The approval is saved in this
 workdir's preset and is ignored when that preset directory is writable
-inside the sandbox (for example via `AI_SANDBOX_EXTRA_RW_DIRS`).
+inside the sandbox (for example via `AI_SANDBOX_EXTRA_RW_DIRS`), or when an
+`AI_WRAPPER_EXTRA_PROFILE` plugin defines `_extra_post_menu_setup` or
+`_extra_sandbox_setup` (they can add sandbox binds after the check).
 
 ## Account switching
 

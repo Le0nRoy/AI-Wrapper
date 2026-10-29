@@ -1295,7 +1295,8 @@ _agent_resume_args() {
 # profile directory AND one existing canonical file, so switching accounts
 # never reuses another profile's approval. Empty (default) = a symlinked
 # settings.json is refused. Persisted in this workdir's agy preset; refused
-# when that preset is writable from inside the sandbox.
+# when that preset is writable from inside the sandbox, or when a plugin
+# hook can add sandbox binds after the check (_AGY_LATE_BIND_HOOKS).
 _AI_SETTINGS_LIST+=(
     "AGY_SETTINGS_TRUSTED_PROFILE|path||yellow|Trusted settings.json profile|Resolved profile dir (e.g. ~/.gemini) whose antigravity-cli/settings.json symlink may be written through. Pair with the target below; empty refuses a symlinked settings.json.|account"
     "AGY_SETTINGS_TRUSTED_TARGET|path||yellow|Trusted settings.json target file|Exact existing canonical file that profile's settings.json symlink must resolve to. Only this file is updated; the symlink is kept.|account"
