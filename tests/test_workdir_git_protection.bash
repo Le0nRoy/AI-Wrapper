@@ -508,13 +508,36 @@ rm -rf "${V}/.git/hooks"; ln -s "${R}/target-dir" "${V}/.git/hooks"
 mkdir -p "${FAKE_HOME}/.gemini/antigravity-cli"
 python3 -I -c 'import json,sys;print(json.dumps({"toolPermission":"always-proceed","artifactReviewPolicy":"always-proceed","allowNonWorkspaceAccess":True,"enableTerminalSandbox":False,"trustedWorkspaces":sys.argv[1:]}))' \
     "${V}" >"${FAKE_HOME}/.gemini/antigravity-cli/settings.json"
+# Nested submodule metadata (#12): a symlinked namespace parent two levels
+# down, in WORKDIR's own .git and in a linked worktree's shared common dir.
+VN="${R}/refuse-nested"
+rm -rf "${VN}"; cp -R "${NS}" "${VN}"
+mv "${VN}/.git/modules/ns/inner" "${R}/refuse-inner.saved"
+ln -s "${R}/refuse-inner.saved" "${VN}/.git/modules/ns/inner"
+VW="${R}/refuse-wt"
+git_q -C "${VN}" worktree add "${VW}" -b refuse-wt
+python3 -I -c 'import json,sys;print(json.dumps({"toolPermission":"always-proceed","artifactReviewPolicy":"always-proceed","allowNonWorkspaceAccess":True,"enableTerminalSandbox":False,"trustedWorkspaces":sys.argv[1:]}))' \
+    "${V}" "${VN}" "${VW}" >"${FAKE_HOME}/.gemini/antigravity-cli/settings.json"
+canary_before="$(ls -A "${R}/refuse-inner.saved")"
 for client in claude codex agy copilot cursor_agent; do
     out="$(cd "${V}" && bash "${REPO_ROOT}/bin/executable_${client}_wrapper.bash" x </dev/null 2>&1)"; rc=$?
     assert_eq "${rc}" "1" "${client}: symlinked hooks/ exits 1"
     assert_contains "${out}" "is a symlink" "${client}: ... with the refusal ERROR"
     assert_not_contains "${out}" "LIVE_CLIENT_TRAP" "${client}: ... before the client runs"
+    out="$(cd "${VN}" && bash "${REPO_ROOT}/bin/executable_${client}_wrapper.bash" x </dev/null 2>&1)"; rc=$?
+    assert_eq "${rc}" "1" "${client}: symlinked nested submodule namespace exits 1"
+    assert_contains "${out}" "is a symlink" "${client}: ... with the refusal ERROR"
+    assert_not_contains "${out}" "LIVE_CLIENT_TRAP" "${client}: ... before the client runs"
+    # cursor-agent never binds a worktree's common dir (nothing to refuse).
+    [[ "${client}" == "cursor_agent" ]] && continue
+    out="$(cd "${VW}" && bash "${REPO_ROOT}/bin/executable_${client}_wrapper.bash" x </dev/null 2>&1)"; rc=$?
+    assert_eq "${rc}" "1" "${client}: symlinked submodule namespace in a worktree's common dir exits 1"
+    assert_contains "${out}" "is a symlink" "${client}: ... with the refusal ERROR"
+    assert_not_contains "${out}" "LIVE_CLIENT_TRAP" "${client}: ... before the client runs"
 done
-rm -rf "${V}"
+assert_eq "$(ls -A "${R}/refuse-inner.saved")" "${canary_before}" "nested refusals: symlink target untouched"
+git_q -C "${VN}" worktree remove --force "${VW}"
+rm -rf "${V}" "${VN}" "${VW}" "${R}/refuse-inner.saved"
 
 # ---------------------------------------------------------------------------
 echo "-- native enforcement (codex wrapper)"
