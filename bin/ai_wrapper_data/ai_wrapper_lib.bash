@@ -322,7 +322,6 @@ _wrapper_bind_git_common_dir() {
     local tag="${AI_AGENT_COMMAND:-ai-wrapper}" m
     _wrapper_git_scan_modules "${tag}" "${git_common_resolved}/modules" "${wt_entry}/modules" || return 1
     local -a shared_pins=() shared_dirs=()
-    _WRAPPER_WT_MODULE_PINS=(); _WRAPPER_WT_MODULE_DIRS=()
     for m in "${_wg_scan_pins[@]+"${_wg_scan_pins[@]}"}"; do
         if [[ "${m}" == "${wt_entry}/modules" || "${m}" == "${wt_entry}/modules/"* ]]; then
             _WRAPPER_WT_MODULE_PINS+=("${m}")
