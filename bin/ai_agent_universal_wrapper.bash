@@ -222,7 +222,7 @@ _run_sandboxed_agent_linux() {
             [[ -z "${_d}" ]] && continue
             _d="${_d/#\~/${HOME}}"
             if [[ -d "${_d}" ]]; then
-                _user_extra_bwrap_flags+=(--ro-bind "${_d}" "${_d}")
+                extra_bwrap_flags+=(--ro-bind "${_d}" "${_d}")
                 _user_extra_bind_dirs+=("${_d}")
             else
                 echo_log "WARNING" "[$agent_name] AI_SANDBOX_EXTRA_RO_DIRS: skipping '${_d}' (not a directory)"
@@ -231,11 +231,13 @@ _run_sandboxed_agent_linux() {
         IFS="${_extra_dirs_ifs}"
     fi
 
-    # User extras mount BEFORE the wrapper's own binds: bwrap's later mount
-    # wins, so an extra RW dir equal to or above WORKDIR (or a worktree's
-    # shared .git) must not cover the wrapper's read-only git metadata
-    # layers or pins. Same outcome as the macOS backend, where RO denies
-    # win regardless of order.
+    # User RW extras mount BEFORE the wrapper's own binds: bwrap's later
+    # mount wins, so an extra RW dir equal to or above WORKDIR (or a
+    # worktree's shared .git) must not cover the wrapper's read-only git
+    # metadata layers. User RO extras stay after them, so the wrapper's RW
+    # binds (git dir pin, worktree common dir) cannot reopen a directory
+    # the user asked to be read-only. (The macOS backend renders RO as
+    # order-independent denies instead.)
     extra_bwrap_flags=("${_user_extra_bwrap_flags[@]+"${_user_extra_bwrap_flags[@]}"}" \
         "${extra_bwrap_flags[@]+"${extra_bwrap_flags[@]}"}")
 

@@ -92,6 +92,18 @@ assert_contains "${out}" "--pin${NL}${N}/.git${NL}" "normal repo (macOS): .git p
 assert_contains "${out}" "--ro-bind${NL}${N}/.git/config${NL}" "normal repo (macOS): config read-only"
 assert_contains "${out}" "--ro-bind${NL}${N}/.git/hooks" "normal repo (macOS): hooks/ read-only"
 
+echo "-- WORKDIR reached through a symlink"
+# bwrap mounts WORKDIR at the logical cwd; the over-mounts must target the
+# same logical paths (sources stay resolved).
+ln -s "${R}" "${FAKE_HOME}/repos-link"
+L="${FAKE_HOME}/repos-link/normal"
+out="$(_protect "${L}")"
+assert_contains "${out}" "--bind${NL}${N}/.git${NL}${L}/.git${NL}" "symlinked cwd (Linux): pin mounted at the logical path"
+assert_contains "${out}" "--ro-bind${NL}${N}/.git/config${NL}${L}/.git/config${NL}" "symlinked cwd (Linux): config RO at the logical path"
+assert_contains "${out}" "--ro-bind${NL}${N}/.git/hooks${NL}${L}/.git/hooks" "symlinked cwd (Linux): hooks/ RO at the logical path"
+out="$(_protect "${L}" Darwin)"
+assert_contains "${out}" "--ro-bind${NL}${N}/.git/config${NL}" "symlinked cwd (macOS): resolved path (backend uses pwd -P)"
+
 echo "-- normal repository: extra entries"
 mkdir -p "${N}/.git/modules/sub1/hooks"; : >"${N}/.git/modules/sub1/config"
 : >"${N}/.git/config.worktree"
@@ -447,6 +459,10 @@ if [[ "${sandbox_e2e}" == "1" ]]; then
     git -C "${E}" config --unset-all core.fsmonitor 2>/dev/null
     git -C "${E}" config --remove-section alias 2>/dev/null
     rm -f "${E}/.git/hooks/post-checkout"
+    # The relaxed hooks-rename probe moved hooks/ away; put it back.
+    if [[ -d "${E}/.git/hooks.old" ]]; then
+        rm -rf "${E}/.git/hooks"; mv "${E}/.git/hooks.old" "${E}/.git/hooks"
+    fi
 
     echo "-- e2e: absent hooks/ and config.worktree (accepted residual)"
     rm -rf "${E}/.git/hooks"
@@ -499,6 +515,40 @@ probe gitdir-move bash -c "ren .git .git.moved; rc=\$?; [ \"\${rc}\" = 0 ] && re
         assert_contains "${out}" "DENIED:${p}" "e2e extra-rw parent: ${p} denied"
     done
     assert_eq "$(_sums "${E}/.git/config")" "${before}" "e2e extra-rw parent: config bytes unchanged on the host"
+
+    echo "-- e2e: WORKDIR reached through a symlink"
+    EL="${FAKE_HOME}/repos-link/e2e"
+    # Linux sees the logical mount path; macOS resolves it.
+    el_expect="${EL}/.git"; [[ "${OS}" == "Darwin" ]] && el_expect="${E}/.git"
+    before="$(_sums "${E}/.git/config" "${E}/.git/hooks")"
+    _write_probe "${el_expect}" ".git/config" '
+probe append-config sh -c "echo evil >>.git/config"
+probe hook-create sh -c "echo evil >.git/hooks/post-checkout"
+probe gitdir-move bash -c "ren .git .git.moved; rc=\$?; [ \"\${rc}\" = 0 ] && ren .git.moved .git; exit \${rc}"
+g commit --allow-empty -m via-link && echo COMMIT_OK
+'
+    out="$(_launch "${EL}")"; rc=$?
+    _assert_ran "${out}" "${rc}" "e2e symlinked cwd"
+    for p in append-config hook-create gitdir-move; do
+        assert_contains "${out}" "DENIED:${p}" "e2e symlinked cwd: ${p} denied"
+    done
+    assert_contains "${out}" "COMMIT_OK" "e2e symlinked cwd: commit works"
+    assert_eq "$(_sums "${E}/.git/config" "${E}/.git/hooks")" "${before}" "e2e symlinked cwd: config and hooks/ unchanged on the host"
+
+    echo "-- e2e: AI_SANDBOX_EXTRA_RO_DIRS on .git is not reopened by the pin"
+    ro_list="${E}/.git"; [[ "${OS}" == "Darwin" ]] && ro_list="${FAKE_HOME}/bin,${E}/.git"
+    _write_probe "${E}/.git" "${E}/.git/config" '
+probe append-config sh -c "echo evil >>.git/config"
+probe hook-create sh -c "echo evil >.git/hooks/post-checkout"
+probe gitdir-file sh -c "echo x >.git/probe-file"
+'
+    out="$(cd "${E}" && AI_SANDBOX_EXTRA_RO_DIRS="${ro_list}" AI_SANDBOX_ALLOW_GIT_CONFIG=1 \
+        bash "${REPO_ROOT}/bin/executable_codex_wrapper.bash" x </dev/null 2>&1)"; rc=$?
+    _assert_ran "${out}" "${rc}" "e2e extra-ro .git (relaxed)"
+    for p in append-config hook-create gitdir-file; do
+        assert_contains "${out}" "DENIED:${p}" "e2e extra-ro .git (relaxed): ${p} denied"
+    done
+    rm -f "${E}/.git/probe-file" "${E}/.git/hooks/post-checkout"
 
     echo "-- e2e: linked worktree pointer"
     git_q -C "${E}" worktree add "${R}/e2e-wt" -b e2e-wt

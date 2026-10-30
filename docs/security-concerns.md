@@ -503,9 +503,10 @@ wrapper) and `tests/test_macos_ro_overlays.bash`, both in CI
 Linux used to differ in one case: bwrap applies binds in order, and
 `AI_SANDBOX_EXTRA_RW_DIRS` entries were appended after the wrapper's RO
 over-mounts, so an entry covering the common dir hid them. Since #10 the
-backend mounts user extra dirs before the wrapper's own binds, so the
-RO layers win on both OSes (`_extra_sandbox_setup` binds still come
-last).
+backend mounts user RW extra dirs before the wrapper's own binds (user
+RO extra dirs stay after them, so the wrapper's RW binds cannot reopen
+them), so the RO layers win on both OSes (`_extra_sandbox_setup` binds
+still come last).
 
 The WORKDIR's own `.git` is covered by B-ν.
 
@@ -558,14 +559,25 @@ starts. It protects only entries that exist at launch:
 - **No host mutation.** Nothing is created or truncated, unlike the
   common-dir helper (B-λ), and there is no post-session step.
 
-**Usability impact (protected mode).** Commit, branch, checkout,
-merge/rebase, fetch and plain push keep working and persist. `git
-config`, `git remote add`, `git branch --set-upstream-to`, `git
-worktree add/prune`, hook installers (`pre-commit install`, husky) and
-submodule updates fail with "could not lock/rename config" or EROFS.
-`git push -u` can update the remote and then fail to record the local
-tracking config: the push lands, the upstream is not set
-(`tests/test_workdir_git_protection.bash` checks both).
+**Usability impact (protected mode).** Commit, new local branches,
+checkout of local branches, merge/rebase, fetch and plain push keep
+working and persist. Anything that writes config fails with "could not
+lock/rename config" or EROFS: `git config`, `git remote add`, `git
+branch --set-upstream-to`, hook installers (`pre-commit install`,
+husky), `git submodule init/update`. Some commands fail half-way:
+
+- `git push -u` can update the remote and then fail to record the local
+  tracking config: the push lands, the upstream is not set
+  (`tests/test_workdir_git_protection.bash` checks both);
+- creating a branch that tracks a remote (`git checkout <remote-only
+  branch>`, `checkout -b x origin/x`, `switch`, `branch x origin/y`)
+  creates the ref, fails to write the tracking config and exits non-zero
+  (checkout leaves HEAD where it was);
+- `git branch -m` renames the ref, then fails to update config.
+
+When linked worktrees exist, `worktrees/` is read-only from the main
+checkout too, so `git worktree add/prune`, `git gc`'s worktree pruning
+and renaming a branch checked out in another worktree fail.
 
 **Residual (accepted by the owner).**
 
@@ -584,6 +596,11 @@ tracking config: the push lands, the upstream is not set
   `sshCommand`, aliases) that run scripts from WORKDIR, and existing hooks
   that read WORKDIR content (pre-commit's `.pre-commit-config.yaml`,
   husky scripts, Makefiles), are not audited.
+- *Operation state.* `.git/rebase-merge/` and `.git/rebase-apply/` must
+  stay writable. The agent can leave a rebase in progress whose todo list
+  contains `exec <cmd>`; `git rebase --continue` on the host then runs it.
+  Check `git status` and the todo before continuing a rebase you did not
+  start.
 - *Not sanitized.* RO protection freezes what is there; it does not
   clean commands or hook symlinks already present, or metadata written by
   an earlier unprotected session.

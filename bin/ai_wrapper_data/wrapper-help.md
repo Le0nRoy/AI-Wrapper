@@ -59,10 +59,15 @@ The sandbox bounds *writes* — it does not bound *reads* or *network*. Be aware
 - `AI_SANDBOX_ALLOW_GIT_CONFIG=1` — leave WORKDIR's `.git/config`,
   `.git/hooks/`, `config.worktree` and submodule config/hooks writable.
   By default (0) they are read-only because host git runs hooks and
-  commands from config outside the sandbox; commit, branch, checkout and
-  push still work, but `git config`, `git remote add`,
-  `branch --set-upstream-to` and hook installers fail, and `git push -u`
-  may update the remote yet fail to record the upstream. The `.git` dir
+  commands from config outside the sandbox; commit, local branches,
+  checkout of local branches and push still work, but anything that
+  writes config fails: `git config`, `git remote add`,
+  `branch --set-upstream-to`, hook installers, submodule init. Some
+  commands fail half-way: `git push -u` may update the remote yet not
+  record the upstream, checking out a remote-only branch creates the
+  branch but exits non-zero, and `git branch -m` renames before failing.
+  It does not relax a linked worktree's shared `.git` (always protected).
+  The `.git` dir
   stays pinned (cannot be moved or replaced), a worktree's `.git` file
   and `commondir` stay read-only, and symlinked metadata refuses the
   launch in both modes. Entries absent at launch (often
