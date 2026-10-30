@@ -133,6 +133,14 @@ ln -s "${FAKE_HOME}/area/other" "${FAKE_HOME}/area-link"
 out="$(_render "${FAKE_HOME}/area-link")"
 assert_contains "${out}" "(subpath \"${FAKE_HOME}/area/other\")" "symlinked RO path is denied at its canonical target"
 
+echo "-- --pin rendering (_append_pin_rules)"
+out="$( _load_backend; _append_pin_rules test "${FAKE_HOME}" "${FAKE_HOME}/area/rw" 2>&1 )"
+assert_eq "${out}" "${NL}(deny file-write* (literal \"${FAKE_HOME}/area/rw\") (literal \"${FAKE_HOME}/area\"))" \
+    "pin: literal write deny on the path and its ancestors below \$HOME only"
+out="$( _load_backend; _append_pin_rules test "${FAKE_HOME}" "${FAKE_HOME}/area/missing/deeper" 2>&1 )"; rc=$?
+assert_eq "${rc}" "1" "pin: unresolvable path fails closed"
+assert_contains "${out}" "Could not resolve --pin path" "... with the resolve error"
+
 # ---------------------------------------------------------------------------
 echo "-- backend wiring (AI_SANDBOX_DRYRUN)"
 STUB_BIN="${FAKE_HOME}/stub-bin"
@@ -172,17 +180,32 @@ assert_eq "${order_ok}" "1" "write-deny rules are rendered after every allow rul
 out="$(_dryrun -- --bind "${mg}" -- hi)"
 profile="${out#*=== Rendered SBPL profile ===}"
 assert_not_contains "${profile}" "(deny ${DENY_OPS}" "no --ro-bind: no write-deny rules"
+assert_not_contains "${profile}" "(deny file-write*" "no --ro-bind / --pin: no pin rules"
+# --pin alone (relaxed WORKDIR git metadata: no RO child to derive a pin).
+out="$(_dryrun -- --pin "${FAKE_HOME}/project/ro-sub" -- hi)"; rc=$?
+assert_eq "${rc}" "0" "dry-run with --pin renders"
+profile="${out#*=== Rendered SBPL profile ===}"
+assert_contains "${profile}" "(deny file-write* (literal \"${FAKE_HOME}/project/ro-sub\") (literal \"${FAKE_HOME}/project\"))" "--pin renders a literal write deny on the path and WORKDIR"
+assert_not_contains "${profile}" "(allow file-read* (literal \"${FAKE_HOME}/project/ro-sub\"))" "--pin grants nothing"
+last_allow="$(printf '%s\n' "${profile}" | grep -n '^(allow' | tail -1 | cut -d: -f1)"
+first_pin="$(printf '%s\n' "${profile}" | grep -nF "(deny file-write* (literal \"${FAKE_HOME}/project/ro-sub\")" | head -1 | cut -d: -f1)"
+order_ok=0; [[ -n "${last_allow}" && -n "${first_pin}" && "${first_pin}" -gt "${last_allow}" ]] && order_ok=1
+assert_eq "${order_ok}" "1" "--pin rule rendered after every allow rule"
+out="$(_dryrun -- --pin "${FAKE_HOME}/nope" -- hi)"; rc=$?
+assert_eq "${rc}" "1" "missing --pin source fails"
+assert_contains "${out}" "--pin source missing" "... with the source-missing message"
 
 # _extra_sandbox_setup (AI_WRAPPER_EXTRA_PROFILE callback) keeps appending
 # to binds_ro / binds_rw, and its RO entries are enforced too.
 _ext_dryrun() {
     ( cd "${FAKE_HOME}/project" && PATH="${dry_path}" && _load_backend
       # shellcheck disable=SC2317,SC2329  # invoked by the backend
-      _extra_sandbox_setup() { binds_ro+=("${FAKE_HOME}/project/ro-sub"); binds_rw+=("${FAKE_HOME}/ext-rw"); }
+      _extra_sandbox_setup() { binds_ro+=("${FAKE_HOME}/project/ro-sub"); binds_rw+=("${FAKE_HOME}/ext-rw"); binds_pin+=("${FAKE_HOME}/ext-rw"); }
       AI_SANDBOX_DRYRUN=1 _run_sandboxed_agent_impl /bin/echo -- -- hi ) 2>&1
 }
 out="$(_ext_dryrun)"
 profile="${out#*=== Rendered SBPL profile ===}"
+assert_contains "${profile}" "(deny file-write* (literal \"${FAKE_HOME}/ext-rw\"))" "extension hook: binds_pin rendered"
 assert_contains "${profile}" "(allow file* (subpath \"${FAKE_HOME}/ext-rw\"))" "extension hook: binds_rw still rendered"
 assert_contains "${profile}" "(deny ${DENY_OPS} (subpath \"${FAKE_HOME}/project/ro-sub\"))" "extension hook: binds_ro write-denied"
 
@@ -262,6 +285,25 @@ else
     assert_not_contains "${out}" "RO_WROTE" "native pin probe: RO subtree write denied"
     pin_ok=0; [[ -d "${pin_area}/sub/ro" && ! -e "${pin_area}/sub/ro/x" && -f "${pin_area}/sub/sibling" ]] && pin_ok=1
     assert_eq "${pin_ok}" "1" "native pin probe: host state matches (RO dir untouched, sibling written)"
+
+    # --pin alone (no RO child): the directory cannot be moved or removed,
+    # its children stay writable.
+    pin_only="${FAKE_HOME}/pin-only"
+    mkdir -p "${pin_only}/root"
+    out="$(_native -- --bind "${pin_only}" --pin "${pin_only}/root" -- -c '
+        (echo x >"$1/root/child") 2>/dev/null && echo PINONLY_CHILD_WROTE
+        mkdir "$1/root/sub" 2>/dev/null && echo PINONLY_MKDIR_OK
+        mv "$1/root" "$1/moved" 2>/dev/null && echo PINONLY_MOVED
+        rm -rf "$1/root" 2>/dev/null; [ -d "$1/root" ] || echo PINONLY_REMOVED
+        echo PINONLY_DONE' _ "${pin_only}")"
+    echo "  (native --pin probe output: ${out})"
+    for ok in PINONLY_CHILD_WROTE PINONLY_MKDIR_OK PINONLY_DONE; do
+        assert_contains "${out}" "${ok}" "native --pin probe: ${ok}"
+    done
+    assert_not_contains "${out}" "PINONLY_MOVED" "native --pin probe: pinned dir cannot be renamed"
+    assert_not_contains "${out}" "PINONLY_REMOVED" "native --pin probe: pinned dir cannot be removed"
+    pin_ok=0; [[ -d "${pin_only}/root" && ! -e "${pin_only}/moved" ]] && pin_ok=1
+    assert_eq "${pin_ok}" "1" "native --pin probe: pinned dir still in place on the host"
 
     # AI_SANDBOX_EXTRA_RO_DIRS inside WORKDIR, and an RW extra dir equal to
     # the common dir, are enforced.

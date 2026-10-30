@@ -13,7 +13,7 @@
 #
 # BIND_FLAGS on Linux are bwrap-shaped: --bind SRC DST / --ro-bind SRC DST.
 # BIND_FLAGS on macOS are single-arg (see macos_sandbox_exec.bash header):
-# --bind SRC / --ro-bind SRC / --meta-bind SRC.
+# --bind SRC / --ro-bind SRC / --meta-bind SRC / --pin SRC.
 # Callers that need to run on both OSes must branch on `uname -s` themselves
 # when building BIND_FLAGS, same as executable_claude_wrapper.bash does.
 
@@ -196,7 +196,7 @@ _run_sandboxed_agent_linux() {
     # wholesale would also flag those trusted binds and refuse to launch.
     # Tilde is preserved verbatim in preset files; quoted [[ -d ]] does not
     # expand it, so use parameter substitution to expand a leading ~ to $HOME.
-    local -a _user_extra_bind_dirs=()
+    local -a _user_extra_bind_dirs=() _user_extra_bwrap_flags=()
     local _extra_dirs_ifs _d
     if [[ -n "${AI_SANDBOX_EXTRA_RW_DIRS:-}" ]]; then
         _extra_dirs_ifs="${IFS}"; IFS=','
@@ -206,7 +206,7 @@ _run_sandboxed_agent_linux() {
             [[ -z "${_d}" ]] && continue
             _d="${_d/#\~/${HOME}}"
             if [[ -d "${_d}" ]]; then
-                extra_bwrap_flags+=(--bind "${_d}" "${_d}")
+                _user_extra_bwrap_flags+=(--bind "${_d}" "${_d}")
                 _user_extra_bind_dirs+=("${_d}")
             else
                 echo_log "WARNING" "[$agent_name] AI_SANDBOX_EXTRA_RW_DIRS: skipping '${_d}' (not a directory)"
@@ -222,7 +222,7 @@ _run_sandboxed_agent_linux() {
             [[ -z "${_d}" ]] && continue
             _d="${_d/#\~/${HOME}}"
             if [[ -d "${_d}" ]]; then
-                extra_bwrap_flags+=(--ro-bind "${_d}" "${_d}")
+                _user_extra_bwrap_flags+=(--ro-bind "${_d}" "${_d}")
                 _user_extra_bind_dirs+=("${_d}")
             else
                 echo_log "WARNING" "[$agent_name] AI_SANDBOX_EXTRA_RO_DIRS: skipping '${_d}' (not a directory)"
@@ -230,6 +230,14 @@ _run_sandboxed_agent_linux() {
         done
         IFS="${_extra_dirs_ifs}"
     fi
+
+    # User extras mount BEFORE the wrapper's own binds: bwrap's later mount
+    # wins, so an extra RW dir equal to or above WORKDIR (or a worktree's
+    # shared .git) must not cover the wrapper's read-only git metadata
+    # layers or pins. Same outcome as the macOS backend, where RO denies
+    # win regardless of order.
+    extra_bwrap_flags=("${_user_extra_bwrap_flags[@]+"${_user_extra_bwrap_flags[@]}"}" \
+        "${extra_bwrap_flags[@]+"${extra_bwrap_flags[@]}"}")
 
     # Setup paths
     WORKDIR="$(pwd)"

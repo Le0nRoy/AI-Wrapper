@@ -220,7 +220,7 @@ if [[ $# -eq 0 && -t 0 && -t 1 ]]; then
     # menu so flips made in the Settings sub-menu (account switch,
     # PASS_GITLAB) actually reach WRAPPER_FLAGS.
     _bind_claude_account
-    _apply_post_menu_binds
+    _apply_post_menu_binds || exit 1
 
     # Plugin post-menu hook: downstream extensions (loaded via
     # AI_WRAPPER_EXTRA_PROFILE) can mutate AGENT_FLAGS / AI_SANDBOX_PROFILE /
@@ -251,7 +251,7 @@ fi
 # catalog defaults.
 _preset_autoload
 _bind_claude_account
-_apply_post_menu_binds
+_apply_post_menu_binds || exit 1
 # Non-interactive plugin hook: same contract as the interactive path above
 # so scripted invocations pick up plugin post-menu mutations too.
 if declare -f _extra_post_menu_setup >/dev/null 2>&1; then

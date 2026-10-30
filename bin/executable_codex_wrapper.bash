@@ -65,7 +65,7 @@ if [[ $# -eq 0 && -t 0 && -t 1 ]]; then
     # Resolve CODEX_ACCOUNT and apply toggle-dependent binds AFTER the
     # menu so flips made in the Settings sub-menu reach WRAPPER_FLAGS.
     _bind_codex_account
-    _apply_post_menu_binds
+    _apply_post_menu_binds || exit 1
 
     # Plugin post-menu hook (AI_WRAPPER_EXTRA_PROFILE); no-op when undefined.
     if declare -f _extra_post_menu_setup >/dev/null 2>&1; then
@@ -94,7 +94,7 @@ fi
 # AI rules (AGENTS.md and CLAUDE.md) are bound by default in universal wrapper
 _preset_autoload
 _bind_codex_account
-_apply_post_menu_binds
+_apply_post_menu_binds || exit 1
 if declare -f _extra_post_menu_setup >/dev/null 2>&1; then
     _extra_post_menu_setup
 fi

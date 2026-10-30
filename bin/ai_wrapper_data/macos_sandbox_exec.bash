@@ -55,10 +55,10 @@ _run_sandboxed_agent_impl() {
     # agent runs without access it was promised, which surfaces as confusing
     # failures deep inside the sandboxed command. Callers must gate optional
     # binds at the call site (e.g. `[[ -e X ]] && WRAPPER_FLAGS+=(--bind X)`).
-    local -a binds_rw=() binds_ro=() binds_meta=()
+    local -a binds_rw=() binds_ro=() binds_meta=() binds_pin=()
     while [[ $# -gt 0 && "${1}" != "--" ]]; do
         case "${1}" in
-            --bind|--ro-bind|--meta-bind)
+            --bind|--ro-bind|--meta-bind|--pin)
                 # Single positional SRC. sandbox-exec cannot remap paths, so
                 # there's no DST. A legacy two-arg call `--bind SRC DST` would
                 # now consume DST as the next flag in the loop and almost
@@ -70,6 +70,12 @@ _run_sandboxed_agent_impl() {
                 # Used for path-traversal-only access (e.g. parent dirs of a
                 # worktree's shared .git that git needs to canonicalize but
                 # not actually read). Tighter than --ro-bind.
+                #
+                # --pin grants nothing: it write-denies the literal path and
+                # its ancestors below HOME (_append_pin_rules) so a
+                # directory inside a writable area cannot be renamed,
+                # removed or replaced; its children are unaffected. The
+                # Linux equivalent is a self-bind (_wrapper_add_pin).
                 if [[ $# -lt 2 ]]; then
                     echo_log "ERROR" "[${tag}] ${1} requires SRC (got: ${*})"
                     return 2
@@ -89,6 +95,7 @@ _run_sandboxed_agent_impl() {
                     --bind)      binds_rw+=("${2}") ;;
                     --ro-bind)   binds_ro+=("${2}") ;;
                     --meta-bind) binds_meta+=("${2}") ;;
+                    --pin)       binds_pin+=("${2}") ;;
                 esac
                 shift 2
                 ;;
@@ -99,7 +106,7 @@ _run_sandboxed_agent_impl() {
                 # old two-arg form catches callers migrating from the
                 # pre-WS1 bubblewrap-shape vocabulary.
                 if [[ -e "${1}" ]]; then
-                    echo_log "ERROR" "[${tag}] Unexpected path '${1}' in flag position. Hint: --bind / --ro-bind / --meta-bind are single-arg (SRC only)."
+                    echo_log "ERROR" "[${tag}] Unexpected path '${1}' in flag position. Hint: --bind / --ro-bind / --meta-bind / --pin are single-arg (SRC only)."
                 else
                     echo_log "ERROR" "[${tag}] Unsupported sandbox flag: ${1}"
                 fi
@@ -710,7 +717,7 @@ _run_sandboxed_agent_impl() {
 
     # Downstream extension hook (see AI_WRAPPER_EXTRA_PROFILE in
     # bin/executable_claude_wrapper.bash). Fires before binds are baked into
-    # the SBPL profile so the callback can append to binds_rw / binds_ro /
+    # the SBPL profile so the callback can append to binds_rw / binds_ro / binds_pin /
     # binds_meta and mutate env_allowlist. Runs in the outer function scope
     # (not the subshell), matching the arrays' scope.
     if declare -f _extra_sandbox_setup >/dev/null 2>&1; then
@@ -737,6 +744,10 @@ _run_sandboxed_agent_impl() {
     # --ro-bind write denial, rendered last so it overrides every allow
     # above (base profile, WORKDIR, --bind). See _append_ro_deny_rules for
     # the nesting rule that replaces bwrap's mount-order semantics.
+    if [[ ${#binds_pin[@]} -gt 0 ]]; then
+        extra_rules="$(_append_pin_rules "${tag}" "${resolved_home}" "${binds_pin[@]}")" || return 1
+        profile+="${extra_rules}"
+    fi
     if [[ ${#binds_ro[@]} -gt 0 ]]; then
         extra_rules="$(_append_ro_deny_rules "${tag}" "${resolved_home}" "${binds_ro[@]}" -- "${binds_rw[@]+"${binds_rw[@]}"}")" || return 1
         profile+="${extra_rules}"
@@ -1107,5 +1118,28 @@ _append_ro_deny_rules() {
         done
         printf ')'
     fi
+    return 0
+}
+
+# Emit one SBPL literal write deny for --pin paths and their ancestors
+# below HOME. Signature: _append_pin_rules TAG HOME PATH...
+# Same pin semantics as the ancestor pins in _append_ro_deny_rules (blocks
+# rename/rmdir/chmod of the directory itself, not writes to its children),
+# for roots that have no --ro-bind child to derive a pin from. Rendered
+# after every allow; denies need no ordering among themselves.
+_append_pin_rules() {
+    local tag="${1}" home="${2%/}"
+    shift 2
+    local p resolved ancestor
+    printf '\n(deny file-write*'
+    for p in "$@"; do
+        resolved="$(_resolve_bind_target "${tag}" "--pin" "${p}")" || return 1
+        ancestor="${resolved}"
+        while [[ -n "${ancestor}" && "${ancestor}" != "${home}" ]]; do
+            printf ' (literal "%s")' "${ancestor}"
+            ancestor="${ancestor%/*}"
+        done
+    done
+    printf ')'
     return 0
 }
