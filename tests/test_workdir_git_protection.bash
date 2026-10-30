@@ -101,6 +101,8 @@ out="$(_protect "${L}")"
 assert_contains "${out}" "--bind${NL}${N}/.git${NL}${L}/.git${NL}" "symlinked cwd (Linux): pin mounted at the logical path"
 assert_contains "${out}" "--ro-bind${NL}${N}/.git/config${NL}${L}/.git/config${NL}" "symlinked cwd (Linux): config RO at the logical path"
 assert_contains "${out}" "--ro-bind${NL}${N}/.git/hooks${NL}${L}/.git/hooks" "symlinked cwd (Linux): hooks/ RO at the logical path"
+assert_contains "${out}" "--bind${NL}${N}/.git${NL}${N}/.git${NL}" "symlinked cwd (Linux): pin also at the resolved path"
+assert_contains "${out}" "--ro-bind${NL}${N}/.git/config${NL}${N}/.git/config${NL}" "symlinked cwd (Linux): config also RO at the resolved path"
 out="$(_protect "${L}" Darwin)"
 assert_contains "${out}" "--ro-bind${NL}${N}/.git/config${NL}" "symlinked cwd (macOS): resolved path (backend uses pwd -P)"
 
@@ -521,14 +523,19 @@ probe gitdir-move bash -c "ren .git .git.moved; rc=\$?; [ \"\${rc}\" = 0 ] && re
     # Linux sees the logical mount path; macOS resolves it.
     el_expect="${EL}/.git"; [[ "${OS}" == "Darwin" ]] && el_expect="${E}/.git"
     before="$(_sums "${E}/.git/config" "${E}/.git/hooks")"
-    _write_probe "${el_expect}" ".git/config" '
-probe append-config sh -c "echo evil >>.git/config"
-probe hook-create sh -c "echo evil >.git/hooks/post-checkout"
-probe gitdir-move bash -c "ren .git .git.moved; rc=\$?; [ \"\${rc}\" = 0 ] && ren .git.moved .git; exit \${rc}"
+    # Resolved tree also granted RW: the alias must not be writable either.
+    probe_resolved="probe resolved-alias-config sh -c \"echo evil >>${E}/.git/config\""
+    [[ "${OS}" == "Darwin" ]] && probe_resolved=""
+    _write_probe "${el_expect}" ".git/config" "
+probe append-config sh -c \"echo evil >>.git/config\"
+probe hook-create sh -c \"echo evil >.git/hooks/post-checkout\"
+probe gitdir-move bash -c \"ren .git .git.moved; rc=\\\$?; [ \\\"\\\${rc}\\\" = 0 ] && ren .git.moved .git; exit \\\${rc}\"
+${probe_resolved}
 g commit --allow-empty -m via-link && echo COMMIT_OK
-'
-    out="$(_launch "${EL}")"; rc=$?
+"
+    out="$(_launch "${EL}" AI_SANDBOX_EXTRA_RW_DIRS="${R}")"; rc=$?
     _assert_ran "${out}" "${rc}" "e2e symlinked cwd"
+    [[ -n "${probe_resolved}" ]] && assert_contains "${out}" "DENIED:resolved-alias-config" "e2e symlinked cwd: resolved-path alias (extra RW dir) denied"
     for p in append-config hook-create gitdir-move; do
         assert_contains "${out}" "DENIED:${p}" "e2e symlinked cwd: ${p} denied"
     done

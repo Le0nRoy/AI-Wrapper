@@ -599,8 +599,21 @@ _wrapper_git_mount_path() {
     fi
 }
 
+# RO-bind / pin PATH where the sandbox sees it. When the logical path
+# differs (Linux), also cover the resolved path: an AI_SANDBOX_EXTRA_RW_DIRS
+# entry naming the resolved tree would otherwise expose a writable alias.
 _wrapper_git_ro_bind() {
-    _wrapper_add_ro_bind "${1}" "$(_wrapper_git_mount_path "${1}")"
+    local dst
+    dst="$(_wrapper_git_mount_path "${1}")"
+    [[ "${dst}" != "${1}" && "${_wrapper_os}" != "Darwin" ]] && _wrapper_add_ro_bind "${1}"
+    _wrapper_add_ro_bind "${1}" "${dst}"
+}
+
+_wrapper_git_pin() {
+    local dst
+    dst="$(_wrapper_git_mount_path "${1}")"
+    [[ "${dst}" != "${1}" && "${_wrapper_os}" != "Darwin" ]] && _wrapper_add_pin "${1}"
+    _wrapper_add_pin "${1}" "${dst}"
 }
 
 # Protect the git dir GIT_DIR (WORKDIR's .git, or WORKDIR itself for a bare
@@ -627,7 +640,7 @@ _wrapper_protect_git_dir() {
     # Root integrity in both modes: RO children alone pin it on macOS
     # only when one exists. WORKDIR (bare repo) is a mount point / has no
     # writable parent already.
-    [[ "${gd}" != "${wd}" ]] && _wrapper_add_pin "${gd}" "$(_wrapper_git_mount_path "${gd}")"
+    [[ "${gd}" != "${wd}" ]] && _wrapper_git_pin "${gd}"
     # Pointers stay read-only in relaxed mode too.
     if [[ -f "${gd}/commondir" ]]; then
         _wrapper_git_ro_bind "${gd}/commondir"
