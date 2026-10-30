@@ -98,6 +98,7 @@ jobs:
       - run: bash tests/test_extra_bind_dirs.bash
       - run: bash tests/test_codex_wrapper.bash
       - run: bash tests/test_bind_hardening.bash
+      - run: bash tests/test_workdir_git_protection.bash
       - run: bash tests/test_macos_ro_overlays.bash
       - run: bash tests/test_agy_wrapper.bash
       - run: bash tests/test_copilot_wrapper.bash
@@ -106,8 +107,9 @@ jobs:
   # cross-platform smoke tests as Linux (run_sandboxed_agent dispatches on
   # `uname -s` internally), the macOS-only DRYRUN/PROFILE tests, and the
   # preset suite (BSD stat; run-preset-tests.sh exits 2 off Darwin, so
-  # this job is its only CI path). Bind-hardening and RO-overlay tests
-  # certify native Seatbelt write denial on the worktree common dir; they
+  # this job is its only CI path). Bind-hardening, WORKDIR git metadata
+  # and RO-overlay tests certify native Seatbelt write denial on the
+  # worktree common dir and WORKDIR's own .git; they
   # fail, not skip, when sandbox-exec is unavailable. Other wrapper e2e and
   # account checks are Linux-only today (see docs/testing.md).
   smoke-macos:
@@ -118,5 +120,6 @@ jobs:
       - run: bash tests/test_sandbox_macos_only.bash
       - run: bash tests/test_extra_bind_dirs.bash
       - run: bash tests/test_bind_hardening.bash
+      - run: bash tests/test_workdir_git_protection.bash
       - run: bash tests/test_macos_ro_overlays.bash
       - run: bash tests/run-preset-tests.sh

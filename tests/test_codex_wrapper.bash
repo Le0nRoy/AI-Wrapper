@@ -226,9 +226,9 @@ else
 fi
 
 mkdir -p "${FAKE_HOME}/.config/glab-cli"
-out="$( set -u; _load claude; WRAPPER_FLAGS=(); AI_SANDBOX_PASS_GITLAB=1 _apply_post_menu_binds; printf '%s\n' "${WRAPPER_FLAGS[@]}" )"
+out="$( set -u; cd "${FAKE_HOME}/work" && _load claude; WRAPPER_FLAGS=(); AI_SANDBOX_PASS_GITLAB=1 _apply_post_menu_binds; printf '%s\n' "${WRAPPER_FLAGS[@]}" )"
 assert_contains "${out}" "--ro-bind${NL}${FAKE_HOME}/.config/glab-cli" "PASS_GITLAB=1 RO-binds glab config"
-out="$( set -u; _load codex; WRAPPER_FLAGS=(); AI_SANDBOX_PASS_GITLAB=0 _apply_post_menu_binds; printf '%s\n' "${WRAPPER_FLAGS[@]}" )"
+out="$( set -u; cd "${FAKE_HOME}/work" && _load codex; WRAPPER_FLAGS=(); AI_SANDBOX_PASS_GITLAB=0 _apply_post_menu_binds; printf '%s\n' "${WRAPPER_FLAGS[@]}" )"
 assert_eq "${out}" "" "PASS_GITLAB=0 adds no glab bind"
 
 # ---------------------------------------------------------------------------

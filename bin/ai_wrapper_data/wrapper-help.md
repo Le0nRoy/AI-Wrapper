@@ -56,6 +56,24 @@ The sandbox bounds *writes* — it does not bound *reads* or *network*. Be aware
   (~/.config/gcloud, ~/.gnupg, ~/.netrc, ~/.npmrc, ~/.pypirc). The
   per-service cred dirs (~/.ssh, ~/.aws, ~/.kube, ~/.docker) are
   enabled by their matching `AI_SANDBOX_PASS_*` flag instead. Red banner.
+- `AI_SANDBOX_ALLOW_GIT_CONFIG=1` — leave WORKDIR's `.git/config`,
+  `.git/hooks/`, `config.worktree` and submodule config/hooks writable.
+  By default (0) they are read-only because host git runs hooks and
+  commands from config outside the sandbox; commit, local branches,
+  checkout of local branches and push still work, but anything that
+  writes config fails: `git config`, `git remote add`,
+  `branch --set-upstream-to`, hook installers, submodule init. Some
+  commands fail half-way: `git push -u` may update the remote yet not
+  record the upstream, checking out a remote-only branch creates the
+  branch but exits non-zero, and `git branch -m` renames before failing.
+  It does not relax a linked worktree's shared `.git` (always protected).
+  The `.git` dir
+  stays pinned (cannot be moved or replaced), a worktree's `.git` file
+  and `commondir` stay read-only, and symlinked metadata refuses the
+  launch in both modes. Entries absent at launch (often
+  `.git/commondir`, sometimes `hooks/`) cannot be protected and are
+  listed in a WARN; nothing is created on the host. A value set at launch
+  wins over the saved per-workdir preset. Red banner.
 <!-- os:darwin -->
 - `AI_SANDBOX_PROFILE=<path>` — point at an alternative SBPL profile (absolute
   path, or relative to the universal wrapper's directory). Replaces the base

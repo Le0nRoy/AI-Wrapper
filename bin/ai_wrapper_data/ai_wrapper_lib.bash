@@ -77,6 +77,22 @@ _wrapper_add_ro_bind() {
     fi
 }
 
+# Pin PATH so the agent cannot rename, remove or replace it (its children
+# stay as writable as before). bwrap: a self-bind turns PATH into a mount
+# point, and rename(2)/rmdir(2) of a mount point fail with EBUSY. Seatbelt:
+# --pin renders a literal write deny on PATH and its ancestors below $HOME
+# (_append_pin_rules in macos_sandbox_exec.bash). Used for git metadata
+# roots inside WORKDIR, which have no RO child to derive a pin from in
+# relaxed mode or when every protected entry is absent.
+_wrapper_add_pin() {
+    local src="${1}" dst="${2:-${1}}"
+    if [[ "${_wrapper_os}" == "Darwin" ]]; then
+        WRAPPER_FLAGS+=(--pin "${src}")
+    else
+        WRAPPER_FLAGS+=(--bind "${src}" "${dst}")
+    fi
+}
+
 _wrapper_add_meta_bind() {
     # Metadata-only (stat, no read/write) binds exist to satisfy Seatbelt's
     # default-deny read fence while walking intermediate path components
@@ -438,6 +454,298 @@ _wrapper_git_common_dir_ok() {
     return 0
 }
 
+# ===== WORKDIR GIT METADATA PROTECTION =====
+# WORKDIR is bound RW, and with it the repository's own git metadata. Git
+# runs hooks (hooks/*) and commands named in config (core.hooksPath,
+# core.fsmonitor, core.sshCommand, aliases, filter/diff drivers,
+# credential helpers) on the HOST, unsandboxed, the next time the user runs
+# git there. _wrapper_protect_workdir_git (called from
+# _apply_post_menu_binds, i.e. after the preset and menu) protects the
+# metadata entries that exist at launch:
+#   - normal repo (<wd>/.git dir): the .git dir is pinned (cannot be renamed
+#     or replaced); config, hooks/, config.worktree and modules/<name>/
+#     {config,hooks} are read-only unless AI_SANDBOX_ALLOW_GIT_CONFIG=1;
+#     commondir (a pointer: git takes config and hooks from the dir it
+#     names) and worktrees/ (other checkouts' pointers) are always
+#     read-only;
+#   - linked worktree / submodule checkout (<wd>/.git file): the pointer
+#     file is always read-only; the shared .git is handled by
+#     _wrapper_bind_git_common_dir;
+#   - bare repo, or WORKDIR is a git dir: same entries directly under WORKDIR
+#     (WORKDIR itself is already immovable);
+#   - repository subdirectory: the git dir is outside WORKDIR and not
+#     writable in the sandbox; nothing to do;
+#   - no repository: WARN that metadata created in the session (git init,
+#     clone) is not protected and needs host review.
+# Nothing is created or truncated on the host. An absent security-relevant
+# entry (config, hooks/, commondir, config.worktree with
+# extensions.worktreeConfig) cannot be over-mounted, so it stays creatable
+# and is listed in a WARN (accepted residual). A symlink or wrong file type
+# among the entries refuses the launch in both modes. Detected writable
+# indirection (core.hooksPath / core.fsmonitor / include paths into
+# WORKDIR, hook symlinks into WORKDIR, a .git file pointing inside WORKDIR)
+# is WARNed, not fixed: existing hook and config commands, and metadata
+# written by earlier unprotected sessions, are not sanitized.
+# See docs/security-concerns.md "Workdir git metadata".
+
+# Host-side git for classification only (rev-parse / config --file, which
+# run no hooks or configured commands). Inherited redirections are dropped
+# so the result matches what git finds from WORKDIR inside the sandbox,
+# whose environment is scrubbed; a bare repo is accepted even under
+# safe.bareRepository=explicit.
+_wrapper_host_git() {
+    ( unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR; git -c safe.bareRepository=all "$@" )
+}
+
+# 0 when PATH (resolved if it or its parent exists) is DIR or below it.
+_wrapper_path_within() {
+    local path="${1}" dir="${2%/}" resolved parent
+    if resolved="$(_realpath "${path}" 2>/dev/null)" && [[ -n "${resolved}" ]]; then
+        path="${resolved}"
+    elif parent="$(_realpath "$(dirname -- "${path}")" 2>/dev/null)" && [[ -n "${parent}" ]]; then
+        path="${parent%/}/$(basename -- "${path}")"
+    fi
+    [[ "${path}" == "${dir}" || "${path}" == "${dir}"/* ]]
+}
+
+# Validate one metadata entry before it is over-mounted. Args: TAG PATH
+# TYPE (f|d). Absent is fine (returns 0); a symlink or the wrong type
+# prints an ERROR and returns 1 — over-mounting would follow the link, and
+# git treats an odd type differently from what the bind assumes.
+_wrapper_git_entry_ok() {
+    local tag="${1}" path="${2}" type="${3}" kind="file"
+    [[ "${type}" == "d" ]] && kind="directory"
+    if [[ -L "${path}" ]]; then
+        echo_log "ERROR" "[${tag}] Refusing to launch: git metadata ${path} is a symlink (it could redirect host git to sandbox-writable files). Replace it with a regular ${kind}, or launch elsewhere."
+        return 1
+    fi
+    [[ -e "${path}" ]] || return 0
+    if [[ "${type}" == "f" && ! -f "${path}" ]] || [[ "${type}" == "d" && ! -d "${path}" ]]; then
+        echo_log "ERROR" "[${tag}] Refusing to launch: git metadata ${path} is not a regular ${kind}."
+        return 1
+    fi
+    return 0
+}
+
+# WARN about host-execution indirection the read-only entries do not
+# cover: config values naming hooks, fsmonitor commands or include files
+# inside WORKDIR, and hook symlinks resolving into WORKDIR. Args: TAG WD
+# GIT_DIR. Detection only; values are read with `git config --file`, which
+# does not follow includes.
+_wrapper_warn_git_indirection() {
+    local tag="${1}" wd="${2}" gd="${3}" cfg value key target hook
+    local -a found=()
+    for cfg in "${gd}/config" "${gd}/config.worktree"; do
+        [[ -f "${cfg}" ]] || continue
+        value="$(_wrapper_host_git config --file "${cfg}" --get core.hooksPath 2>/dev/null)" || value=""
+        if [[ -n "${value}" ]]; then
+            case "${value}" in
+                /*) target="${value}" ;;
+                \~/*) target="${HOME}/${value#\~/}" ;;
+                *) target="${wd}/${value}" ;;
+            esac
+            if _wrapper_path_within "${target}" "${wd}" && ! _wrapper_path_within "${target}" "${gd}/hooks"; then
+                found+=("core.hooksPath=${value} (${cfg})")
+            fi
+        fi
+        value="$(_wrapper_host_git config --file "${cfg}" --get core.fsmonitor 2>/dev/null)" || value=""
+        case "${value}" in
+            ""|true|false|yes|no|on|off|1|0) ;;
+            *)
+                target="${value%% *}"
+                [[ "${target}" == /* ]] || target="${wd}/${target}"
+                _wrapper_path_within "${target}" "${wd}" && found+=("core.fsmonitor=${value} (${cfg})")
+                ;;
+        esac
+        while IFS= read -r key; do
+            value="${key#* }"
+            [[ -n "${value}" && "${value}" != "${key}" ]] || continue
+            case "${value}" in
+                /*) target="${value}" ;;
+                \~/*) target="${HOME}/${value#\~/}" ;;
+                *) target="$(dirname -- "${cfg}")/${value}" ;;
+            esac
+            if _wrapper_path_within "${target}" "${wd}" \
+                    && [[ "$(_realpath "${target}" 2>/dev/null)" != "${gd}/config" ]]; then
+                found+=("${key%% *}=${value} (${cfg})")
+            fi
+        done < <(_wrapper_host_git config --file "${cfg}" --get-regexp '^include(if\..*)?\.path$' 2>/dev/null)
+    done
+    for hook in "${gd}/hooks/"*; do
+        [[ -L "${hook}" ]] || continue
+        if _wrapper_path_within "${hook}" "${wd}" && ! _wrapper_path_within "${hook}" "${gd}/hooks"; then
+            found+=("hook symlink ${hook}")
+        fi
+    done
+    [[ -d "${gd}/modules" ]] && found+=("submodule checkouts' .git pointer files below WORKDIR")
+    local item
+    for item in "${found[@]+"${found[@]}"}"; do
+        echo_log "WARN" "[${tag}] Git hook/config indirection into sandbox-writable files: ${item}. The agent can change what host git runs through it; review before running git here."
+    done
+    return 0
+}
+
+# Where the sandbox sees PATH (resolved, under the resolved WORKDIR): bwrap
+# mounts WORKDIR at the logical cwd, so an over-mount must target the same
+# logical path or a symlinked cwd would leave the agent's view writable.
+# Uses _wrapper_protect_workdir_git's _wg_wd / _wg_mount. macOS uses the
+# resolved path for WORKDIR too, and its flags drop DST.
+_wrapper_git_mount_path() {
+    local p="${1}"
+    if [[ -n "${_wg_wd:-}" && -n "${_wg_mount:-}" && ( "${p}" == "${_wg_wd}" || "${p}" == "${_wg_wd}"/* ) ]]; then
+        printf '%s%s' "${_wg_mount}" "${p#"${_wg_wd}"}"
+    else
+        printf '%s' "${p}"
+    fi
+}
+
+# RO-bind / pin PATH where the sandbox sees it. When the logical path
+# differs (Linux), also cover the resolved path: an AI_SANDBOX_EXTRA_RW_DIRS
+# entry naming the resolved tree would otherwise expose a writable alias.
+_wrapper_git_ro_bind() {
+    local dst
+    dst="$(_wrapper_git_mount_path "${1}")"
+    [[ "${dst}" != "${1}" && "${_wrapper_os}" != "Darwin" ]] && _wrapper_add_ro_bind "${1}"
+    _wrapper_add_ro_bind "${1}" "${dst}"
+}
+
+_wrapper_git_pin() {
+    local dst
+    dst="$(_wrapper_git_mount_path "${1}")"
+    [[ "${dst}" != "${1}" && "${_wrapper_os}" != "Darwin" ]] && _wrapper_add_pin "${1}"
+    _wrapper_add_pin "${1}" "${dst}"
+}
+
+# Protect the git dir GIT_DIR (WORKDIR's .git, or WORKDIR itself for a bare
+# repo). Args: TAG WD GIT_DIR. See the section comment above.
+_wrapper_protect_git_dir() {
+    local tag="${1}" wd="${2}" gd="${3}" relaxed=0 sub entry
+    [[ "${AI_SANDBOX_ALLOW_GIT_CONFIG:-0}" == "1" ]] && relaxed=1
+    local -a modules=() absent=()
+
+    _wrapper_git_entry_ok "${tag}" "${gd}/config" f || return 1
+    _wrapper_git_entry_ok "${tag}" "${gd}/hooks" d || return 1
+    _wrapper_git_entry_ok "${tag}" "${gd}/config.worktree" f || return 1
+    _wrapper_git_entry_ok "${tag}" "${gd}/commondir" f || return 1
+    _wrapper_git_entry_ok "${tag}" "${gd}/worktrees" d || return 1
+    _wrapper_git_entry_ok "${tag}" "${gd}/modules" d || return 1
+    for sub in "${gd}/modules/"*; do
+        [[ -e "${sub}" || -L "${sub}" ]] || continue
+        _wrapper_git_entry_ok "${tag}" "${sub}" d || return 1
+        _wrapper_git_entry_ok "${tag}" "${sub}/config" f || return 1
+        _wrapper_git_entry_ok "${tag}" "${sub}/hooks" d || return 1
+        modules+=("${sub}")
+    done
+
+    # Root integrity in both modes: RO children alone pin it on macOS
+    # only when one exists. WORKDIR (bare repo) is a mount point / has no
+    # writable parent already.
+    [[ "${gd}" != "${wd}" ]] && _wrapper_git_pin "${gd}"
+    # Pointers stay read-only in relaxed mode too.
+    if [[ -f "${gd}/commondir" ]]; then
+        _wrapper_git_ro_bind "${gd}/commondir"
+    else
+        absent+=("${gd}/commondir")
+    fi
+    [[ -d "${gd}/worktrees" ]] && _wrapper_git_ro_bind "${gd}/worktrees"
+
+    if (( relaxed )); then
+        echo_log "WARN" "[${tag}] AI_SANDBOX_ALLOW_GIT_CONFIG=1: ${gd}/config and hooks/ are writable in the sandbox. The agent can make host git run arbitrary commands (hooks, core.hooksPath, core.fsmonitor, aliases); review them before running git here."
+    else
+        for entry in config config.worktree; do
+            [[ -f "${gd}/${entry}" ]] && _wrapper_git_ro_bind "${gd}/${entry}"
+        done
+        [[ -f "${gd}/config" ]] || absent+=("${gd}/config")
+        if [[ -d "${gd}/hooks" ]]; then
+            _wrapper_git_ro_bind "${gd}/hooks"
+        else
+            absent+=("${gd}/hooks/")
+        fi
+        if [[ ! -e "${gd}/config.worktree" && -f "${gd}/config" \
+                && "$(_wrapper_host_git config --file "${gd}/config" --type=bool --get extensions.worktreeConfig 2>/dev/null)" == "true" ]]; then
+            absent+=("${gd}/config.worktree")
+        fi
+        for sub in "${modules[@]+"${modules[@]}"}"; do
+            [[ -f "${sub}/config" ]] && _wrapper_git_ro_bind "${sub}/config"
+            [[ -d "${sub}/hooks" ]] && _wrapper_git_ro_bind "${sub}/hooks"
+        done
+    fi
+    if [[ ${#absent[@]} -gt 0 ]]; then
+        echo_log "WARN" "[${tag}] Git metadata absent at launch cannot be made read-only and stays creatable in the sandbox: ${absent[*]}. If the session creates it, host git may run agent-chosen commands; review before running git here."
+    fi
+    _wrapper_warn_git_indirection "${tag}" "${wd}" "${gd}"
+    return 0
+}
+
+_wrapper_protect_workdir_git() {
+    local tag="${AI_AGENT_COMMAND:-ai-wrapper}" wd git_dir pointer target
+    if ! wd="$(_realpath "$(pwd -P)")" || [[ -z "${wd}" || ! -d "${wd}" ]]; then
+        echo_log "ERROR" "[${tag}] Cannot resolve the working directory; refusing to launch without git metadata protection."
+        return 1
+    fi
+    wd="${wd%/}"
+    # Read by _wrapper_git_mount_path (dynamic scope): the Linux backend
+    # mounts WORKDIR at the logical $(pwd), which differs from the
+    # resolved path when cwd was reached through a symlink.
+    local _wg_wd="${wd}" _wg_mount
+    _wg_mount="$(pwd)"
+    [[ "${_wg_mount}" == "/" ]] || _wg_mount="${_wg_mount%/}"
+
+    if [[ -L "${wd}/.git" ]]; then
+        echo_log "ERROR" "[${tag}] Refusing to launch: ${wd}/.git is a symlink (it could redirect host git to sandbox-writable metadata). Replace it with the real directory or a gitdir file."
+        return 1
+    fi
+    if [[ -d "${wd}/.git" ]]; then
+        _wrapper_protect_git_dir "${tag}" "${wd}" "${wd}/.git"
+        return
+    fi
+    if [[ -f "${wd}/.git" ]]; then
+        # Linked worktree or submodule checkout: keep the pointer immutable
+        # in both modes.
+        _wrapper_git_ro_bind "${wd}/.git"
+        pointer=""
+        IFS= read -r pointer <"${wd}/.git" || [[ -n "${pointer}" ]] || pointer=""
+        target="${pointer#gitdir: }"
+        if [[ "${target}" != "${pointer}" && -n "${target}" ]]; then
+            [[ "${target}" == /* ]] || target="${wd}/${target}"
+            if _wrapper_path_within "${target}" "${wd}"; then
+                echo_log "WARN" "[${tag}] ${wd}/.git points at a git dir inside WORKDIR (${target}); its config and hooks stay writable in the sandbox. Review them before running git here."
+            fi
+        fi
+        return 0
+    fi
+    if [[ -e "${wd}/.git" ]]; then
+        echo_log "ERROR" "[${tag}] Refusing to launch: ${wd}/.git has an unexpected file type."
+        return 1
+    fi
+
+    # No .git entry: WORKDIR is a bare repo / git dir, inside a git dir, a
+    # repository subdirectory, or not in a repository.
+    if git_dir="$(_wrapper_host_git -C "${wd}" rev-parse --absolute-git-dir 2>/dev/null)" && [[ -n "${git_dir}" ]]; then
+        if ! git_dir="$(_realpath "${git_dir}")" || [[ -z "${git_dir}" ]]; then
+            echo_log "ERROR" "[${tag}] Cannot resolve the git dir of ${wd}; refusing to launch without git metadata protection."
+            return 1
+        fi
+    else
+        echo_log "WARN" "[${tag}] ${wd} is not in a git repository. Git metadata created in this session (git init, git clone, nested repos) is not protected: review its hooks/ and config on the host before running git there."
+        return 0
+    fi
+    git_dir="${git_dir%/}"
+    if [[ "${git_dir}" == "${wd}" ]]; then
+        _wrapper_protect_git_dir "${tag}" "${wd}" "${wd}"
+        return
+    fi
+    if [[ "${wd}" == "${git_dir}"/* || "${git_dir}" == "${wd}"/* ]]; then
+        echo_log "ERROR" "[${tag}] Refusing to launch: WORKDIR ${wd} and its git dir ${git_dir} nest in a way the metadata protection does not handle. Launch from the repository's work tree instead."
+        return 1
+    fi
+    # Repository subdirectory: the git dir lies outside WORKDIR, so the
+    # sandbox cannot write it (a worktree's shared .git is bound by
+    # _wrapper_bind_git_common_dir with its own read-only layers).
+    [[ "${AI_SANDBOX_DEBUG:-0}" == "1" ]] && echo_log "DEBUG" "_wrapper_protect_workdir_git: git dir ${git_dir} is outside WORKDIR ${wd}; nothing to protect"
+    return 0
+}
+
 # Guard for an agent config path (~/.claude, ~/.codex, ~/.<agent>-<name>,
 # ~/.claude-<name>.json) that the wrapper binds RW. If PATH is a symlink,
 # its target must resolve strictly under $HOME and outside the credential
@@ -474,8 +782,11 @@ _wrapper_check_config_symlink() {
 # `s)` has no effect (WRAPPER_FLAGS is frozen by then). The shared
 # wrapper re-reads env-passthrough gates inside run_sandboxed_agent
 # at exec time, so those keep working; this function covers only the
-# bind-list side.
+# bind-list side. Returns 1 when the launch must be refused (callers exit).
 _apply_post_menu_binds() {
+    # WORKDIR git metadata (AI_SANDBOX_ALLOW_GIT_CONFIG is a menu setting).
+    _wrapper_protect_workdir_git || return 1
+
     # GitLab CLI (glab) on-disk credentials. AI_SANDBOX_PASS_GITLAB
     # already propagates GITLAB_TOKEN / CI_JOB_TOKEN env vars; when
     # the user has no env var set, glab reads its token from the
@@ -557,6 +868,7 @@ _AI_SETTINGS_LIST=(
 
     # Sensitive directories
     "AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR|bool|0|red|Allow launch from sensitive dirs|Permits launching from \$HOME itself, a dotfile dir directly under \$HOME${_ai_sensitive_workdir_extra}, or a top-level system directory — the write fence then grants RW there, which likely exposes credentials|sensitive"
+    "AI_SANDBOX_ALLOW_GIT_CONFIG|bool|0|red|Allow editing git config and hooks|Leaves WORKDIR's .git/config, hooks/, config.worktree and submodule config/hooks writable so git config, remote add and push -u work. The agent can then make host git run any command. Off: those edits and tracking-branch setup fail; commits, local branches and checkouts still work.|sensitive"
     "AI_SANDBOX_ALLOW_RO_HOMEDIR|bool|0|yellow|Share home directory (read-only)|Agent can read everything in \$HOME except credentials|sensitive|darwin"
 
     # Credentials
@@ -608,6 +920,13 @@ unset _ai_n _ai_t _ai_d _ai_sev _ai_hl _ai_det _ai_cat
 # debugging; not consulted on load (older presets load with a WARN
 # on unrecognised keys, not a hard error).
 _AI_WRAPPER_PRESET_FORMAT_VERSION="2026-05-28"
+
+# AI_SANDBOX_ALLOW_GIT_CONFIG given explicitly at launch (even =0) wins
+# over the per-workdir preset, so a one-off `AI_SANDBOX_ALLOW_GIT_CONFIG=0`
+# cannot be undone by a saved relaxed value. Captured at source time,
+# before _preset_autoload exports anything.
+_AI_GIT_CONFIG_SET_AT_LAUNCH=0
+[[ -n "${AI_SANDBOX_ALLOW_GIT_CONFIG+set}" ]] && _AI_GIT_CONFIG_SET_AT_LAUNCH=1
 
 # Parse one catalog entry into globals: _set_name _set_type _set_default
 # _set_severity _set_headline _set_detail _set_category _set_os_scope.
@@ -995,6 +1314,11 @@ _preset_autoload() {
                 # No further validation — accept-any-string contract.
                 ;;
         esac
+        if [[ "${key}" == "AI_SANDBOX_ALLOW_GIT_CONFIG" ]]; then
+            (( _AI_GIT_CONFIG_SET_AT_LAUNCH )) && continue
+            # stderr, not /dev/tty: scripted launches must see it too.
+            [[ "${val}" == "1" ]] && echo "  WARN: [${AI_AGENT_COMMAND:-ai-wrapper}] Restored AI_SANDBOX_ALLOW_GIT_CONFIG=1 from the saved preset: git config and hooks in this workdir will be writable by the agent (set AI_SANDBOX_ALLOW_GIT_CONFIG=0 at launch or toggle it in s) Settings to protect them)." >&2
+        fi
         export "${key}=${val}"
         applied=$((applied + 1))
     done < "${path}"
