@@ -447,7 +447,7 @@ does not relax it. **Behaviour change:** worktrees of repos outside
 `$HOME` (or under a `$HOME` dotfile dir) no longer get the shared `.git`
 bound automatically — grant it explicitly with `AI_SANDBOX_EXTRA_RW_DIRS`.
 
-### B-λ — worktree common dir: borrowed entries and host code execution (RESOLVED on Linux, 2026-10)
+### B-λ — worktree common dir: borrowed entries and host code execution (RESOLVED, 2026-10)
 
 Two gaps left by B-ι's first fix:
 
@@ -478,12 +478,28 @@ bwrap's mount for a *concurrent* host process that can write the
 victim repo; sandboxed sessions can no longer rename the RO mount
 points.
 
-**macOS (open).** Seatbelt grants are additive allows: a nested
-`--ro-bind` under the common dir's `--bind` does not remove write
-access, and `macos_sandbox_exec.bash` has no deny-write helper. On
-macOS the over-mounts are emitted but not enforced; the wrapper WARNs.
-Follow-up: add a `--deny-write` flag emitting `(deny file-write*
-(subpath …))` after the allows.
+**macOS (#11).** Seatbelt has no mounts, so the backend renders every
+`--ro-bind` as a read allow plus a `(deny file-write* file-link …)`
+rule appended after all allows (`_append_ro_deny_rules`). Precedence is
+"most specific bind wins", independent of flag order: an RO path is
+denied except below an RW `--bind` nested strictly inside it (so
+`worktrees/` stays RO except this worktree's own entry, whose
+`commondir`/`gitdir` are RO again). An equal or broader RW grant —
+WORKDIR, `AI_SANDBOX_EXTRA_RW_DIRS`, a duplicate `--bind` — never
+reopens an RO path. Because Seatbelt matches paths rather than inodes,
+every ancestor directory of an RO path (and the root of each nested RW
+exception) is also write-denied as a literal: renaming a writable
+parent away, editing the file under its new name and renaming it back
+fails. `file-link` blocks hard-linking a protected file into a writable
+directory. The same rules apply to `AI_SANDBOX_EXTRA_RO_DIRS`, the
+glab config bind and `_extra_sandbox_setup` entries. Native coverage:
+`tests/test_bind_hardening.bash` (worktree e2e through the codex
+wrapper) and `tests/test_macos_ro_overlays.bash`, both in CI
+`smoke-macos`.
+
+Linux differs in one case: bwrap applies binds in order, so an
+`AI_SANDBOX_EXTRA_RW_DIRS` entry covering the common dir (appended
+after the wrapper's RO over-mounts) still hides them there.
 
 **Not covered (follow-up).** The same hooks/config vector exists for the
 WORKDIR's own `.git` (regular repos, and the worktree's `.git` file,
