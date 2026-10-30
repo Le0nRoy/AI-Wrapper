@@ -119,8 +119,11 @@ assert_contains "${out}" "$(_lflag --ro-bind "${N}/.git/modules/sub1/config")" "
 assert_contains "${out}" "$(_lflag --ro-bind "${N}/.git/modules/sub1/hooks")" "submodule hooks/ read-only"
 assert_contains "${out}" "submodule checkouts' .git pointer files" "submodule pointer residual WARNed"
 printf '%s\n' "../../elsewhere/.git" >"${N}/.git/commondir"
+# Module git dirs get the same pointer checks as the root (#12).
+printf '%s\n' "../../elsewhere/.git" >"${N}/.git/modules/sub1/commondir"
 out="$(_protect "${N}")"
 assert_contains "${out}" "$(_lflag --ro-bind "${N}/.git/commondir")" "commondir read-only when present"
+assert_contains "${out}" "$(_lflag --ro-bind "${N}/.git/modules/sub1/commondir")" "submodule commondir read-only when present"
 assert_not_contains "${out}" "absent at launch" "nothing reported absent when every entry exists"
 rm -f "${N}/.git/commondir" "${N}/.git/config.worktree"
 rm -rf "${N}/.git/modules"
@@ -205,6 +208,194 @@ for mode in 0 1; do
     assert_contains "${out}" "rc=1" "ALLOW_GIT_CONFIG=${mode}: config as a directory refuses the launch"
 done
 rm -rf "${R}"/sym-* "${R}"/type-*
+
+# ---------------------------------------------------------------------------
+# Nested submodule git dirs (#12). Real Git layout: superproject with the
+# submodule `plain` and the slash-named `ns/inner/mid`, which has its own
+# submodule `deep/leaf`:
+#   .git/modules/plain
+#   .git/modules/ns/inner/mid                       (ns, ns/inner: namespaces)
+#   .git/modules/ns/inner/mid/modules/deep/leaf     (deep: namespace)
+git_sub() { git_q -c protocol.file.allow=always "$@"; }
+NSRC="${R}/nested-src"
+_new_repo "${NSRC}/leaf"
+_new_repo "${NSRC}/mid"
+git_sub -C "${NSRC}/mid" submodule add "${NSRC}/leaf" deep/leaf
+git_q -C "${NSRC}/mid" commit -m add-leaf
+# Build superproject TOP from NSRC; every module git dir gets a hooks/.
+_new_nested_super() {
+    local top="${1}" gd
+    _new_repo "${top}"
+    git_sub -C "${top}" submodule add "${NSRC}/mid" ns/inner/mid
+    git_sub -C "${top}" submodule add "${NSRC}/leaf" plain
+    git_q -C "${top}" commit -m add-subs
+    git_sub -C "${top}" submodule update --init --recursive
+    for gd in plain ns/inner/mid ns/inner/mid/modules/deep/leaf; do
+        mkdir -p "${top}/.git/modules/${gd}/hooks"
+    done
+    mkdir -p "${top}/.git/hooks"
+}
+# The module git dirs and the directory chain the protection must pin.
+_nested_gitdirs() { printf '%s\n' plain ns/inner/mid ns/inner/mid/modules/deep/leaf; }
+_nested_chain() { printf '%s\n' "" /ns /ns/inner /ns/inner/mid /ns/inner/mid/modules /ns/inner/mid/modules/deep \
+    /ns/inner/mid/modules/deep/leaf /plain; }
+
+echo "-- nested submodule git dirs: real layout (#12)"
+NS="${R}/nested"
+_new_nested_super "${NS}"
+NM="${NS}/.git/modules"
+ok=0; [[ -f "${NM}/ns/inner/mid/modules/deep/leaf/HEAD" && -f "${NM}/plain/HEAD" && ! -e "${NM}/ns/HEAD" ]] && ok=1
+assert_eq "${ok}" "1" "fixture: git created nested and slash-named module git dirs"
+# Ordinary object storage below a git dir is not searched: a symlink there
+# must not refuse the launch.
+ln -s "${R}/target-dir" "${NM}/plain/objects/not-searched"
+out="$(_protect "${NS}")"
+assert_contains "${out}" "rc=0" "nested: launch allowed"
+while IFS= read -r c; do
+    assert_contains "${out}" "$(_lflag --bind "${NM}${c}")" "nested (Linux): modules${c} pinned"
+done < <(_nested_chain)
+while IFS= read -r g; do
+    assert_contains "${out}" "$(_lflag --ro-bind "${NM}/${g}/config")" "nested: modules/${g}/config read-only"
+    assert_contains "${out}" "$(_lflag --ro-bind "${NM}/${g}/hooks")" "nested: modules/${g}/hooks read-only"
+done < <(_nested_gitdirs)
+for n in ns ns/inner ns/inner/mid/modules/deep; do
+    assert_not_contains "${out}" "${NM}/${n}/config${NL}" "nested: namespace modules/${n} not treated as a git dir (config)"
+    assert_not_contains "${out}" "${NM}/${n}/commondir" "nested: namespace modules/${n} not treated as a git dir (commondir)"
+done
+assert_not_contains "${out}" "not-searched" "nested: objects/ of a module git dir not searched"
+# bwrap: every pin before the first read-only layer below modules/.
+last_pin="$(printf '%s\n' "${out}" | grep -n -x -F -e "--bind" | tail -1 | cut -d: -f1)"
+first_ro="$(printf '%s\n' "${out}" | grep -n -x -F -e "--ro-bind" | head -1 | cut -d: -f1)"
+ok=0; [[ -n "${last_pin}" && -n "${first_ro}" && "${last_pin}" -lt "${first_ro}" ]] && ok=1
+assert_eq "${ok}" "1" "nested (Linux): all pins precede the read-only layers"
+out="$(_protect "${NS}" Darwin)"
+for c in /ns /ns/inner/mid/modules/deep /ns/inner/mid/modules/deep/leaf; do
+    assert_contains "${out}" "--pin${NL}${NM}${c}${NL}" "nested (macOS): modules${c} pinned with --pin"
+done
+assert_contains "${out}" "--ro-bind${NL}${NM}/ns/inner/mid/modules/deep/leaf/config${NL}" "nested (macOS): deepest config read-only"
+rm -f "${NM}/plain/objects/not-searched"
+
+echo "-- nested submodule git dirs: relaxed mode"
+out="$(AI_SANDBOX_ALLOW_GIT_CONFIG=1 _protect "${NS}")"
+assert_contains "${out}" "rc=0" "nested relaxed: launch allowed"
+while IFS= read -r c; do
+    assert_contains "${out}" "$(_lflag --bind "${NM}${c}")" "nested relaxed (Linux): modules${c} still pinned"
+done < <(_nested_chain)
+assert_not_contains "${out}" "--ro-bind${NL}${NM}" "nested relaxed: no submodule config/hooks layer"
+assert_contains "${out}" "submodule git dirs" "nested relaxed: WARN covers submodules"
+printf '%s\n' "../x" >"${NM}/ns/inner/mid/modules/deep/leaf/commondir"
+mkdir -p "${NM}/plain/worktrees"
+out="$(AI_SANDBOX_ALLOW_GIT_CONFIG=1 _protect "${NS}")"
+assert_contains "${out}" "$(_lflag --ro-bind "${NM}/ns/inner/mid/modules/deep/leaf/commondir")" "nested relaxed: nested commondir pointer still read-only"
+assert_contains "${out}" "$(_lflag --ro-bind "${NM}/plain/worktrees")" "nested relaxed: submodule worktrees/ still read-only"
+out="$(AI_SANDBOX_ALLOW_GIT_CONFIG=1 _protect "${NS}" Darwin)"
+assert_contains "${out}" "--pin${NL}${NM}/ns/inner${NL}" "nested relaxed (macOS): namespace still pinned"
+rm -f "${NM}/ns/inner/mid/modules/deep/leaf/commondir"; rmdir "${NM}/plain/worktrees"
+
+echo "-- nested submodule git dirs: missing config / hooks (no host creation)"
+LEAF="${NM}/ns/inner/mid/modules/deep/leaf"
+mv "${LEAF}/config" "${R}/leaf-config.saved"
+rm -rf "${NM}/plain/hooks"
+git -C "${NS}" config extensions.worktreeConfig true
+git config --file "${NM}/ns/inner/mid/config" extensions.worktreeConfig true
+out="$(_protect "${NS}")"
+assert_contains "${out}" "rc=0" "missing nested config/hooks: launch allowed"
+assert_contains "${out}" "$(_lflag --bind "${LEAF}")" "missing config: git dir still recognised by HEAD (pinned)"
+assert_contains "${out}" "$(_lflag --ro-bind "${LEAF}/hooks")" "missing config: its hooks/ still read-only"
+absent_line="$(printf '%s\n' "${out}" | grep 'absent at launch' || true)"
+assert_contains "${absent_line}" "${LEAF}/config " "missing nested config reported absent"
+assert_contains "${absent_line}" "${NM}/plain/hooks/" "missing submodule hooks/ reported absent"
+assert_contains "${absent_line}" "${NM}/ns/inner/mid/config.worktree" "submodule worktreeConfig without config.worktree reported absent"
+made=0; [[ -e "${LEAF}/config" || -e "${NM}/plain/hooks" || -e "${NM}/ns/inner/mid/config.worktree" ]] && made=1
+assert_eq "${made}" "0" "missing nested entries: nothing created on the host"
+mv "${R}/leaf-config.saved" "${LEAF}/config"; mkdir "${NM}/plain/hooks"
+git -C "${NS}" config --unset extensions.worktreeConfig
+git config --file "${NM}/ns/inner/mid/config" --unset extensions.worktreeConfig
+# A namespace may hold stray regular files (not git dirs): ignored.
+: >"${NM}/ns/stray"
+out="$(_protect "${NS}")"
+assert_contains "${out}" "rc=0" "regular file in a namespace: launch allowed"
+assert_not_contains "${out}" "${NM}/ns/stray" "regular file in a namespace: not bound"
+rm -f "${NM}/ns/stray"
+
+echo "-- nested submodule git dirs: symlink / type validation (both modes)"
+CANARY="${R}/canary"
+rm -rf "${CANARY}"; mkdir -p "${CANARY}/hooks"; printf 'canary\n' >"${CANARY}/config"; printf 'ref: x\n' >"${CANARY}/HEAD"
+canary_before="$(ls -A "${CANARY}" "${CANARY}/hooks"; cksum "${CANARY}/config" "${CANARY}/HEAD")"
+# Each case: path below .git/modules, what replaces it.
+_nested_bad() {
+    local mode="${1}" rel="${2}" kind="${3}" label="${4}" expect="${5}" V="${R}/nested-bad"
+    rm -rf "${V}"; cp -R "${NS}" "${V}"
+    local p="${V}/.git/modules/${rel}"
+    rm -rf "${p}"
+    case "${kind}" in
+        dirlink) ln -s "${CANARY}" "${p}" ;;
+        filelink) ln -s "${CANARY}/config" "${p}" ;;
+        file) : >"${p}" ;;
+    esac
+    out="$(AI_SANDBOX_ALLOW_GIT_CONFIG="${mode}" _protect "${V}")"
+    assert_contains "${out}" "rc=1" "ALLOW_GIT_CONFIG=${mode}: ${label} refuses the launch"
+    assert_contains "${out}" "${expect}" "... with the ERROR"
+    assert_not_contains "${out}" "--bind" "... before any bind is added"
+    rm -rf "${V}"
+}
+for mode in 0 1; do
+    _nested_bad "${mode}" ns dirlink "symlinked namespace parent" "is a symlink"
+    _nested_bad "${mode}" ns/inner/mid/modules dirlink "symlinked nested modules/" "is a symlink"
+    _nested_bad "${mode}" ns/inner/mid/modules/deep/leaf dirlink "symlinked nested module git dir" "is a symlink"
+    _nested_bad "${mode}" ns/inner/mid/modules/deep/leaf/hooks dirlink "symlinked nested hooks/" "is a symlink"
+    _nested_bad "${mode}" ns/inner/mid/modules/deep/leaf/config filelink "symlinked nested config" "is a symlink"
+    _nested_bad "${mode}" ns/inner/mid/modules/deep/leaf/HEAD filelink "symlinked nested HEAD" "is a symlink"
+    _nested_bad "${mode}" ns/inner/mid/modules/deep/leaf/commondir filelink "symlinked nested commondir" "is a symlink"
+    _nested_bad "${mode}" ns/inner/mid/modules/deep/leaf/hooks file "nested hooks/ as a regular file" "not a regular directory"
+    _nested_bad "${mode}" ns/inner/mid/modules file "nested modules as a regular file" "not a regular directory"
+done
+assert_eq "$(ls -A "${CANARY}" "${CANARY}/hooks"; cksum "${CANARY}/config" "${CANARY}/HEAD")" "${canary_before}" "symlink refusals: external canary untouched"
+
+echo "-- nested submodule git dirs: depth and count limits"
+_fake_mod() { mkdir -p "${1}" && : >"${1}/HEAD"; }
+LM="${R}/limits"
+_new_repo "${LM}"
+# 15 namespace parents + the git dir = depth 16 (the limit): allowed.
+chain=""; for i in $(seq 1 15); do chain+="/n${i}"; done
+_fake_mod "${LM}/.git/modules${chain}/g"
+out="$(_protect "${LM}")"
+assert_contains "${out}" "rc=0" "depth 16 (namespace chain): allowed"
+assert_contains "${out}" "$(_lflag --bind "${LM}/.git/modules${chain}/g")" "depth 16: deepest git dir pinned"
+assert_contains "${out}" "$(_lflag --bind "${LM}/.git/modules/n1")" "depth 16: top namespace pinned"
+# One more namespace level: refused, not truncated.
+rm -rf "${LM}/.git/modules"; _fake_mod "${LM}/.git/modules${chain}/n16/g"
+out="$(_protect "${LM}")"
+assert_contains "${out}" "rc=1" "depth 17 (namespace chain): refused"
+assert_contains "${out}" "deeper than the supported 16" "... naming the depth limit"
+assert_not_contains "${out}" "--bind" "... before any bind"
+# Nested modules/ dirs count as levels: a/modules/b/.../modules/h is 15.
+rm -rf "${LM}/.git/modules"
+nest=""; for n in a b c d e f g h; do nest+="${nest:+/modules}/${n}"; _fake_mod "${LM}/.git/modules${nest}"; done
+out="$(_protect "${LM}")"
+assert_contains "${out}" "rc=0" "depth 15 (8 nested git dirs): allowed"
+assert_contains "${out}" "$(_lflag --bind "${LM}/.git/modules${nest}")" "8 nested git dirs: deepest pinned"
+mkdir "${LM}/.git/modules${nest}/modules"
+out="$(_protect "${LM}")"
+assert_contains "${out}" "rc=0" "depth 16 (empty nested modules/): allowed"
+_fake_mod "${LM}/.git/modules${nest}/modules/i"
+out="$(_protect "${LM}")"
+assert_contains "${out}" "rc=1" "depth 17 (git dir below the 16th level): refused"
+assert_contains "${out}" "deeper than the supported 16" "... naming the depth limit"
+# Count: 256 git dirs (one of them nested) allowed, 257 refused.
+rm -rf "${LM}/.git/modules"
+for i in $(seq 1 255); do _fake_mod "${LM}/.git/modules/m${i}"; done
+_fake_mod "${LM}/.git/modules/m1/modules/x"
+out="$(_protect "${LM}")"
+assert_contains "${out}" "rc=0" "256 module git dirs: allowed"
+assert_contains "${out}" "$(_lflag --bind "${LM}/.git/modules/m255")" "256 module git dirs: last one pinned"
+assert_contains "${out}" "$(_lflag --bind "${LM}/.git/modules/m1/modules/x")" "256 module git dirs: nested one pinned"
+_fake_mod "${LM}/.git/modules/m1/modules/y"
+out="$(_protect "${LM}")"
+assert_contains "${out}" "rc=1" "257 module git dirs: refused"
+assert_contains "${out}" "more than 256 submodule git dirs" "... naming the count limit"
+assert_not_contains "${out}" "--bind" "... before any bind"
+rm -rf "${LM}"
 
 echo "-- linked worktree pointer (.git file)"
 M="${R}/main"

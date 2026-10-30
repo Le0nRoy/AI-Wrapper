@@ -120,11 +120,18 @@ if command -v git >/dev/null 2>&1; then
     git -C "${FAKE_HOME}/repos/main" config --unset extensions.worktreeConfig
     rm -f "${mg}/worktrees/wt/config.worktree"
 
-    # Submodule git dirs: hooks/ and config RO.
+    # Submodule git dirs: config RO; a missing hooks/ is no longer created
+    # on the host (#12) but reported absent.
     mkdir -p "${mg}/modules/sub1"; : >"${mg}/modules/sub1/config"
     out="$(_gitbind "${FAKE_HOME}/repos/wt")"
-    assert_contains "${out}" "--ro-bind${NL}${mg}/modules/sub1/hooks" "submodule hooks/ RO"
     assert_contains "${out}" "--ro-bind${NL}${mg}/modules/sub1/config" "submodule config RO"
+    hooks_made=0; [[ -e "${mg}/modules/sub1/hooks" ]] && hooks_made=1
+    assert_eq "${hooks_made}" "0" "submodule: missing hooks/ not created on the host"
+    assert_contains "${out}" "absent at launch" "submodule: missing hooks/ reported absent"
+    assert_contains "${out}" "${mg}/modules/sub1/hooks/" "... naming it"
+    mkdir "${mg}/modules/sub1/hooks"
+    out="$(_gitbind "${FAKE_HOME}/repos/wt")"
+    assert_contains "${out}" "--ro-bind${NL}${mg}/modules/sub1/hooks" "submodule hooks/ RO when present"
     rm -rf "${mg}/modules"
 
     # Crafted commondir -> ~/.ssh (made git-dir shaped so git accepts it).

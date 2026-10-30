@@ -20,7 +20,7 @@ check_agent_binary
 WRAPPER_FLAGS=()
 
 # Bind shared Git metadata for worktrees after validating its path and links.
-_wrapper_bind_git_common_dir
+_wrapper_bind_git_common_dir || exit 1
 
 # Keep Copilot runtime state in its standard home paths while preventing broad
 # access to unrelated system directories. Symlinked config paths are refused

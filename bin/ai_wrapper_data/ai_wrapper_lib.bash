@@ -242,12 +242,25 @@ _check_workdir_breadth() {
 # push -u, branch --set-upstream-to), git worktree add/prune and
 # submodule updates fail inside the sandbox.
 #
+# Submodule git dirs below <common>/modules are found at any depth
+# (_wrapper_git_scan_modules): the chain of directories leading to each is
+# pinned and its config / hooks / pointers are read-only in both modes.
+# Those below this worktree's own <entry>/modules are protected after the
+# menu (_wrapper_protect_worktree_modules), honouring
+# AI_SANDBOX_ALLOW_GIT_CONFIG like WORKDIR's own submodules. A symlink,
+# wrong type or exceeded limit in either tree refuses the launch (returns
+# 1; callers exit). Nothing is created for submodules: an absent hooks/ or
+# config is WARNed (accepted residual).
+#
 # macOS: the Seatbelt backend renders each --ro-bind as a trailing write
 # deny that wins over the RW --bind of the common dir except below the
 # nested RW own-entry bind (_append_ro_deny_rules in macos_sandbox_exec.bash;
 # docs/security-concerns.md B-λ).
 _wrapper_bind_git_common_dir() {
     local git_common_dir git_common_resolved wd_resolved home_resolved wt_parent
+    # This worktree's own submodule git dirs, protected after the menu by
+    # _wrapper_protect_worktree_modules (AI_SANDBOX_ALLOW_GIT_CONFIG).
+    _WRAPPER_WT_MODULE_PINS=(); _WRAPPER_WT_MODULE_DIRS=()
     git_common_dir="$(git -C "$(pwd -P)" rev-parse --git-common-dir 2>/dev/null)" || return 0
     [[ -n "${git_common_dir}" ]] || return 0
     # `git rev-parse --git-common-dir` returns either an absolute path or a
@@ -291,14 +304,6 @@ _wrapper_bind_git_common_dir() {
             && ! -e "${wt_entry}/config.worktree" && ! -L "${wt_entry}/config.worktree" ]]; then
         : >"${wt_entry}/config.worktree" 2>/dev/null
     fi
-    local sub
-    for sub in "${git_common_resolved}/modules/"*/; do
-        sub="${sub%/}"
-        [[ -d "${sub}" && ! -L "${sub}" ]] || continue
-        [[ -d "${sub}/hooks" || -L "${sub}/hooks" ]] || mkdir "${sub}/hooks" 2>/dev/null
-        ro_paths+=("${sub}/hooks")
-        [[ -e "${sub}/config" || -L "${sub}/config" ]] && ro_paths+=("${sub}/config")
-    done
     local p
     for p in "${ro_paths[@]}" "${git_common_resolved}/worktrees" "${wt_entry}" \
             "${wt_entry}/commondir" "${wt_entry}/gitdir" "${wt_entry}/config.worktree"; do
@@ -311,11 +316,44 @@ _wrapper_bind_git_common_dir() {
         echo_log "WARN" "[${AI_AGENT_COMMAND:-ai-wrapper}] Not binding git common dir ${git_common_resolved}: config or hooks/ missing and could not be created."
         return 0
     fi
+    # Submodule git dirs at any depth, shared ones and this worktree's own
+    # (<entry>/modules), with one limit for the launch. A symlink, wrong
+    # type or exceeded limit refuses the launch (nothing is bound yet).
+    local tag="${AI_AGENT_COMMAND:-ai-wrapper}" m
+    _wrapper_git_scan_modules "${tag}" "${git_common_resolved}/modules" "${wt_entry}/modules" || return 1
+    local -a shared_pins=() shared_dirs=()
+    _WRAPPER_WT_MODULE_PINS=(); _WRAPPER_WT_MODULE_DIRS=()
+    for m in "${_wg_scan_pins[@]+"${_wg_scan_pins[@]}"}"; do
+        if [[ "${m}" == "${wt_entry}/modules" || "${m}" == "${wt_entry}/modules/"* ]]; then
+            _WRAPPER_WT_MODULE_PINS+=("${m}")
+        else
+            shared_pins+=("${m}")
+        fi
+    done
+    for m in "${_wg_scan_dirs[@]+"${_wg_scan_dirs[@]}"}"; do
+        if [[ "${m}" == "${wt_entry}/modules/"* ]]; then
+            _WRAPPER_WT_MODULE_DIRS+=("${m}")
+        else
+            shared_dirs+=("${m}")
+        fi
+    done
 
     _wrapper_add_bind "${git_common_resolved}"
+    # Pins before the read-only children they contain (bwrap: a later
+    # self-bind of a parent would hide earlier child mounts).
+    for p in "${shared_pins[@]+"${shared_pins[@]}"}"; do
+        _wrapper_add_pin "${p}"
+    done
     for p in "${ro_paths[@]}"; do
         _wrapper_add_ro_bind "${p}"
     done
+    # Shared submodule metadata stays read-only whatever
+    # AI_SANDBOX_ALLOW_GIT_CONFIG says (other checkouts use it too).
+    _wg_absent=()
+    for m in "${shared_dirs[@]+"${shared_dirs[@]}"}"; do
+        _wrapper_git_dir_ro_entries "${m}" 0
+    done
+    _wrapper_git_warn_absent "${tag}"
     # Other worktrees' entries RO, this worktree's entry RW, and its link
     # files RO again.
     _wrapper_add_ro_bind "${git_common_resolved}/worktrees"
@@ -616,64 +654,201 @@ _wrapper_git_pin() {
     _wrapper_add_pin "${1}" "${dst}"
 }
 
-# Protect the git dir GIT_DIR (WORKDIR's .git, or WORKDIR itself for a bare
-# repo). Args: TAG WD GIT_DIR. See the section comment above.
-_wrapper_protect_git_dir() {
-    local tag="${1}" wd="${2}" gd="${3}" relaxed=0 sub entry
-    [[ "${AI_SANDBOX_ALLOW_GIT_CONFIG:-0}" == "1" ]] && relaxed=1
-    local -a modules=() absent=()
+# ----- Submodule git dirs at any depth -----
+# Git keeps a submodule's git dir at <gitdir>/modules/<name>. <name> may
+# contain slashes (modules/libs/foo: libs/ is a namespace parent, not a
+# repository), and a submodule's own submodules live below its git dir
+# (modules/a/modules/b). A directory is a module git dir when its HEAD or
+# its config is a regular file: git refuses to place a module git dir
+# inside another one's namespace, so a namespace parent never holds
+# either, and a missing config alone does not demote a git dir. Any other
+# directory is a namespace parent and is searched further; regular files
+# in a namespace cannot be git dirs and are ignored. Below a module git
+# dir only its own modules/ is searched, never objects/ or refs/.
+#
+# Limits (approved for #12; exceeding one refuses the launch, nothing is
+# silently left unprotected): depth counts every directory component below
+# a scan root (namespace parents, module git dirs and nested modules/ dirs
+# alike: modules/a is depth 1, modules/a/modules/b depth 3, modules/x/y/z
+# depth 3), at most _WRAPPER_GIT_MODULES_MAX_DEPTH; module git dirs are
+# counted across all roots of one scan, at most
+# _WRAPPER_GIT_MODULES_MAX_COUNT.
+_WRAPPER_GIT_MODULES_MAX_DEPTH=16
+_WRAPPER_GIT_MODULES_MAX_COUNT=256
 
+# Scan modules/ roots. Args: TAG ROOT... (absent roots are skipped). On
+# success sets _wg_scan_dirs (module git dirs, search order) and
+# _wg_scan_pins (every directory from a root down to each module git dir,
+# parents before children, each once; chains without a git dir are not
+# pinned) and returns 0. A symlink anywhere on the searched tree, a
+# wrong-typed or symlinked entry of a module git dir, or an exceeded limit
+# prints an ERROR and returns 1. Reads nothing but directory listings and
+# file types; changes nothing.
+_wrapper_git_scan_modules() {
+    local tag="${1}" root
+    shift
+    _wg_scan_dirs=(); _wg_scan_pins=(); _wg_scan_stack=(); _wg_scan_flushed=(); _wg_scan_count=0
+    for root in "$@"; do
+        _wrapper_git_entry_ok "${tag}" "${root}" d || return 1
+        [[ -d "${root}" ]] || continue
+        _wrapper_git_scan_dir "${tag}" "${root}" 0 || return 1
+    done
+    return 0
+}
+
+# One directory of the scan. Args: TAG DIR DEPTH (DIR's depth below its
+# root). _wg_scan_stack[i] holds DIR's ancestor at depth i, so a found git
+# dir pins exactly its own chain.
+_wrapper_git_scan_dir() {
+    local tag="${1}" dir="${2}" depth="${3}" child i
+    local next=$(( depth + 1 ))
+    _wg_scan_stack[depth]="${dir}"; _wg_scan_flushed[depth]=0
+    for child in "${dir}"/* "${dir}"/.[!.]* "${dir}"/..?*; do
+        [[ -e "${child}" || -L "${child}" ]] || continue
+        if [[ -L "${child}" ]]; then
+            echo_log "ERROR" "[${tag}] Refusing to launch: git submodule metadata ${child} is a symlink (it could redirect host git to sandbox-writable files). Replace it with a regular directory, or launch elsewhere."
+            return 1
+        fi
+        [[ -d "${child}" ]] || continue
+        if (( next > _WRAPPER_GIT_MODULES_MAX_DEPTH )); then
+            echo_log "ERROR" "[${tag}] Refusing to launch: git submodule metadata ${child} is ${next} directories below ${_wg_scan_stack[0]}, deeper than the supported ${_WRAPPER_GIT_MODULES_MAX_DEPTH}; it cannot be protected. Remove stale submodule git dirs there, or launch elsewhere."
+            return 1
+        fi
+        if [[ -L "${child}/HEAD" || -L "${child}/config" ]]; then
+            echo_log "ERROR" "[${tag}] Refusing to launch: git submodule metadata ${child}/HEAD or ${child}/config is a symlink. Replace it with a regular file, or launch elsewhere."
+            return 1
+        fi
+        if [[ ! -f "${child}/HEAD" && ! -f "${child}/config" ]]; then
+            _wrapper_git_scan_dir "${tag}" "${child}" "${next}" || return 1
+            continue
+        fi
+        # Module git dir.
+        _wg_scan_count=$(( _wg_scan_count + 1 ))
+        if (( _wg_scan_count > _WRAPPER_GIT_MODULES_MAX_COUNT )); then
+            echo_log "ERROR" "[${tag}] Refusing to launch: more than ${_WRAPPER_GIT_MODULES_MAX_COUNT} submodule git dirs (reached at ${child}); they cannot all be protected. Remove stale ones under modules/, or launch elsewhere."
+            return 1
+        fi
+        _wrapper_git_entry_ok "${tag}" "${child}/HEAD" f || return 1
+        _wrapper_git_dir_entries_ok "${tag}" "${child}" || return 1
+        [[ "${AI_SANDBOX_DEBUG:-0}" == "1" ]] && echo_log "DEBUG" "_wrapper_git_scan_modules: module git dir ${child} (depth ${next})"
+        _wg_scan_dirs+=("${child}")
+        for (( i = 0; i <= depth; i++ )); do
+            if [[ "${_wg_scan_flushed[i]}" == "0" ]]; then
+                _wg_scan_pins+=("${_wg_scan_stack[i]}")
+                _wg_scan_flushed[i]=1
+            fi
+        done
+        _wg_scan_pins+=("${child}")
+        [[ -d "${child}/modules" ]] || continue
+        if (( next + 1 > _WRAPPER_GIT_MODULES_MAX_DEPTH )); then
+            echo_log "ERROR" "[${tag}] Refusing to launch: git submodule metadata ${child}/modules is $(( next + 1 )) directories below ${_wg_scan_stack[0]}, deeper than the supported ${_WRAPPER_GIT_MODULES_MAX_DEPTH}; it cannot be protected. Remove stale submodule git dirs there, or launch elsewhere."
+            return 1
+        fi
+        _wg_scan_stack[next]="${child}"; _wg_scan_flushed[next]=1
+        _wrapper_git_scan_dir "${tag}" "${child}/modules" $(( next + 1 )) || return 1
+    done
+    return 0
+}
+
+# Validate the security-relevant entries of git dir GD (types, no
+# symlinks; absent is fine). Args: TAG GD.
+_wrapper_git_dir_entries_ok() {
+    local tag="${1}" gd="${2}"
     _wrapper_git_entry_ok "${tag}" "${gd}/config" f || return 1
     _wrapper_git_entry_ok "${tag}" "${gd}/hooks" d || return 1
     _wrapper_git_entry_ok "${tag}" "${gd}/config.worktree" f || return 1
     _wrapper_git_entry_ok "${tag}" "${gd}/commondir" f || return 1
     _wrapper_git_entry_ok "${tag}" "${gd}/worktrees" d || return 1
     _wrapper_git_entry_ok "${tag}" "${gd}/modules" d || return 1
-    for sub in "${gd}/modules/"*; do
-        [[ -e "${sub}" || -L "${sub}" ]] || continue
-        _wrapper_git_entry_ok "${tag}" "${sub}" d || return 1
-        _wrapper_git_entry_ok "${tag}" "${sub}/config" f || return 1
-        _wrapper_git_entry_ok "${tag}" "${sub}/hooks" d || return 1
-        modules+=("${sub}")
-    done
+}
 
-    # Root integrity in both modes: RO children alone pin it on macOS
-    # only when one exists. WORKDIR (bare repo) is a mount point / has no
-    # writable parent already.
-    [[ "${gd}" != "${wd}" ]] && _wrapper_git_pin "${gd}"
-    # Pointers stay read-only in relaxed mode too.
+# Read-only layers for git dir GD: pointers (commondir, worktrees/) always,
+# config / hooks/ / config.worktree unless RELAXED is 1. Absent entries are
+# appended to _wg_absent. Args: GD RELAXED. GD must have passed
+# _wrapper_git_dir_entries_ok.
+_wrapper_git_dir_ro_entries() {
+    local gd="${1}" relaxed="${2}" entry
     if [[ -f "${gd}/commondir" ]]; then
         _wrapper_git_ro_bind "${gd}/commondir"
     else
-        absent+=("${gd}/commondir")
+        _wg_absent+=("${gd}/commondir")
     fi
     [[ -d "${gd}/worktrees" ]] && _wrapper_git_ro_bind "${gd}/worktrees"
-
-    if (( relaxed )); then
-        echo_log "WARN" "[${tag}] AI_SANDBOX_ALLOW_GIT_CONFIG=1: ${gd}/config and hooks/ are writable in the sandbox. The agent can make host git run arbitrary commands (hooks, core.hooksPath, core.fsmonitor, aliases); review them before running git here."
+    [[ "${relaxed}" == "1" ]] && return 0
+    for entry in config config.worktree; do
+        [[ -f "${gd}/${entry}" ]] && _wrapper_git_ro_bind "${gd}/${entry}"
+    done
+    [[ -f "${gd}/config" ]] || _wg_absent+=("${gd}/config")
+    if [[ -d "${gd}/hooks" ]]; then
+        _wrapper_git_ro_bind "${gd}/hooks"
     else
-        for entry in config config.worktree; do
-            [[ -f "${gd}/${entry}" ]] && _wrapper_git_ro_bind "${gd}/${entry}"
-        done
-        [[ -f "${gd}/config" ]] || absent+=("${gd}/config")
-        if [[ -d "${gd}/hooks" ]]; then
-            _wrapper_git_ro_bind "${gd}/hooks"
-        else
-            absent+=("${gd}/hooks/")
-        fi
-        if [[ ! -e "${gd}/config.worktree" && -f "${gd}/config" \
-                && "$(_wrapper_host_git config --file "${gd}/config" --type=bool --get extensions.worktreeConfig 2>/dev/null)" == "true" ]]; then
-            absent+=("${gd}/config.worktree")
-        fi
-        for sub in "${modules[@]+"${modules[@]}"}"; do
-            [[ -f "${sub}/config" ]] && _wrapper_git_ro_bind "${sub}/config"
-            [[ -d "${sub}/hooks" ]] && _wrapper_git_ro_bind "${sub}/hooks"
-        done
+        _wg_absent+=("${gd}/hooks/")
     fi
-    if [[ ${#absent[@]} -gt 0 ]]; then
-        echo_log "WARN" "[${tag}] Git metadata absent at launch cannot be made read-only and stays creatable in the sandbox: ${absent[*]}. If the session creates it, host git may run agent-chosen commands; review before running git here."
+    if [[ ! -e "${gd}/config.worktree" && -f "${gd}/config" \
+            && "$(_wrapper_host_git config --file "${gd}/config" --type=bool --get extensions.worktreeConfig 2>/dev/null)" == "true" ]]; then
+        _wg_absent+=("${gd}/config.worktree")
     fi
+    return 0
+}
+
+_wrapper_git_warn_absent() {
+    local tag="${1}"
+    [[ ${#_wg_absent[@]} -gt 0 ]] || return 0
+    echo_log "WARN" "[${tag}] Git metadata absent at launch cannot be made read-only and stays creatable in the sandbox: ${_wg_absent[*]}. If the session creates it, host git may run agent-chosen commands; review before running git here."
+}
+
+# Protect the git dir GIT_DIR (WORKDIR's .git, or WORKDIR itself for a bare
+# repo) and its submodule git dirs. Args: TAG WD GIT_DIR. See the section
+# comment above.
+_wrapper_protect_git_dir() {
+    local tag="${1}" wd="${2}" gd="${3}" relaxed=0 p
+    [[ "${AI_SANDBOX_ALLOW_GIT_CONFIG:-0}" == "1" ]] && relaxed=1
+
+    # Validate everything before the first bind.
+    _wrapper_git_dir_entries_ok "${tag}" "${gd}" || return 1
+    _wrapper_git_scan_modules "${tag}" "${gd}/modules" || return 1
+
+    # Root integrity in both modes: RO children alone pin it on macOS
+    # only when one exists. WORKDIR (bare repo) is a mount point / has no
+    # writable parent already. Module chains too (a namespace parent or
+    # modules/ moved away would take its protected children with it), all
+    # pins before the read-only entries below them.
+    [[ "${gd}" != "${wd}" ]] && _wrapper_git_pin "${gd}"
+    for p in "${_wg_scan_pins[@]+"${_wg_scan_pins[@]}"}"; do
+        _wrapper_git_pin "${p}"
+    done
+    if (( relaxed )); then
+        echo_log "WARN" "[${tag}] AI_SANDBOX_ALLOW_GIT_CONFIG=1: ${gd}/config and hooks/ (and those of its submodule git dirs) are writable in the sandbox. The agent can make host git run arbitrary commands (hooks, core.hooksPath, core.fsmonitor, aliases); review them before running git here."
+    fi
+    _wg_absent=()
+    for p in "${gd}" "${_wg_scan_dirs[@]+"${_wg_scan_dirs[@]}"}"; do
+        _wrapper_git_dir_ro_entries "${p}" "${relaxed}"
+    done
+    _wrapper_git_warn_absent "${tag}"
     _wrapper_warn_git_indirection "${tag}" "${wd}" "${gd}"
+    return 0
+}
+
+# Protect this linked worktree's own submodule git dirs
+# (<common>/worktrees/<name>/modules, found before the menu by
+# _wrapper_bind_git_common_dir) with the final AI_SANDBOX_ALLOW_GIT_CONFIG:
+# chains pinned and pointers read-only in both modes, config / hooks/ only
+# in protected mode. The shared <common>/modules stay read-only regardless.
+_wrapper_protect_worktree_modules() {
+    local tag="${AI_AGENT_COMMAND:-ai-wrapper}" relaxed=0 p
+    [[ -n "${_WRAPPER_WT_MODULE_DIRS[*]+set}" && ${#_WRAPPER_WT_MODULE_DIRS[@]} -gt 0 ]] || return 0
+    [[ "${AI_SANDBOX_ALLOW_GIT_CONFIG:-0}" == "1" ]] && relaxed=1
+    for p in "${_WRAPPER_WT_MODULE_PINS[@]}"; do
+        _wrapper_add_pin "${p}"
+    done
+    if (( relaxed )); then
+        echo_log "WARN" "[${tag}] AI_SANDBOX_ALLOW_GIT_CONFIG=1: this worktree's submodule config and hooks/ are writable in the sandbox. The agent can make host git run arbitrary commands there; review them before running git in those submodules."
+    fi
+    _wg_absent=()
+    for p in "${_WRAPPER_WT_MODULE_DIRS[@]}"; do
+        _wrapper_git_dir_ro_entries "${p}" "${relaxed}"
+    done
+    _wrapper_git_warn_absent "${tag}"
     return 0
 }
 
@@ -784,8 +959,10 @@ _wrapper_check_config_symlink() {
 # at exec time, so those keep working; this function covers only the
 # bind-list side. Returns 1 when the launch must be refused (callers exit).
 _apply_post_menu_binds() {
-    # WORKDIR git metadata (AI_SANDBOX_ALLOW_GIT_CONFIG is a menu setting).
+    # WORKDIR git metadata and a linked worktree's own submodule git dirs
+    # (AI_SANDBOX_ALLOW_GIT_CONFIG is a menu setting).
     _wrapper_protect_workdir_git || return 1
+    _wrapper_protect_worktree_modules
 
     # GitLab CLI (glab) on-disk credentials. AI_SANDBOX_PASS_GITLAB
     # already propagates GITLAB_TOKEN / CI_JOB_TOKEN env vars; when
