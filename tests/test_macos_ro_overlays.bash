@@ -28,6 +28,7 @@ cleanup() { rm -rf "${FAKE_HOME}"; }
 trap cleanup EXIT
 
 OS="$(uname -s)"
+NL=$'\n'
 DENY_OPS="file-write* file-link"
 
 _load_backend() {
@@ -69,9 +70,9 @@ _render_from_flags() {
               --ro-bind) ro+=("${path}") ;;
           esac
       done
-      _append_ro_deny_rules test "${ro[@]}" -- "${rw[@]+"${rw[@]}"}" )
+      _append_ro_deny_rules test "${FAKE_HOME}" "${ro[@]}" -- "${rw[@]+"${rw[@]}"}" )
 }
-_render() { ( _load_backend; _append_ro_deny_rules test "$@" ) 2>&1; }
+_render() { ( _load_backend; _append_ro_deny_rules test "${FAKE_HOME}" "$@" ) 2>&1; }
 
 # ---------------------------------------------------------------------------
 echo "-- rule rendering for the worktree bind list"
@@ -92,6 +93,9 @@ assert_contains "${pins}" "(literal \"${wt_entry}\")" "own entry dir pinned (can
 assert_contains "${pins}" "(literal \"${mg}\")" "common dir pinned"
 assert_contains "${pins}" "(literal \"${mg}/worktrees\")" "worktrees/ pinned"
 assert_eq "$(printf '%s\n' "${rules}" | grep -c '^(deny file-write\* (literal')" "1" "ancestor pins rendered once, de-duplicated"
+assert_contains "${pins}" "(literal \"${FAKE_HOME}/repos\")" "ancestor below \$HOME pinned"
+assert_not_contains "${pins}" "(literal \"${FAKE_HOME}\")" "\$HOME itself is not pinned"
+assert_not_contains "${pins}" "(literal \"${FAKE_HOME%/*}\")" "\$HOME's parent is not pinned"
 
 # Reversed and duplicated bind lists render the same rules: the
 # precedence does not depend on flag order.
@@ -123,6 +127,8 @@ assert_eq "${rc}" "1" "SBPL-unsafe RO path is rejected"
 mkdir -p "${FAKE_HOME}/area/dot.dir/x"
 out="$(_render "${FAKE_HOME}/area" -- "${FAKE_HOME}/area/dot.dir")"
 assert_contains "${out}" "#\"^${FAKE_HOME//./\\.}/area/dot\\.dir/\"" "regex exception escapes '.' in the path"
+out="$( _load_backend; _append_ro_deny_rules test "" "${FAKE_HOME}/area/rw" 2>&1 )"
+assert_contains "${out}" "(literal \"${FAKE_HOME}/area\")" "empty HOME: ancestors still pinned"
 ln -s "${FAKE_HOME}/area/other" "${FAKE_HOME}/area-link"
 out="$(_render "${FAKE_HOME}/area-link")"
 assert_contains "${out}" "(subpath \"${FAKE_HOME}/area/other\")" "symlinked RO path is denied at its canonical target"
@@ -151,6 +157,10 @@ out="$(AI_SANDBOX_EXTRA_RO_DIRS="${FAKE_HOME}/project/ro-sub" AI_SANDBOX_EXTRA_R
 rc=$?
 assert_eq "${rc}" "0" "dry-run with RO binds renders"
 profile="${out#*=== Rendered SBPL profile ===}"
+# git/realpath lstat() every component of a path; a HOME below
+# /Users/<name> (like this FAKE_HOME) needs stat on its own ancestors.
+assert_contains "${profile}" "(allow file-read-metadata (literal \"${FAKE_HOME%/*}\"))" "HOME's parent gets a stat-only grant"
+assert_not_contains "${profile}" "(deny file-write* (literal \"${FAKE_HOME%/*}\"" "HOME's parent is not write-pinned"
 assert_contains "${profile}" "(allow file-read* (literal \"${mg}/config\"))" "--ro-bind keeps its read allow"
 assert_contains "${profile}" "(deny ${DENY_OPS} (literal \"${mg}/config\"))" "--ro-bind under an RW --bind is write-denied"
 assert_contains "${profile}" "(deny ${DENY_OPS} (subpath \"${FAKE_HOME}/project/ro-sub\"))" "AI_SANDBOX_EXTRA_RO_DIRS inside WORKDIR is write-denied"
@@ -220,6 +230,38 @@ else
         rm -f "${wt_entry}/probe-file" "${mg}/objects/probe-file"
     done
     assert_eq "$(cksum <"${mg}/config")" "${config_before}" "native: config bytes unchanged on the host"
+
+    # Path discovery works inside the sandbox with the RO denies in place:
+    # git lstat()s every component from / down (CI once failed here with
+    # "Invalid path '<HOME parent>': Operation not permitted").
+    out="$(_native -- "${flag_list[@]}" -- -c 'git rev-parse --git-common-dir --absolute-git-dir && stat "$1" >/dev/null && echo STAT_OK' _ "${FAKE_HOME%/*}")"
+    echo "  (native discovery output: ${out})"
+    assert_contains "${out}" "${mg}${NL}${wt_entry}" "native: git rev-parse resolves the common dir and own entry"
+    assert_contains "${out}" "STAT_OK" "native: stat on HOME's parent works"
+    assert_not_contains "${out}" "Invalid path" "native: no realpath EPERM"
+
+    # Synthetic probe of the ancestor pin alone: RW area, RO area/sub/ro.
+    # area/sub is pinned (literal write deny). It must stay stat-able and
+    # listable, its other children writable, and only the dir itself
+    # immovable.
+    pin_area="${FAKE_HOME}/pin-area"
+    mkdir -p "${pin_area}/sub/ro"
+    out="$(_native -- --bind "${pin_area}" --ro-bind "${pin_area}/sub/ro" -- -c '
+        stat "$1/sub" >/dev/null && echo PIN_STAT_OK
+        ls "$1/sub" >/dev/null && echo PIN_LS_OK
+        (echo x >"$1/sub/sibling") 2>/dev/null && echo PIN_CHILD_WROTE
+        mkdir "$1/sub/newdir" 2>/dev/null && echo PIN_MKDIR_OK
+        mv "$1/sub" "$1/moved" 2>/dev/null && echo PIN_MOVED
+        (echo x >"$1/sub/ro/x") 2>/dev/null && echo RO_WROTE
+        echo PIN_PROBE_DONE' _ "${pin_area}")"
+    echo "  (native pin probe output: ${out})"
+    for ok in PIN_STAT_OK PIN_LS_OK PIN_CHILD_WROTE PIN_MKDIR_OK PIN_PROBE_DONE; do
+        assert_contains "${out}" "${ok}" "native pin probe: ${ok}"
+    done
+    assert_not_contains "${out}" "PIN_MOVED" "native pin probe: pinned ancestor cannot be renamed"
+    assert_not_contains "${out}" "RO_WROTE" "native pin probe: RO subtree write denied"
+    pin_ok=0; [[ -d "${pin_area}/sub/ro" && ! -e "${pin_area}/sub/ro/x" && -f "${pin_area}/sub/sibling" ]] && pin_ok=1
+    assert_eq "${pin_ok}" "1" "native pin probe: host state matches (RO dir untouched, sibling written)"
 
     # AI_SANDBOX_EXTRA_RO_DIRS inside WORKDIR, and an RW extra dir equal to
     # the common dir, are enforced.

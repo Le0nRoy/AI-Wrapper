@@ -309,6 +309,21 @@ _run_sandboxed_agent_impl() {
         unset _wd_parent
     fi
 
+    # The walks above stop at HOME, and the base profile only grants
+    # /Users and HOME itself, so HOME's own ancestors are stat-able only
+    # when HOME is /Users/<name>. A HOME one level deeper (a test fake HOME,
+    # /Volumes/<disk>/Users/<name>) made realpath()/git fail with
+    # "Invalid path '<HOME parent>': Operation not permitted". Grant
+    # metadata on each HOME ancestor too.
+    if [[ -n "${resolved_home}" ]]; then
+        local _home_parent="${resolved_home%/*}"
+        while [[ -n "${_home_parent}" ]]; do
+            binds_meta+=("${_home_parent}")
+            _home_parent="${_home_parent%/*}"
+        done
+        unset _home_parent
+    fi
+
     # Same ancestor-metadata rationale as the WORKDIR walk above, applied
     # to every per-call --bind / --ro-bind entry too. Without this the
     # kernel's namei walk denies stat on intermediate dirs between HOME
@@ -723,7 +738,7 @@ _run_sandboxed_agent_impl() {
     # above (base profile, WORKDIR, --bind). See _append_ro_deny_rules for
     # the nesting rule that replaces bwrap's mount-order semantics.
     if [[ ${#binds_ro[@]} -gt 0 ]]; then
-        extra_rules="$(_append_ro_deny_rules "${tag}" "${binds_ro[@]}" -- "${binds_rw[@]+"${binds_rw[@]}"}")" || return 1
+        extra_rules="$(_append_ro_deny_rules "${tag}" "${resolved_home}" "${binds_ro[@]}" -- "${binds_rw[@]+"${binds_rw[@]}"}")" || return 1
         profile+="${extra_rules}"
     fi
 
@@ -1007,7 +1022,8 @@ _append_bind_rules() {
 _SBPL_RO_DENY_OPS="file-write* file-link"
 
 # Emit SBPL write-deny rules for --ro-bind paths to stdout.
-# Signature: _append_ro_deny_rules TAG RO_PATH... -- RW_PATH...
+# Signature: _append_ro_deny_rules TAG HOME RO_PATH... -- RW_PATH...
+#   HOME        — resolved $HOME (may be empty); ancestor pins stop below it
 #   RO_PATH...  — every --ro-bind path (wrapper, AI_SANDBOX_EXTRA_RO_DIRS,
 #                 _extra_sandbox_setup)
 #   RW_PATH...  — every --bind path, used only to carve exceptions
@@ -1027,10 +1043,12 @@ _SBPL_RO_DENY_OPS="file-write* file-link"
 # renaming a writable parent away, editing the RO file under its new name
 # and renaming it back would bypass the subpath rule; bwrap mount points
 # cannot be moved like that. Literal denial blocks rename/rmdir/chmod of the
-# directory itself while leaving its other children writable.
+# directory itself while leaving its other children writable. Pins stop
+# below $HOME: $HOME and its ancestors have no write grant in the profile,
+# so pinning them adds nothing.
 _append_ro_deny_rules() {
-    local tag="${1}"
-    shift
+    local tag="${1}" home="${2%/}"
+    shift 2
     local -a ro_paths=() rw_paths=() pins=()
     local resolved
     while [[ $# -gt 0 && "${1}" != "--" ]]; do
@@ -1068,7 +1086,7 @@ _append_ro_deny_rules() {
             printf '\n(deny %s (literal "%s"))' "${_SBPL_RO_DENY_OPS}" "${ro}"
         fi
         ancestor="${ro%/*}"
-        while [[ -n "${ancestor}" ]]; do
+        while [[ -n "${ancestor}" && "${ancestor}" != "${home}" ]]; do
             pins+=("${ancestor}")
             ancestor="${ancestor%/*}"
         done
