@@ -66,8 +66,8 @@ that launch a real sandbox.
 | `test_sandbox_macos_only.bash` | sandbox-exec dry-run | sandbox-exec | exits 0 with a skip line | full |
 | `test_macos_ro_overlays.bash` | git repos in fake home; stub `getconf`/`sandbox-exec` off macOS | git; sandbox-exec for native checks | rule rendering + mocked dry-run; native part skipped | full, native write denial (missing sandbox-exec fails) |
 | `test_codex_wrapper.bash`, `test_agy_wrapper.bash`, `test_copilot_wrapper.bash` | git repos, sqlite db, stub clients in fake home; bwrap e2e | git, python3 (sqlite3, tomllib optional), bwrap for e2e | full with bwrap; e2e skipped without | argv/unit parts; bwrap e2e skipped |
-| `test_bind_hardening.bash` | git repos, stub codex in fake home, temp alias dir under `/tmp` (macOS) | git, perl; bwrap or sandbox-exec for e2e | full with bwrap; e2e skipped without | full: native worktree write-denial e2e (missing sandbox-exec fails) |
-| `test_workdir_git_protection.bash` | git repos (normal, worktree, bare, scaffold) and stub clients in fake home | git, perl, python3; bwrap or sandbox-exec for e2e | full with bwrap; missing bwrap fails | full: native WORKDIR git metadata write denial (missing sandbox-exec fails) |
+| `test_bind_hardening.bash` | git repos (incl. a worktree with nested submodules via local file:// clones), stub codex in fake home, temp alias dir under `/tmp` (macOS) | git, perl; bwrap or sandbox-exec for e2e | full with bwrap; e2e skipped without | full: native worktree write-denial e2e (missing sandbox-exec fails) |
+| `test_workdir_git_protection.bash` | git repos (normal, worktree, bare, scaffold, nested submodules via local file:// clones) and stub clients in fake home | git, perl, python3; bwrap or sandbox-exec for e2e | full with bwrap; missing bwrap fails | full: native WORKDIR git metadata write denial (missing sandbox-exec fails) |
 | `run-preset-tests.sh` | rewritten lib copy and scratch dirs under `$TMPDIR` (fallback `tests/preset/_scratch/`, git-ignored), removed on exit | BSD `stat -f` | exits 2 (not run) | full |
 
 ## CI mapping

@@ -501,11 +501,12 @@ _wrapper_git_common_dir_ok() {
 # _apply_post_menu_binds, i.e. after the preset and menu) protects the
 # metadata entries that exist at launch:
 #   - normal repo (<wd>/.git dir): the .git dir is pinned (cannot be renamed
-#     or replaced); config, hooks/, config.worktree and modules/<name>/
-#     {config,hooks} are read-only unless AI_SANDBOX_ALLOW_GIT_CONFIG=1;
-#     commondir (a pointer: git takes config and hooks from the dir it
-#     names) and worktrees/ (other checkouts' pointers) are always
-#     read-only;
+#     or replaced); config, hooks/ and config.worktree are read-only unless
+#     AI_SANDBOX_ALLOW_GIT_CONFIG=1; commondir (a pointer: git takes config
+#     and hooks from the dir it names) and worktrees/ (other checkouts'
+#     pointers) are always read-only. Submodule git dirs below modules/ at
+#     any depth get the same treatment, and the directories leading to
+#     them are pinned (_wrapper_git_scan_modules);
 #   - linked worktree / submodule checkout (<wd>/.git file): the pointer
 #     file is always read-only; the shared .git is handled by
 #     _wrapper_bind_git_common_dir;
@@ -1045,7 +1046,7 @@ _AI_SETTINGS_LIST=(
 
     # Sensitive directories
     "AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR|bool|0|red|Allow launch from sensitive dirs|Permits launching from \$HOME itself, a dotfile dir directly under \$HOME${_ai_sensitive_workdir_extra}, or a top-level system directory — the write fence then grants RW there, which likely exposes credentials|sensitive"
-    "AI_SANDBOX_ALLOW_GIT_CONFIG|bool|0|red|Allow editing git config and hooks|Leaves WORKDIR's .git/config, hooks/, config.worktree and submodule config/hooks writable so git config, remote add and push -u work. The agent can then make host git run any command. Off: those edits and tracking-branch setup fail; commits, local branches and checkouts still work.|sensitive"
+    "AI_SANDBOX_ALLOW_GIT_CONFIG|bool|0|red|Allow editing git config and hooks|Leaves WORKDIR's .git/config, hooks/, config.worktree and submodule config/hooks (also a linked worktree's own submodules) writable so git config, remote add and push -u work. The agent can then make host git run any command. Off: those edits and tracking-branch setup fail; commits, local branches and checkouts still work.|sensitive"
     "AI_SANDBOX_ALLOW_RO_HOMEDIR|bool|0|yellow|Share home directory (read-only)|Agent can read everything in \$HOME except credentials|sensitive|darwin"
 
     # Credentials

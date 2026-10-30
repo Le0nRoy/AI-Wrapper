@@ -465,9 +465,19 @@ Two gaps left by B-ι's first fix:
    wrapper now over-mounts read-only: `config`, `hooks/` (created if
    missing), all of `worktrees/` except this worktree's own entry, that
    entry's `commondir` / `gitdir` / `config.worktree` (pre-created when
-   `extensions.worktreeConfig` is on), and `modules/*/{hooks,config}`.
-   Any of those being a symlink aborts the bind (WARN). Commit, branch,
-   checkout, fetch keep working; `git config`, `remote add`, `push -u`,
+   `extensions.worktreeConfig` is on), and the submodule git dirs below
+   `modules/` at any depth (see "Submodule git dirs" under B-ν): their
+   `config`, `hooks/`, `config.worktree`, `commondir` and `worktrees/`
+   are RO in both modes and every directory on the chain to them is
+   pinned. A symlink among the root-level targets aborts the bind
+   (WARN); a symlink, wrong type or exceeded limit in the submodule tree
+   refuses the launch (#12). This worktree's own submodule git dirs
+   (`<common>/worktrees/<name>/modules`, where git keeps them for a
+   linked worktree) are protected after the menu and follow
+   `AI_SANDBOX_ALLOW_GIT_CONFIG` like WORKDIR's own submodules; the
+   shared ones never do. Missing submodule `hooks/` are no longer
+   created on the host (WARNed instead). Commit, branch, checkout, fetch
+   keep working; `git config`, `remote add`, `push -u`,
    `branch --set-upstream-to`, `worktree add/prune` and submodule
    updates fail inside the sandbox. Applies to the Claude wrapper too.
 
@@ -528,7 +538,7 @@ starts. It protects only entries that exist at launch:
 
 | WORKDIR | Always | Protected mode only |
 |---|---|---|
-| normal repo (`.git` dir) | `.git` pinned; `commondir`, `worktrees/` RO | `config`, `hooks/`, `config.worktree`, `modules/<name>/{config,hooks}` RO |
+| normal repo (`.git` dir) | `.git` and the chain to every submodule git dir pinned; `commondir`, `worktrees/` RO (also in submodule git dirs) | `config`, `hooks/`, `config.worktree` RO, also in submodule git dirs at any depth |
 | linked worktree / submodule checkout (`.git` file) | `.git` file RO | — (shared `.git`: B-λ) |
 | bare repo, or WORKDIR is a git dir | `commondir`, `worktrees/` RO | same entries directly under WORKDIR |
 | repository subdirectory | nothing to do: the git dir is outside WORKDIR and not writable | |
@@ -543,15 +553,38 @@ starts. It protects only entries that exist at launch:
   objects, refs, logs, `HEAD` and lock files work as before.
 - **Setting.** `AI_SANDBOX_ALLOW_GIT_CONFIG=1` (menu: Sensitive, "Allow
   editing git config and hooks"; default 0) drops the RO layers on
-  `config`, `hooks/`, `config.worktree` and submodule config/hooks only.
-  The pin, pointer files, `commondir`, `worktrees/` and all validation
-  stay. A value given explicitly at launch (even `=0`) wins over the
-  per-workdir preset; restoring `1` from a preset WARNs. It does not
-  relax the worktree common dir (B-λ).
+  `config`, `hooks/`, `config.worktree` and submodule config/hooks only
+  (WORKDIR's submodules and a linked worktree's own submodules). The
+  pins, pointer files, `commondir`, `worktrees/` and all validation and
+  limits stay. A value given explicitly at launch (even `=0`) wins over
+  the per-workdir preset; restoring `1` from a preset WARNs. It does not
+  relax the worktree common dir or its shared submodules (B-λ).
+- **Submodule git dirs (#12).** `_wrapper_git_scan_modules` walks
+  `modules/` (WORKDIR's git dir, a worktree's shared common dir and its
+  own `worktrees/<name>/modules`; one shared helper). A directory whose
+  `HEAD` or `config` is a regular file is a module git dir (a missing
+  `config` alone does not demote it); any other directory is a namespace
+  parent of a slash-containing name (`modules/libs/foo`) and is searched
+  further; git refuses to nest module git dirs inside another one's
+  namespace. Below a module git dir only its own `modules/` is searched
+  (`modules/a/modules/b`), never `objects/` or `refs/`. Every module git
+  dir gets the root's entry set (above) and every directory from
+  `modules/` down to it (namespace parents, nested `modules/`) is pinned,
+  in both modes: read-only children alone do not stop `rename(2)` of a
+  parent on Linux, and a moved parent would let the agent plant a fresh
+  tree in its place. On Linux all pins are mounted before the read-only
+  layers below them.
+  Limits: at most 16 directory levels below a `modules/` root (every
+  component counts: `modules/a/modules/b` is 3, `modules/x/y/z` is 3) and
+  at most 256 module git dirs per scan (a linked worktree's shared and
+  own trees count together). Exceeding either refuses the launch with an
+  ERROR naming the path; nothing is skipped or truncated.
 - **Validation (both modes).** A symlinked `.git`, `config`, `hooks`,
-  `config.worktree`, `commondir`, `worktrees`, `modules` or
-  `modules/<name>` (or `config`/`hooks` below it), or one with the wrong
-  file type, refuses the launch. So does a WORKDIR strictly inside a git
+  `config.worktree`, `commondir`, `worktrees`, `modules`, any symlink in
+  the searched submodule tree (namespace parents, module git dirs, their
+  `HEAD`, `config`, `hooks`, `commondir`, `worktrees`, `modules`), or one
+  of those with the wrong file type, refuses the launch. The common-dir
+  binder propagates such a refusal too (all wrappers exit 1). So does a WORKDIR strictly inside a git
   dir. Failure to resolve WORKDIR or its git dir fails closed. Host-side
   detection runs `git rev-parse` / `git config --file` only (no hooks or
   configured commands), with inherited `GIT_DIR` / `GIT_WORK_TREE` /
@@ -585,9 +618,11 @@ and renaming a branch checked out in another worktree fail.
   rules are only rendered for existing sources; creating them would
   mutate the host. A missing `config`, `hooks/`, `commondir` (absent in
   almost every repo, so this WARN appears on most normal-repo launches)
-  or `config.worktree` (with `extensions.worktreeConfig`) stays
-  creatable and is listed in a WARN. Created ones are not protected
-  until the next launch.
+  or `config.worktree` (with `extensions.worktreeConfig`), in the root or
+  in any submodule git dir, stays creatable and is listed in a WARN.
+  Created ones are not protected until the next launch. The same holds
+  for submodule git dirs created in the session (`modules/` stays
+  writable so `git submodule update --init` works).
 - *Indirection.* WARNs (detection only) for `core.hooksPath`,
   `core.fsmonitor` and `include.path` / `includeIf.*.path` resolving into
   WORKDIR, hook symlinks into WORKDIR, a `.git` file pointing at a git dir
@@ -604,9 +639,9 @@ and renaming a branch checked out in another worktree fail.
 - *Not sanitized.* RO protection freezes what is there; it does not
   clean commands or hook symlinks already present, or metadata written by
   an earlier unprotected session.
-- *Nested metadata.* Repos, submodule git dirs below `modules/<a>/modules`
-  and `.git` dirs created anywhere below WORKDIR are writable; recursive
-  submodule metadata is #12.
+- *Nested metadata.* Repos and `.git` dirs created anywhere below
+  WORKDIR (outside `modules/`) are writable. Submodule git dirs below
+  `modules/` are covered at any depth (#12).
 - *Plugins.* `_extra_sandbox_setup` binds are applied last and can
   re-grant RW (trusted code, S-β).
 
