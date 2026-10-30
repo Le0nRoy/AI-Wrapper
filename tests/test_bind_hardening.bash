@@ -4,7 +4,8 @@
 #   - the git-worktree common-dir bind (_wrapper_bind_git_common_dir): the
 #     common dir comes from the WORKDIR's `.git` file / `commondir`, so a
 #     crafted checkout must not get ~/.ssh, $HOME, /etc or an unrelated repo
-#     bound RW
+#     bound RW; its submodule git dirs at any depth, shared and this
+#     worktree's own, are protected (#12)
 #   - account/config dirs (~/.codex, ~/.codex-<name>, ~/.claude.json) that
 #     are symlinks to outside $HOME or into credential dirs
 #   - per-workdir preset values flowing into binds (CODEX_ACCOUNT,
@@ -504,6 +505,105 @@ STUB
         assert_eq "${hooks_planted}" "0" "e2e legit worktree: no hook planted on the host"
         entry_in_place=0; [[ -f "${mg}/worktrees/wt/commondir" && -d "${mg}/modules/sub1/hooks" ]] && entry_in_place=1
         assert_eq "${entry_in_place}" "1" "e2e legit worktree: worktree entry and submodule dir still in place"
+
+        # Nested submodules of a linked worktree (#12): shared ones under
+        # <common>/modules stay read-only in both modes, this worktree's own
+        # (<entry>/modules) follow AI_SANDBOX_ALLOW_GIT_CONFIG, and no
+        # directory on the chain to either can be moved.
+        _write_nested_wt_probe() {
+            {
+                printf '#!/bin/bash\nexpect_m=%q\nexpect_w=%q\ntag=%q\n' "${sg}" "${se}" "${1}"
+                cat <<'STUB'
+setup_failed() { echo "SETUP_FAILED: $*"; exit 3; }
+m="$(git rev-parse --git-common-dir 2>&1)" || setup_failed "git rev-parse --git-common-dir: ${m}"
+w="$(git rev-parse --absolute-git-dir 2>&1)" || setup_failed "git rev-parse --absolute-git-dir: ${w}"
+m="$(cd "${m}" 2>&1 && pwd -P)" || setup_failed "cannot enter common dir: ${m}"
+[[ "${m}" == "${expect_m}" && "${w}" == "${expect_w}" ]] \
+    || setup_failed "discovered common='${m}' own='${w}', expected '${expect_m}' '${expect_w}'"
+SL="${m}/modules/ns/inner/mid/modules/deep/leaf"; EL="${w}/modules/ns/inner/mid/modules/deep/leaf"
+for p in "${SL}/config" "${m}/modules/plain/hooks" "${EL}/config" "${w}/modules/plain/config" \
+        "${w}/modules/plain/hooks" plain/.git ns/inner/mid/deep/leaf/.git; do
+    [[ -e "${p}" ]] || setup_failed "missing ${p}"
+done
+echo DISCOVERY_OK
+g() { git -c user.name=t -c user.email=t@t "$@" >/dev/null 2>&1; }
+ren() { perl -e 'rename($ARGV[0], $ARGV[1]) or exit 1' "$@"; }
+mvback() { ren "$1" "$2"; rc=$?; [ "${rc}" = 0 ] && ren "$2" "$1"; return "${rc}"; }
+export -f ren mvback
+probe() { local name="${1}"; shift; if ("$@") >/dev/null 2>&1; then echo "WROTE:${name}"; else echo "DENIED:${name}"; fi; }
+(cd plain && g commit --allow-empty -m "wt-sub-${tag}") && echo SUB_COMMIT_OK
+(cd ns/inner/mid/deep/leaf && g commit --allow-empty -m "wt-leaf-${tag}") && echo LEAF_COMMIT_OK
+probe shared-leaf-config sh -c 'echo evil >>"$1"' _ "${SL}/config"
+probe shared-hook-create sh -c 'echo evil >"$1"' _ "${m}/modules/plain/hooks/post-commit"
+probe shared-modules-move mvback "${m}/modules" "${m}/modules.moved"
+probe shared-namespace-move mvback "${m}/modules/ns" "${m}/modules/ns.moved"
+probe shared-deep-namespace-move mvback "${m}/modules/ns/inner/mid/modules/deep" "${m}/modules/ns/inner/mid/modules/deep.moved"
+probe entry-leaf-config sh -c 'echo evil >>"$1"' _ "${EL}/config"
+probe entry-config-replace bash -c 'cp "$1" "$1.tmp" && echo "[core] fsmonitor = ./x" >>"$1.tmp" && ren "$1.tmp" "$1"' _ "${w}/modules/plain/config"
+probe entry-hook-create sh -c 'echo evil >"$1"' _ "${w}/modules/plain/hooks/post-commit"
+probe entry-modules-move mvback "${w}/modules" "${w}/modules.moved"
+probe entry-namespace-move mvback "${w}/modules/ns/inner" "${w}/modules/ns/inner.moved"
+probe entry-module-root-move mvback "${w}/modules/plain" "${w}/modules/plain.moved"
+probe entry-scratch-move bash -c 'mkdir "$1" && mvback "$1" "$1.moved" && rmdir "$1"' _ "${w}/modules/scratch"
+rm -f "${w}/modules/plain/config.tmp"
+echo PROBES_DONE
+STUB
+            } >"${FAKE_HOME}/bin/codex"
+            chmod +x "${FAKE_HOME}/bin/codex"
+        }
+        _nested_wt_sums() {
+            local root g
+            for root in "${sg}" "${se}"; do
+                for g in ${nested_gitdirs}; do
+                    printf '%s ' "${root}/modules/${g}"; cksum <"${root}/modules/${g}/config" 2>&1
+                    ls -A "${root}/modules/${g}/hooks" 2>&1
+                done
+            done
+        }
+        _launch_swt() {
+            ( cd "${SWT}" && env PATH="${FAKE_HOME}/bin:${PATH}" AI_SANDBOX_EXTRA_RO_DIRS="${stub_ro_dirs}" "$@" \
+                bash "${REPO_ROOT}/bin/executable_codex_wrapper.bash" x </dev/null 2>&1 )
+        }
+        nested_moves="shared-modules-move shared-namespace-move shared-deep-namespace-move entry-modules-move entry-namespace-move entry-module-root-move"
+        for mode in 0 1; do
+            label="e2e nested worktree ALLOW_GIT_CONFIG=${mode}"
+            sums_before="$(_nested_wt_sums)"
+            cp "${se}/modules/plain/config" "${OUTSIDE}/plain-config.saved"
+            cp "${se}/modules/ns/inner/mid/modules/deep/leaf/config" "${OUTSIDE}/leaf-config.saved"
+            _write_nested_wt_probe "m${mode}"
+            out="$(_launch_swt AI_SANDBOX_ALLOW_GIT_CONFIG="${mode}")"; rc=$?
+            echo "  (${label} output: ${out})"
+            assert_eq "${rc}" "0" "${label}: probe client exits 0"
+            assert_contains "${out}" "DISCOVERY_OK" "${label}: probe found the fixture git dirs"
+            assert_not_contains "${out}" "SETUP_FAILED" "${label}: no probe setup failure"
+            assert_contains "${out}" "PROBES_DONE" "${label}: probe client ran to the end"
+            assert_contains "${out}" "SUB_COMMIT_OK" "${label}: worktree submodule commit works"
+            assert_contains "${out}" "LEAF_COMMIT_OK" "${label}: nested worktree submodule commit works"
+            assert_eq "$(git -C "${SWT}/plain" log --format=%s -1)" "wt-sub-m${mode}" "${label}: submodule commit persisted on the host"
+            assert_eq "$(git -C "${SWT}/ns/inner/mid/deep/leaf" log --format=%s -1)" "wt-leaf-m${mode}" "${label}: nested submodule commit persisted on the host"
+            for p in shared-leaf-config shared-hook-create ${nested_moves}; do
+                assert_contains "${out}" "DENIED:${p}" "${label}: ${p} denied"
+            done
+            assert_contains "${out}" "WROTE:entry-scratch-move" "${label}: new dirs below the entry's modules/ still movable (positive control)"
+            if [[ "${mode}" == "0" ]]; then
+                for p in entry-leaf-config entry-config-replace entry-hook-create; do
+                    assert_contains "${out}" "DENIED:${p}" "${label}: ${p} denied"
+                done
+                assert_eq "$(_nested_wt_sums)" "${sums_before}" "${label}: submodule config bytes and hooks/ unchanged on the host"
+            else
+                for p in entry-leaf-config entry-config-replace entry-hook-create; do
+                    assert_contains "${out}" "WROTE:${p}" "${label}: ${p} allowed (positive control)"
+                done
+                ok=0; grep -q evil "${se}/modules/ns/inner/mid/modules/deep/leaf/config" && ok=1
+                assert_eq "${ok}" "1" "${label}: entry submodule config edit persisted on the host"
+            fi
+            ok=0; [[ ! -e "${sg}/modules/plain/hooks/post-commit" && -d "${sg}/modules/ns/inner/mid/modules/deep/leaf" \
+                && -d "${se}/modules/ns/inner" && ! -e "${se}/modules.moved" && ! -e "${sg}/modules.moved" ]] && ok=1
+            assert_eq "${ok}" "1" "${label}: shared hooks untouched and module trees in place on the host"
+            cp "${OUTSIDE}/plain-config.saved" "${se}/modules/plain/config"
+            cp "${OUTSIDE}/leaf-config.saved" "${se}/modules/ns/inner/mid/modules/deep/leaf/config"
+            rm -f "${se}/modules/plain/hooks/post-commit"
+        done
         [[ -n "${alias_dir}" ]] && rm -rf "${alias_dir}"
         rm -rf "${mg}/modules" "${mg}/objects/wt-moved" "${mg}/objects/sub1-moved"
     fi

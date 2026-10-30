@@ -18,7 +18,9 @@
 #      metadata-root moves are denied in protected mode, root integrity
 #      holds in relaxed mode, absent entries stay creatable (accepted
 #      residual), bare repos, scaffolding and AI_SANDBOX_EXTRA_RW_DIRS
-#      covering WORKDIR.
+#      covering WORKDIR; nested / slash-named submodule git dirs (#12):
+#      their config and hooks, and moves of every directory on the chain
+#      to them, denied while submodule commits persist.
 # Every e2e probe client first proves it found the expected fixture and
 # prints SETUP_FAILED (exit 3) otherwise, so a setup error can never pass
 # as a denied write.
@@ -643,6 +645,43 @@ _assert_normal_persisted() {
     assert_eq "$(git -C "${E}/remote.git" log --format=%s -1 main 2>&1)" "sandboxed-${tag}" "${label}: push reached the remote"
 }
 
+# Probes for the nested-submodule fixture (_new_nested_super), run from
+# its work tree. TAG makes the submodule commits fresh. Temp files stay in
+# the directory they replace (a cross-mount rename would fail with EXDEV
+# for the wrong reason); every move probe moves the directory back.
+_nested_probes() {
+    local tag="${1}"
+    printf '%s\n' \
+        "(cd plain && g commit --allow-empty -m sub-${tag}) && echo SUB_COMMIT_OK" \
+        "(cd ns/inner/mid/deep/leaf && g commit --allow-empty -m leaf-${tag}) && echo LEAF_COMMIT_OK"
+    cat <<'PROBES'
+M=.git/modules
+L=${M}/ns/inner/mid/modules/deep/leaf
+mvback() { ren "$1" "$2"; rc=$?; [ "${rc}" = 0 ] && ren "$2" "$1"; return "${rc}"; }
+export -f mvback
+probe leaf-config-append sh -c "echo evil >>${L}/config"
+probe mid-config-replace bash -c "cp ${M}/ns/inner/mid/config ${M}/ns/inner/mid/cfg.tmp && echo '[core] fsmonitor = ./x' >>${M}/ns/inner/mid/cfg.tmp && ren ${M}/ns/inner/mid/cfg.tmp ${M}/ns/inner/mid/config"
+probe leaf-hook-create sh -c "echo evil >${L}/hooks/post-commit"
+probe modules-move bash -c "mvback ${M} .git/modules.moved"
+probe namespace-move bash -c "mvback ${M}/ns ${M}/ns.moved"
+probe namespace-swap bash -c "ren ${M}/ns/inner ${M}/ns/inner.old && mkdir -p ${M}/ns/inner/mid"
+probe nested-modules-move bash -c "mvback ${M}/ns/inner/mid/modules ${M}/ns/inner/mid/modules.moved"
+probe deep-namespace-move bash -c "mvback ${M}/ns/inner/mid/modules/deep ${M}/ns/inner/mid/modules/deep.moved"
+probe leaf-move bash -c "mvback ${L} ${L}.moved"
+probe module-root-move bash -c "mvback ${M}/plain ${M}/plain.moved"
+probe scratch-move bash -c "mkdir ${M}/scratch && mvback ${M}/scratch ${M}/scratch.moved && rmdir ${M}/scratch"
+rm -f ${M}/ns/inner/mid/cfg.tmp
+PROBES
+}
+_nested_moves="modules-move namespace-move namespace-swap nested-modules-move deep-namespace-move leaf-move module-root-move"
+# The nested fixture's config bytes and hook dirs.
+_nested_sums() {
+    local top="${1}" g
+    for g in plain ns/inner/mid ns/inner/mid/modules/deep/leaf; do
+        _sums "${top}/.git/modules/${g}/config" "${top}/.git/modules/${g}/hooks"
+    done
+}
+
 if [[ "${sandbox_e2e}" == "1" ]]; then
     E="${R}/e2e"
     _new_repo "${E}"
@@ -831,6 +870,76 @@ probe hook-create sh -c "echo evil >hooks/post-receive"
     assert_eq "$(_sums "${EB}/config" "${EB}/hooks")" "${before}" "e2e bare: config and hooks/ unchanged on the host"
     ok=0; git -C "${EB}" rev-parse -q --verify bare-side >/dev/null && ok=1
     assert_eq "${ok}" "1" "e2e bare: branch persisted on the host"
+
+    echo "-- e2e: nested submodules, protected (#12)"
+    EN="${R}/e2e-nested"
+    _new_nested_super "${EN}"
+    ENM="${EN}/.git/modules"
+    rm -rf "${ENM}/plain/hooks"
+    nested_required="${ENM}/ns/inner/mid/modules/deep/leaf/config ${ENM}/ns/inner/mid/modules/deep/leaf/hooks ${ENM}/ns/inner/mid/config ${ENM}/plain/HEAD ${EN}/plain/.git ${EN}/ns/inner/mid/deep/leaf/.git"
+    before="$(_nested_sums "${EN}" 2>&1)"
+    _write_probe "${EN}/.git" "${nested_required}" '
+[[ -e .git/modules/plain/hooks ]] && echo PLAIN_HOOKS_PRESENT_AT_START || echo PLAIN_HOOKS_ABSENT_AT_START
+'"$(_nested_probes protected)"'
+probe plain-hooks-create sh -c "mkdir .git/modules/plain/hooks && echo probe >.git/modules/plain/hooks/residual-probe"
+'
+    out="$(_launch "${EN}")"; rc=$?
+    _assert_ran "${out}" "${rc}" "e2e nested protected"
+    assert_contains "${out}" "SUB_COMMIT_OK" "e2e nested protected: submodule commit works"
+    assert_contains "${out}" "LEAF_COMMIT_OK" "e2e nested protected: nested submodule commit works"
+    assert_eq "$(git -C "${EN}/plain" log --format=%s -1)" "sub-protected" "e2e nested protected: submodule commit persisted on the host"
+    assert_eq "$(git -C "${EN}/ns/inner/mid/deep/leaf" log --format=%s -1)" "leaf-protected" "e2e nested protected: nested submodule commit persisted on the host"
+    for p in leaf-config-append mid-config-replace leaf-hook-create ${_nested_moves}; do
+        assert_contains "${out}" "DENIED:${p}" "e2e nested protected: ${p} denied"
+    done
+    assert_contains "${out}" "WROTE:scratch-move" "e2e nested protected: new dirs below modules/ still movable (positive control)"
+    assert_contains "${out}" "PLAIN_HOOKS_ABSENT_AT_START" "e2e nested protected: wrapper did not create the absent submodule hooks/"
+    assert_contains "${out}" "${ENM}/plain/hooks/" "e2e nested protected: absent submodule hooks/ WARNed"
+    assert_contains "${out}" "WROTE:plain-hooks-create" "e2e nested protected: absent submodule hooks/ stays creatable (documented residual)"
+    rm -rf "${ENM}/plain/hooks"
+    assert_eq "$(_nested_sums "${EN}" 2>&1)" "${before}" "e2e nested protected: submodule config bytes and hooks/ unchanged on the host"
+    ok=0; [[ -d "${ENM}/ns/inner/mid/modules/deep/leaf" && ! -e "${ENM}/ns.moved" && ! -e "${ENM}/ns/inner.old" && ! -e "${EN}/.git/modules.moved" ]] && ok=1
+    assert_eq "${ok}" "1" "e2e nested protected: module tree still in place on the host"
+    mkdir "${ENM}/plain/hooks"
+
+    echo "-- e2e: nested submodules, AI_SANDBOX_ALLOW_GIT_CONFIG=1"
+    saved="${R}/e2e-nested-saved"; rm -rf "${saved}"; mkdir -p "${saved}"
+    cp "${ENM}/ns/inner/mid/config" "${saved}/mid"; cp "${ENM}/ns/inner/mid/modules/deep/leaf/config" "${saved}/leaf"
+    _write_probe "${EN}/.git" "${nested_required}" "$(_nested_probes relaxed)"
+    out="$(_launch "${EN}" AI_SANDBOX_ALLOW_GIT_CONFIG=1)"; rc=$?
+    _assert_ran "${out}" "${rc}" "e2e nested relaxed"
+    assert_contains "${out}" "LEAF_COMMIT_OK" "e2e nested relaxed: nested submodule commit works"
+    assert_eq "$(git -C "${EN}/ns/inner/mid/deep/leaf" log --format=%s -1)" "leaf-relaxed" "e2e nested relaxed: nested commit persisted on the host"
+    for p in leaf-config-append mid-config-replace leaf-hook-create; do
+        assert_contains "${out}" "WROTE:${p}" "e2e nested relaxed: ${p} allowed (positive control)"
+    done
+    for p in ${_nested_moves}; do
+        assert_contains "${out}" "DENIED:${p}" "e2e nested relaxed: ${p} denied (chain integrity)"
+    done
+    ok=0; grep -q evil "${ENM}/ns/inner/mid/modules/deep/leaf/config" && ok=1
+    assert_eq "${ok}" "1" "e2e nested relaxed: nested config edit persisted on the host"
+    cp "${saved}/mid" "${ENM}/ns/inner/mid/config"; cp "${saved}/leaf" "${ENM}/ns/inner/mid/modules/deep/leaf/config"
+    rm -rf "${saved}" "${ENM}/ns/inner/mid/modules/deep/leaf/hooks/post-commit"
+
+    echo "-- e2e: nested submodules through a symlinked WORKDIR and a resolved-path RW alias"
+    ENL="${FAKE_HOME}/repos-link/e2e-nested"
+    enl_expect="${ENL}/.git"; [[ "${OS}" == "Darwin" ]] && enl_expect="${EN}/.git"
+    before="$(_nested_sums "${EN}" 2>&1)"
+    alias_probe="probe resolved-alias-leaf-config sh -c \"echo evil >>${ENM}/ns/inner/mid/modules/deep/leaf/config\""
+    alias_probe+="${NL}probe resolved-alias-namespace-move bash -c \"mvback ${ENM}/ns ${ENM}/ns.moved\""
+    [[ "${OS}" == "Darwin" ]] && alias_probe=""
+    _write_probe "${enl_expect}" ".git/modules/ns/inner/mid/modules/deep/leaf/config" "$(_nested_probes alias)${NL}${alias_probe}"
+    out="$(_launch "${ENL}" AI_SANDBOX_EXTRA_RW_DIRS="${R}")"; rc=$?
+    _assert_ran "${out}" "${rc}" "e2e nested symlinked cwd"
+    for p in leaf-config-append mid-config-replace leaf-hook-create ${_nested_moves}; do
+        assert_contains "${out}" "DENIED:${p}" "e2e nested symlinked cwd: ${p} denied"
+    done
+    if [[ -n "${alias_probe}" ]]; then
+        assert_contains "${out}" "DENIED:resolved-alias-leaf-config" "e2e nested symlinked cwd: resolved-path alias config write denied"
+        assert_contains "${out}" "DENIED:resolved-alias-namespace-move" "e2e nested symlinked cwd: resolved-path alias namespace move denied"
+    fi
+    assert_contains "${out}" "LEAF_COMMIT_OK" "e2e nested symlinked cwd: nested submodule commit works"
+    assert_eq "$(_nested_sums "${EN}" 2>&1)" "${before}" "e2e nested symlinked cwd: submodule config bytes and hooks/ unchanged on the host"
 
     echo "-- e2e: non-repo scaffolding"
     ES="${R}/e2e-scaffold"
