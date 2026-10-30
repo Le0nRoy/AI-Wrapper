@@ -186,7 +186,7 @@ _bind_claude_account() {
 # post-menu glab bind (_apply_post_menu_binds, called below) live in the
 # shared ai_wrapper_data/ai_wrapper_lib.bash so the Codex wrapper gets the
 # same behavior. See the comments there.
-_wrapper_bind_git_common_dir
+_wrapper_bind_git_common_dir || exit 1
 
 # Claude CLI flags — full autonomy *within the sandbox boundary*.
 # The sandbox (bwrap args / SBPL profile) is the permission fence here:

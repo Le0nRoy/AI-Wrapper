@@ -4,7 +4,8 @@
 #   - the git-worktree common-dir bind (_wrapper_bind_git_common_dir): the
 #     common dir comes from the WORKDIR's `.git` file / `commondir`, so a
 #     crafted checkout must not get ~/.ssh, $HOME, /etc or an unrelated repo
-#     bound RW
+#     bound RW; its submodule git dirs at any depth, shared and this
+#     worktree's own, are protected (#12)
 #   - account/config dirs (~/.codex, ~/.codex-<name>, ~/.claude.json) that
 #     are symlinks to outside $HOME or into credential dirs
 #   - per-workdir preset values flowing into binds (CODEX_ACCOUNT,
@@ -120,12 +121,121 @@ if command -v git >/dev/null 2>&1; then
     git -C "${FAKE_HOME}/repos/main" config --unset extensions.worktreeConfig
     rm -f "${mg}/worktrees/wt/config.worktree"
 
-    # Submodule git dirs: hooks/ and config RO.
+    # Submodule git dirs: config RO; a missing hooks/ is no longer created
+    # on the host (#12) but reported absent.
     mkdir -p "${mg}/modules/sub1"; : >"${mg}/modules/sub1/config"
     out="$(_gitbind "${FAKE_HOME}/repos/wt")"
-    assert_contains "${out}" "--ro-bind${NL}${mg}/modules/sub1/hooks" "submodule hooks/ RO"
     assert_contains "${out}" "--ro-bind${NL}${mg}/modules/sub1/config" "submodule config RO"
+    hooks_made=0; [[ -e "${mg}/modules/sub1/hooks" ]] && hooks_made=1
+    assert_eq "${hooks_made}" "0" "submodule: missing hooks/ not created on the host"
+    assert_contains "${out}" "absent at launch" "submodule: missing hooks/ reported absent"
+    assert_contains "${out}" "${mg}/modules/sub1/hooks/" "... naming it"
+    mkdir "${mg}/modules/sub1/hooks"
+    out="$(_gitbind "${FAKE_HOME}/repos/wt")"
+    assert_contains "${out}" "--ro-bind${NL}${mg}/modules/sub1/hooks" "submodule hooks/ RO when present"
     rm -rf "${mg}/modules"
+
+    # Nested submodule git dirs (#12), real Git layout: superproject SUP
+    # with `plain` and the slash-named `ns/inner/mid` (own submodule
+    # `deep/leaf`), and a linked worktree SWT whose submodules git keeps
+    # in its own entry (<common>/worktrees/sup-wt/modules).
+    git_sub() { git_q -c protocol.file.allow=always "$@"; }
+    nsrc="${FAKE_HOME}/repos/nested-src"
+    for r in leaf mid; do git_q init "${nsrc}/${r}"; git_q -C "${nsrc}/${r}" commit --allow-empty -m init; done
+    git_sub -C "${nsrc}/mid" submodule add "${nsrc}/leaf" deep/leaf
+    git_q -C "${nsrc}/mid" commit -m add-leaf
+    SUP="${FAKE_HOME}/repos/sup"; SWT="${FAKE_HOME}/repos/sup-wt"
+    git_q init "${SUP}"; git_q -C "${SUP}" commit --allow-empty -m init
+    git_sub -C "${SUP}" submodule add "${nsrc}/mid" ns/inner/mid
+    git_sub -C "${SUP}" submodule add "${nsrc}/leaf" plain
+    git_q -C "${SUP}" commit -m add-subs
+    git_sub -C "${SUP}" submodule update --init --recursive
+    git_q -C "${SUP}" worktree add "${SWT}" -b swt
+    git_sub -C "${SWT}" submodule update --init --recursive
+    sg="${SUP}/.git"; se="${sg}/worktrees/sup-wt"
+    nested_gitdirs="plain ns/inner/mid ns/inner/mid/modules/deep/leaf"
+    for g in ${nested_gitdirs}; do mkdir -p "${sg}/modules/${g}/hooks" "${se}/modules/${g}/hooks"; done
+    mkdir -p "${sg}/hooks"
+    ok=0; [[ -f "${sg}/modules/ns/inner/mid/modules/deep/leaf/HEAD" && -f "${se}/modules/ns/inner/mid/modules/deep/leaf/HEAD" ]] && ok=1
+    assert_eq "${ok}" "1" "nested fixture: git created shared and worktree-entry module git dirs"
+    # Pre-menu bind plus the post-menu step, as the wrappers run them. OS
+    # (default Linux) is set after sourcing so the host never decides the
+    # flag shape.
+    _wtbind() {
+        ( set -u; cd "${SWT}" && _load codex; _wrapper_os="${2:-Linux}"; WRAPPER_FLAGS=()
+          _wrapper_bind_git_common_dir; echo "rc=$?"
+          AI_SANDBOX_ALLOW_GIT_CONFIG="${1}" _apply_post_menu_binds; echo "post_rc=$?"
+          printf '%s\n' "${WRAPPER_FLAGS[@]+"${WRAPPER_FLAGS[@]}"}" ) 2>&1
+    }
+    _pinflag() { printf -- '--bind\n%s\n%s\n' "${1}" "${1}"; }
+    chain="/ns /ns/inner /ns/inner/mid /ns/inner/mid/modules /ns/inner/mid/modules/deep /ns/inner/mid/modules/deep/leaf /plain"
+    for mode in 0 1; do
+        out="$(_wtbind "${mode}")"
+        assert_contains "${out}" "${NL}rc=0${NL}" "nested worktree ALLOW_GIT_CONFIG=${mode}: pre-menu bind allowed"
+        assert_contains "${out}" "post_rc=0" "nested worktree ALLOW_GIT_CONFIG=${mode}: post-menu protection allowed"
+        assert_contains "${out}" "--bind${NL}${sg}${NL}" "nested worktree ALLOW_GIT_CONFIG=${mode}: common dir bound"
+        for c in "" ${chain}; do
+            assert_contains "${out}" "$(_pinflag "${sg}/modules${c}")" "nested worktree ALLOW_GIT_CONFIG=${mode}: shared modules${c} pinned"
+            assert_contains "${out}" "$(_pinflag "${se}/modules${c}")" "nested worktree ALLOW_GIT_CONFIG=${mode}: entry modules${c} pinned"
+        done
+        for g in ${nested_gitdirs}; do
+            assert_contains "${out}" "--ro-bind${NL}${sg}/modules/${g}/config${NL}" "nested worktree ALLOW_GIT_CONFIG=${mode}: shared modules/${g}/config read-only"
+            assert_contains "${out}" "--ro-bind${NL}${sg}/modules/${g}/hooks${NL}" "nested worktree ALLOW_GIT_CONFIG=${mode}: shared modules/${g}/hooks read-only"
+        done
+        assert_not_contains "${out}" "--ro-bind${NL}${sg}/modules/ns/config" "nested worktree: namespace not treated as a git dir"
+        # bwrap: entry pins after the RW entry bind, shared pins before
+        # the shared read-only layers.
+        rw_entry="$(printf '%s\n' "${out}" | grep -n -x -F "${se}" | head -1 | cut -d: -f1)"
+        entry_pin="$(printf '%s\n' "${out}" | grep -n -x -F "${se}/modules" | head -1 | cut -d: -f1)"
+        shared_pin="$(printf '%s\n' "${out}" | grep -n -x -F "${sg}/modules/plain" | head -1 | cut -d: -f1)"
+        shared_ro="$(printf '%s\n' "${out}" | grep -n -x -F "${sg}/modules/plain/config" | head -1 | cut -d: -f1)"
+        ok=0; [[ -n "${rw_entry}" && -n "${entry_pin}" && "${rw_entry}" -lt "${entry_pin}" \
+            && -n "${shared_pin}" && -n "${shared_ro}" && "${shared_pin}" -lt "${shared_ro}" ]] && ok=1
+        assert_eq "${ok}" "1" "nested worktree ALLOW_GIT_CONFIG=${mode} (Linux): parents mounted before children"
+    done
+    out="$(_wtbind 0)"
+    for g in ${nested_gitdirs}; do
+        assert_contains "${out}" "--ro-bind${NL}${se}/modules/${g}/config${NL}" "nested worktree protected: entry modules/${g}/config read-only"
+        assert_contains "${out}" "--ro-bind${NL}${se}/modules/${g}/hooks${NL}" "nested worktree protected: entry modules/${g}/hooks read-only"
+    done
+    out="$(_wtbind 1)"
+    assert_not_contains "${out}" "--ro-bind${NL}${se}/modules" "nested worktree relaxed: entry submodule config/hooks writable"
+    assert_contains "${out}" "worktree's submodule config and hooks/ are writable" "nested worktree relaxed: WARN printed"
+    out="$(_wtbind 0 Darwin)"
+    assert_contains "${out}" "--pin${NL}${se}/modules/ns/inner${NL}" "nested worktree (macOS): entry namespace pinned with --pin"
+    assert_contains "${out}" "--pin${NL}${sg}/modules/ns/inner/mid/modules/deep${NL}" "nested worktree (macOS): shared namespace pinned with --pin"
+    # Missing module hooks/: not created on the host, reported absent.
+    rm -rf "${sg}/modules/ns/inner/mid/modules/deep/leaf/hooks" "${se}/modules/plain/hooks"
+    out="$(_wtbind 0)"
+    assert_contains "${out}" "post_rc=0" "nested worktree: missing submodule hooks/ do not fail the launch"
+    made=0; [[ -e "${sg}/modules/ns/inner/mid/modules/deep/leaf/hooks" || -e "${se}/modules/plain/hooks" ]] && made=1
+    assert_eq "${made}" "0" "nested worktree: missing submodule hooks/ not created on the host"
+    assert_contains "${out}" "${sg}/modules/ns/inner/mid/modules/deep/leaf/hooks/" "nested worktree: missing shared hooks/ reported absent"
+    assert_contains "${out}" "${se}/modules/plain/hooks/" "nested worktree: missing entry hooks/ reported absent"
+    mkdir "${sg}/modules/ns/inner/mid/modules/deep/leaf/hooks" "${se}/modules/plain/hooks"
+    # Symlinks in either tree refuse the launch before anything is bound.
+    for root in "${sg}" "${se}"; do
+        mv "${root}/modules/ns/inner" "${OUTSIDE}/inner.saved"
+        ln -s "${OUTSIDE}/inner.saved" "${root}/modules/ns/inner"
+        out="$(_wtbind 1)"
+        assert_contains "${out}" "${NL}rc=1${NL}" "nested worktree: symlinked namespace in ${root#"${sg}"}/modules refuses the launch"
+        assert_contains "${out}" "is a symlink" "... with the symlink ERROR"
+        assert_not_contains "${out}" "--bind" "... before any bind"
+        rm -f "${root}/modules/ns/inner"; mv "${OUTSIDE}/inner.saved" "${root}/modules/ns/inner"
+    done
+    # One count limit across both roots: 3 + 3 real git dirs, plus 125
+    # fabricated in each root = 256 allowed; one more refused.
+    for i in $(seq 1 125); do
+        mkdir -p "${sg}/modules/f${i}" "${se}/modules/e${i}"; : >"${sg}/modules/f${i}/HEAD"; : >"${se}/modules/e${i}/HEAD"
+    done
+    out="$(_wtbind 0)"
+    assert_contains "${out}" "${NL}rc=0${NL}" "nested worktree: 256 module git dirs over two roots allowed"
+    mkdir -p "${se}/modules/e126"; : >"${se}/modules/e126/HEAD"
+    out="$(_wtbind 0)"
+    assert_contains "${out}" "${NL}rc=1${NL}" "nested worktree: 257 module git dirs over two roots refused"
+    assert_contains "${out}" "more than 256 submodule git dirs" "... naming the count limit"
+    assert_not_contains "${out}" "--bind" "... before any bind"
+    for i in $(seq 1 126); do rm -rf "${sg}/modules/f${i}" "${se}/modules/e${i}"; done
 
     # Crafted commondir -> ~/.ssh (made git-dir shaped so git accepts it).
     _fake_gitdir "${FAKE_HOME}/.ssh"
@@ -395,6 +505,105 @@ STUB
         assert_eq "${hooks_planted}" "0" "e2e legit worktree: no hook planted on the host"
         entry_in_place=0; [[ -f "${mg}/worktrees/wt/commondir" && -d "${mg}/modules/sub1/hooks" ]] && entry_in_place=1
         assert_eq "${entry_in_place}" "1" "e2e legit worktree: worktree entry and submodule dir still in place"
+
+        # Nested submodules of a linked worktree (#12): shared ones under
+        # <common>/modules stay read-only in both modes, this worktree's own
+        # (<entry>/modules) follow AI_SANDBOX_ALLOW_GIT_CONFIG, and no
+        # directory on the chain to either can be moved.
+        _write_nested_wt_probe() {
+            {
+                printf '#!/bin/bash\nexpect_m=%q\nexpect_w=%q\ntag=%q\n' "${sg}" "${se}" "${1}"
+                cat <<'STUB'
+setup_failed() { echo "SETUP_FAILED: $*"; exit 3; }
+m="$(git rev-parse --git-common-dir 2>&1)" || setup_failed "git rev-parse --git-common-dir: ${m}"
+w="$(git rev-parse --absolute-git-dir 2>&1)" || setup_failed "git rev-parse --absolute-git-dir: ${w}"
+m="$(cd "${m}" 2>&1 && pwd -P)" || setup_failed "cannot enter common dir: ${m}"
+[[ "${m}" == "${expect_m}" && "${w}" == "${expect_w}" ]] \
+    || setup_failed "discovered common='${m}' own='${w}', expected '${expect_m}' '${expect_w}'"
+SL="${m}/modules/ns/inner/mid/modules/deep/leaf"; EL="${w}/modules/ns/inner/mid/modules/deep/leaf"
+for p in "${SL}/config" "${m}/modules/plain/hooks" "${EL}/config" "${w}/modules/plain/config" \
+        "${w}/modules/plain/hooks" plain/.git ns/inner/mid/deep/leaf/.git; do
+    [[ -e "${p}" ]] || setup_failed "missing ${p}"
+done
+echo DISCOVERY_OK
+g() { git -c user.name=t -c user.email=t@t "$@" >/dev/null 2>&1; }
+ren() { perl -e 'rename($ARGV[0], $ARGV[1]) or exit 1' "$@"; }
+mvback() { ren "$1" "$2"; rc=$?; [ "${rc}" = 0 ] && ren "$2" "$1"; return "${rc}"; }
+export -f ren mvback
+probe() { local name="${1}"; shift; if ("$@") >/dev/null 2>&1; then echo "WROTE:${name}"; else echo "DENIED:${name}"; fi; }
+(cd plain && g commit --allow-empty -m "wt-sub-${tag}") && echo SUB_COMMIT_OK
+(cd ns/inner/mid/deep/leaf && g commit --allow-empty -m "wt-leaf-${tag}") && echo LEAF_COMMIT_OK
+probe shared-leaf-config sh -c 'echo evil >>"$1"' _ "${SL}/config"
+probe shared-hook-create sh -c 'echo evil >"$1"' _ "${m}/modules/plain/hooks/post-commit"
+probe shared-modules-move mvback "${m}/modules" "${m}/modules.moved"
+probe shared-namespace-move mvback "${m}/modules/ns" "${m}/modules/ns.moved"
+probe shared-deep-namespace-move mvback "${m}/modules/ns/inner/mid/modules/deep" "${m}/modules/ns/inner/mid/modules/deep.moved"
+probe entry-leaf-config sh -c 'echo evil >>"$1"' _ "${EL}/config"
+probe entry-config-replace bash -c 'cp "$1" "$1.tmp" && echo "[core] fsmonitor = ./x" >>"$1.tmp" && ren "$1.tmp" "$1"' _ "${w}/modules/plain/config"
+probe entry-hook-create sh -c 'echo evil >"$1"' _ "${w}/modules/plain/hooks/post-commit"
+probe entry-modules-move mvback "${w}/modules" "${w}/modules.moved"
+probe entry-namespace-move mvback "${w}/modules/ns/inner" "${w}/modules/ns/inner.moved"
+probe entry-module-root-move mvback "${w}/modules/plain" "${w}/modules/plain.moved"
+probe entry-scratch-move bash -c 'mkdir "$1" && mvback "$1" "$1.moved" && rmdir "$1"' _ "${w}/modules/scratch"
+rm -f "${w}/modules/plain/config.tmp"
+echo PROBES_DONE
+STUB
+            } >"${FAKE_HOME}/bin/codex"
+            chmod +x "${FAKE_HOME}/bin/codex"
+        }
+        _nested_wt_sums() {
+            local root g
+            for root in "${sg}" "${se}"; do
+                for g in ${nested_gitdirs}; do
+                    printf '%s ' "${root}/modules/${g}"; cksum <"${root}/modules/${g}/config" 2>&1
+                    ls -A "${root}/modules/${g}/hooks" 2>&1
+                done
+            done
+        }
+        _launch_swt() {
+            ( cd "${SWT}" && env PATH="${FAKE_HOME}/bin:${PATH}" AI_SANDBOX_EXTRA_RO_DIRS="${stub_ro_dirs}" "$@" \
+                bash "${REPO_ROOT}/bin/executable_codex_wrapper.bash" x </dev/null 2>&1 )
+        }
+        nested_moves="shared-modules-move shared-namespace-move shared-deep-namespace-move entry-modules-move entry-namespace-move entry-module-root-move"
+        for mode in 0 1; do
+            label="e2e nested worktree ALLOW_GIT_CONFIG=${mode}"
+            sums_before="$(_nested_wt_sums)"
+            cp "${se}/modules/plain/config" "${OUTSIDE}/plain-config.saved"
+            cp "${se}/modules/ns/inner/mid/modules/deep/leaf/config" "${OUTSIDE}/leaf-config.saved"
+            _write_nested_wt_probe "m${mode}"
+            out="$(_launch_swt AI_SANDBOX_ALLOW_GIT_CONFIG="${mode}")"; rc=$?
+            echo "  (${label} output: ${out})"
+            assert_eq "${rc}" "0" "${label}: probe client exits 0"
+            assert_contains "${out}" "DISCOVERY_OK" "${label}: probe found the fixture git dirs"
+            assert_not_contains "${out}" "SETUP_FAILED" "${label}: no probe setup failure"
+            assert_contains "${out}" "PROBES_DONE" "${label}: probe client ran to the end"
+            assert_contains "${out}" "SUB_COMMIT_OK" "${label}: worktree submodule commit works"
+            assert_contains "${out}" "LEAF_COMMIT_OK" "${label}: nested worktree submodule commit works"
+            assert_eq "$(git -C "${SWT}/plain" log --format=%s -1)" "wt-sub-m${mode}" "${label}: submodule commit persisted on the host"
+            assert_eq "$(git -C "${SWT}/ns/inner/mid/deep/leaf" log --format=%s -1)" "wt-leaf-m${mode}" "${label}: nested submodule commit persisted on the host"
+            for p in shared-leaf-config shared-hook-create ${nested_moves}; do
+                assert_contains "${out}" "DENIED:${p}" "${label}: ${p} denied"
+            done
+            assert_contains "${out}" "WROTE:entry-scratch-move" "${label}: new dirs below the entry's modules/ still movable (positive control)"
+            if [[ "${mode}" == "0" ]]; then
+                for p in entry-leaf-config entry-config-replace entry-hook-create; do
+                    assert_contains "${out}" "DENIED:${p}" "${label}: ${p} denied"
+                done
+                assert_eq "$(_nested_wt_sums)" "${sums_before}" "${label}: submodule config bytes and hooks/ unchanged on the host"
+            else
+                for p in entry-leaf-config entry-config-replace entry-hook-create; do
+                    assert_contains "${out}" "WROTE:${p}" "${label}: ${p} allowed (positive control)"
+                done
+                ok=0; grep -q evil "${se}/modules/ns/inner/mid/modules/deep/leaf/config" && ok=1
+                assert_eq "${ok}" "1" "${label}: entry submodule config edit persisted on the host"
+            fi
+            ok=0; [[ ! -e "${sg}/modules/plain/hooks/post-commit" && -d "${sg}/modules/ns/inner/mid/modules/deep/leaf" \
+                && -d "${se}/modules/ns/inner" && ! -e "${se}/modules.moved" && ! -e "${sg}/modules.moved" ]] && ok=1
+            assert_eq "${ok}" "1" "${label}: shared hooks untouched and module trees in place on the host"
+            cp "${OUTSIDE}/plain-config.saved" "${se}/modules/plain/config"
+            cp "${OUTSIDE}/leaf-config.saved" "${se}/modules/ns/inner/mid/modules/deep/leaf/config"
+            rm -f "${se}/modules/plain/hooks/post-commit"
+        done
         [[ -n "${alias_dir}" ]] && rm -rf "${alias_dir}"
         rm -rf "${mg}/modules" "${mg}/objects/wt-moved" "${mg}/objects/sub1-moved"
     fi

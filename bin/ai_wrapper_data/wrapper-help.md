@@ -66,7 +66,11 @@ The sandbox bounds *writes* — it does not bound *reads* or *network*. Be aware
   commands fail half-way: `git push -u` may update the remote yet not
   record the upstream, checking out a remote-only branch creates the
   branch but exits non-zero, and `git branch -m` renames before failing.
-  It does not relax a linked worktree's shared `.git` (always protected).
+  Submodule git dirs are covered at any depth (nested and slash-named),
+  including a linked worktree's own submodules; at most 16 directory
+  levels and 256 submodule git dirs, beyond which the launch is refused.
+  It does not relax a linked worktree's shared `.git` or its shared
+  submodules (always protected).
   The `.git` dir
   stays pinned (cannot be moved or replaced), a worktree's `.git` file
   and `commondir` stay read-only, and symlinked metadata refuses the

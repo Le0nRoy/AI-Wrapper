@@ -18,7 +18,9 @@
 #      metadata-root moves are denied in protected mode, root integrity
 #      holds in relaxed mode, absent entries stay creatable (accepted
 #      residual), bare repos, scaffolding and AI_SANDBOX_EXTRA_RW_DIRS
-#      covering WORKDIR.
+#      covering WORKDIR; nested / slash-named submodule git dirs (#12):
+#      their config and hooks, and moves of every directory on the chain
+#      to them, denied while submodule commits persist.
 # Every e2e probe client first proves it found the expected fixture and
 # prints SETUP_FAILED (exit 3) otherwise, so a setup error can never pass
 # as a denied write.
@@ -119,8 +121,11 @@ assert_contains "${out}" "$(_lflag --ro-bind "${N}/.git/modules/sub1/config")" "
 assert_contains "${out}" "$(_lflag --ro-bind "${N}/.git/modules/sub1/hooks")" "submodule hooks/ read-only"
 assert_contains "${out}" "submodule checkouts' .git pointer files" "submodule pointer residual WARNed"
 printf '%s\n' "../../elsewhere/.git" >"${N}/.git/commondir"
+# Module git dirs get the same pointer checks as the root (#12).
+printf '%s\n' "../../elsewhere/.git" >"${N}/.git/modules/sub1/commondir"
 out="$(_protect "${N}")"
 assert_contains "${out}" "$(_lflag --ro-bind "${N}/.git/commondir")" "commondir read-only when present"
+assert_contains "${out}" "$(_lflag --ro-bind "${N}/.git/modules/sub1/commondir")" "submodule commondir read-only when present"
 assert_not_contains "${out}" "absent at launch" "nothing reported absent when every entry exists"
 rm -f "${N}/.git/commondir" "${N}/.git/config.worktree"
 rm -rf "${N}/.git/modules"
@@ -205,6 +210,194 @@ for mode in 0 1; do
     assert_contains "${out}" "rc=1" "ALLOW_GIT_CONFIG=${mode}: config as a directory refuses the launch"
 done
 rm -rf "${R}"/sym-* "${R}"/type-*
+
+# ---------------------------------------------------------------------------
+# Nested submodule git dirs (#12). Real Git layout: superproject with the
+# submodule `plain` and the slash-named `ns/inner/mid`, which has its own
+# submodule `deep/leaf`:
+#   .git/modules/plain
+#   .git/modules/ns/inner/mid                       (ns, ns/inner: namespaces)
+#   .git/modules/ns/inner/mid/modules/deep/leaf     (deep: namespace)
+git_sub() { git_q -c protocol.file.allow=always "$@"; }
+NSRC="${R}/nested-src"
+_new_repo "${NSRC}/leaf"
+_new_repo "${NSRC}/mid"
+git_sub -C "${NSRC}/mid" submodule add "${NSRC}/leaf" deep/leaf
+git_q -C "${NSRC}/mid" commit -m add-leaf
+# Build superproject TOP from NSRC; every module git dir gets a hooks/.
+_new_nested_super() {
+    local top="${1}" gd
+    _new_repo "${top}"
+    git_sub -C "${top}" submodule add "${NSRC}/mid" ns/inner/mid
+    git_sub -C "${top}" submodule add "${NSRC}/leaf" plain
+    git_q -C "${top}" commit -m add-subs
+    git_sub -C "${top}" submodule update --init --recursive
+    for gd in plain ns/inner/mid ns/inner/mid/modules/deep/leaf; do
+        mkdir -p "${top}/.git/modules/${gd}/hooks"
+    done
+    mkdir -p "${top}/.git/hooks"
+}
+# The module git dirs and the directory chain the protection must pin.
+_nested_gitdirs() { printf '%s\n' plain ns/inner/mid ns/inner/mid/modules/deep/leaf; }
+_nested_chain() { printf '%s\n' "" /ns /ns/inner /ns/inner/mid /ns/inner/mid/modules /ns/inner/mid/modules/deep \
+    /ns/inner/mid/modules/deep/leaf /plain; }
+
+echo "-- nested submodule git dirs: real layout (#12)"
+NS="${R}/nested"
+_new_nested_super "${NS}"
+NM="${NS}/.git/modules"
+ok=0; [[ -f "${NM}/ns/inner/mid/modules/deep/leaf/HEAD" && -f "${NM}/plain/HEAD" && ! -e "${NM}/ns/HEAD" ]] && ok=1
+assert_eq "${ok}" "1" "fixture: git created nested and slash-named module git dirs"
+# Ordinary object storage below a git dir is not searched: a symlink there
+# must not refuse the launch.
+ln -s "${R}/target-dir" "${NM}/plain/objects/not-searched"
+out="$(_protect "${NS}")"
+assert_contains "${out}" "rc=0" "nested: launch allowed"
+while IFS= read -r c; do
+    assert_contains "${out}" "$(_lflag --bind "${NM}${c}")" "nested (Linux): modules${c} pinned"
+done < <(_nested_chain)
+while IFS= read -r g; do
+    assert_contains "${out}" "$(_lflag --ro-bind "${NM}/${g}/config")" "nested: modules/${g}/config read-only"
+    assert_contains "${out}" "$(_lflag --ro-bind "${NM}/${g}/hooks")" "nested: modules/${g}/hooks read-only"
+done < <(_nested_gitdirs)
+for n in ns ns/inner ns/inner/mid/modules/deep; do
+    assert_not_contains "${out}" "${NM}/${n}/config${NL}" "nested: namespace modules/${n} not treated as a git dir (config)"
+    assert_not_contains "${out}" "${NM}/${n}/commondir" "nested: namespace modules/${n} not treated as a git dir (commondir)"
+done
+assert_not_contains "${out}" "not-searched" "nested: objects/ of a module git dir not searched"
+# bwrap: every pin before the first read-only layer below modules/.
+last_pin="$(printf '%s\n' "${out}" | grep -n -x -F -e "--bind" | tail -1 | cut -d: -f1)"
+first_ro="$(printf '%s\n' "${out}" | grep -n -x -F -e "--ro-bind" | head -1 | cut -d: -f1)"
+ok=0; [[ -n "${last_pin}" && -n "${first_ro}" && "${last_pin}" -lt "${first_ro}" ]] && ok=1
+assert_eq "${ok}" "1" "nested (Linux): all pins precede the read-only layers"
+out="$(_protect "${NS}" Darwin)"
+for c in /ns /ns/inner/mid/modules/deep /ns/inner/mid/modules/deep/leaf; do
+    assert_contains "${out}" "--pin${NL}${NM}${c}${NL}" "nested (macOS): modules${c} pinned with --pin"
+done
+assert_contains "${out}" "--ro-bind${NL}${NM}/ns/inner/mid/modules/deep/leaf/config${NL}" "nested (macOS): deepest config read-only"
+rm -f "${NM}/plain/objects/not-searched"
+
+echo "-- nested submodule git dirs: relaxed mode"
+out="$(AI_SANDBOX_ALLOW_GIT_CONFIG=1 _protect "${NS}")"
+assert_contains "${out}" "rc=0" "nested relaxed: launch allowed"
+while IFS= read -r c; do
+    assert_contains "${out}" "$(_lflag --bind "${NM}${c}")" "nested relaxed (Linux): modules${c} still pinned"
+done < <(_nested_chain)
+assert_not_contains "${out}" "--ro-bind${NL}${NM}" "nested relaxed: no submodule config/hooks layer"
+assert_contains "${out}" "submodule git dirs" "nested relaxed: WARN covers submodules"
+printf '%s\n' "../x" >"${NM}/ns/inner/mid/modules/deep/leaf/commondir"
+mkdir -p "${NM}/plain/worktrees"
+out="$(AI_SANDBOX_ALLOW_GIT_CONFIG=1 _protect "${NS}")"
+assert_contains "${out}" "$(_lflag --ro-bind "${NM}/ns/inner/mid/modules/deep/leaf/commondir")" "nested relaxed: nested commondir pointer still read-only"
+assert_contains "${out}" "$(_lflag --ro-bind "${NM}/plain/worktrees")" "nested relaxed: submodule worktrees/ still read-only"
+out="$(AI_SANDBOX_ALLOW_GIT_CONFIG=1 _protect "${NS}" Darwin)"
+assert_contains "${out}" "--pin${NL}${NM}/ns/inner${NL}" "nested relaxed (macOS): namespace still pinned"
+rm -f "${NM}/ns/inner/mid/modules/deep/leaf/commondir"; rmdir "${NM}/plain/worktrees"
+
+echo "-- nested submodule git dirs: missing config / hooks (no host creation)"
+LEAF="${NM}/ns/inner/mid/modules/deep/leaf"
+mv "${LEAF}/config" "${R}/leaf-config.saved"
+rm -rf "${NM}/plain/hooks"
+git -C "${NS}" config extensions.worktreeConfig true
+git config --file "${NM}/ns/inner/mid/config" extensions.worktreeConfig true
+out="$(_protect "${NS}")"
+assert_contains "${out}" "rc=0" "missing nested config/hooks: launch allowed"
+assert_contains "${out}" "$(_lflag --bind "${LEAF}")" "missing config: git dir still recognised by HEAD (pinned)"
+assert_contains "${out}" "$(_lflag --ro-bind "${LEAF}/hooks")" "missing config: its hooks/ still read-only"
+absent_line="$(printf '%s\n' "${out}" | grep 'absent at launch' || true)"
+assert_contains "${absent_line}" "${LEAF}/config " "missing nested config reported absent"
+assert_contains "${absent_line}" "${NM}/plain/hooks/" "missing submodule hooks/ reported absent"
+assert_contains "${absent_line}" "${NM}/ns/inner/mid/config.worktree" "submodule worktreeConfig without config.worktree reported absent"
+made=0; [[ -e "${LEAF}/config" || -e "${NM}/plain/hooks" || -e "${NM}/ns/inner/mid/config.worktree" ]] && made=1
+assert_eq "${made}" "0" "missing nested entries: nothing created on the host"
+mv "${R}/leaf-config.saved" "${LEAF}/config"; mkdir "${NM}/plain/hooks"
+git -C "${NS}" config --unset extensions.worktreeConfig
+git config --file "${NM}/ns/inner/mid/config" --unset extensions.worktreeConfig
+# A namespace may hold stray regular files (not git dirs): ignored.
+: >"${NM}/ns/stray"
+out="$(_protect "${NS}")"
+assert_contains "${out}" "rc=0" "regular file in a namespace: launch allowed"
+assert_not_contains "${out}" "${NM}/ns/stray" "regular file in a namespace: not bound"
+rm -f "${NM}/ns/stray"
+
+echo "-- nested submodule git dirs: symlink / type validation (both modes)"
+CANARY="${R}/canary"
+rm -rf "${CANARY}"; mkdir -p "${CANARY}/hooks"; printf 'canary\n' >"${CANARY}/config"; printf 'ref: x\n' >"${CANARY}/HEAD"
+canary_before="$(ls -A "${CANARY}" "${CANARY}/hooks"; cksum "${CANARY}/config" "${CANARY}/HEAD")"
+# Each case: path below .git/modules, what replaces it.
+_nested_bad() {
+    local mode="${1}" rel="${2}" kind="${3}" label="${4}" expect="${5}" V="${R}/nested-bad"
+    rm -rf "${V}"; cp -R "${NS}" "${V}"
+    local p="${V}/.git/modules/${rel}"
+    rm -rf "${p}"
+    case "${kind}" in
+        dirlink) ln -s "${CANARY}" "${p}" ;;
+        filelink) ln -s "${CANARY}/config" "${p}" ;;
+        file) : >"${p}" ;;
+    esac
+    out="$(AI_SANDBOX_ALLOW_GIT_CONFIG="${mode}" _protect "${V}")"
+    assert_contains "${out}" "rc=1" "ALLOW_GIT_CONFIG=${mode}: ${label} refuses the launch"
+    assert_contains "${out}" "${expect}" "... with the ERROR"
+    assert_not_contains "${out}" "--bind" "... before any bind is added"
+    rm -rf "${V}"
+}
+for mode in 0 1; do
+    _nested_bad "${mode}" ns dirlink "symlinked namespace parent" "is a symlink"
+    _nested_bad "${mode}" ns/inner/mid/modules dirlink "symlinked nested modules/" "is a symlink"
+    _nested_bad "${mode}" ns/inner/mid/modules/deep/leaf dirlink "symlinked nested module git dir" "is a symlink"
+    _nested_bad "${mode}" ns/inner/mid/modules/deep/leaf/hooks dirlink "symlinked nested hooks/" "is a symlink"
+    _nested_bad "${mode}" ns/inner/mid/modules/deep/leaf/config filelink "symlinked nested config" "is a symlink"
+    _nested_bad "${mode}" ns/inner/mid/modules/deep/leaf/HEAD filelink "symlinked nested HEAD" "is a symlink"
+    _nested_bad "${mode}" ns/inner/mid/modules/deep/leaf/commondir filelink "symlinked nested commondir" "is a symlink"
+    _nested_bad "${mode}" ns/inner/mid/modules/deep/leaf/hooks file "nested hooks/ as a regular file" "not a regular directory"
+    _nested_bad "${mode}" ns/inner/mid/modules file "nested modules as a regular file" "not a regular directory"
+done
+assert_eq "$(ls -A "${CANARY}" "${CANARY}/hooks"; cksum "${CANARY}/config" "${CANARY}/HEAD")" "${canary_before}" "symlink refusals: external canary untouched"
+
+echo "-- nested submodule git dirs: depth and count limits"
+_fake_mod() { mkdir -p "${1}" && : >"${1}/HEAD"; }
+LM="${R}/limits"
+_new_repo "${LM}"
+# 15 namespace parents + the git dir = depth 16 (the limit): allowed.
+chain=""; for i in $(seq 1 15); do chain+="/n${i}"; done
+_fake_mod "${LM}/.git/modules${chain}/g"
+out="$(_protect "${LM}")"
+assert_contains "${out}" "rc=0" "depth 16 (namespace chain): allowed"
+assert_contains "${out}" "$(_lflag --bind "${LM}/.git/modules${chain}/g")" "depth 16: deepest git dir pinned"
+assert_contains "${out}" "$(_lflag --bind "${LM}/.git/modules/n1")" "depth 16: top namespace pinned"
+# One more namespace level: refused, not truncated.
+rm -rf "${LM}/.git/modules"; _fake_mod "${LM}/.git/modules${chain}/n16/g"
+out="$(_protect "${LM}")"
+assert_contains "${out}" "rc=1" "depth 17 (namespace chain): refused"
+assert_contains "${out}" "deeper than the supported 16" "... naming the depth limit"
+assert_not_contains "${out}" "--bind" "... before any bind"
+# Nested modules/ dirs count as levels: a/modules/b/.../modules/h is 15.
+rm -rf "${LM}/.git/modules"
+nest=""; for n in a b c d e f g h; do nest+="${nest:+/modules}/${n}"; _fake_mod "${LM}/.git/modules${nest}"; done
+out="$(_protect "${LM}")"
+assert_contains "${out}" "rc=0" "depth 15 (8 nested git dirs): allowed"
+assert_contains "${out}" "$(_lflag --bind "${LM}/.git/modules${nest}")" "8 nested git dirs: deepest pinned"
+mkdir "${LM}/.git/modules${nest}/modules"
+out="$(_protect "${LM}")"
+assert_contains "${out}" "rc=0" "depth 16 (empty nested modules/): allowed"
+_fake_mod "${LM}/.git/modules${nest}/modules/i"
+out="$(_protect "${LM}")"
+assert_contains "${out}" "rc=1" "depth 17 (git dir below the 16th level): refused"
+assert_contains "${out}" "deeper than the supported 16" "... naming the depth limit"
+# Count: 256 git dirs (one of them nested) allowed, 257 refused.
+rm -rf "${LM}/.git/modules"
+for i in $(seq 1 255); do _fake_mod "${LM}/.git/modules/m${i}"; done
+_fake_mod "${LM}/.git/modules/m1/modules/x"
+out="$(_protect "${LM}")"
+assert_contains "${out}" "rc=0" "256 module git dirs: allowed"
+assert_contains "${out}" "$(_lflag --bind "${LM}/.git/modules/m255")" "256 module git dirs: last one pinned"
+assert_contains "${out}" "$(_lflag --bind "${LM}/.git/modules/m1/modules/x")" "256 module git dirs: nested one pinned"
+_fake_mod "${LM}/.git/modules/m1/modules/y"
+out="$(_protect "${LM}")"
+assert_contains "${out}" "rc=1" "257 module git dirs: refused"
+assert_contains "${out}" "more than 256 submodule git dirs" "... naming the count limit"
+assert_not_contains "${out}" "--bind" "... before any bind"
+rm -rf "${LM}"
 
 echo "-- linked worktree pointer (.git file)"
 M="${R}/main"
@@ -317,13 +510,36 @@ rm -rf "${V}/.git/hooks"; ln -s "${R}/target-dir" "${V}/.git/hooks"
 mkdir -p "${FAKE_HOME}/.gemini/antigravity-cli"
 python3 -I -c 'import json,sys;print(json.dumps({"toolPermission":"always-proceed","artifactReviewPolicy":"always-proceed","allowNonWorkspaceAccess":True,"enableTerminalSandbox":False,"trustedWorkspaces":sys.argv[1:]}))' \
     "${V}" >"${FAKE_HOME}/.gemini/antigravity-cli/settings.json"
+# Nested submodule metadata (#12): a symlinked namespace parent two levels
+# down, in WORKDIR's own .git and in a linked worktree's shared common dir.
+VN="${R}/refuse-nested"
+rm -rf "${VN}"; cp -R "${NS}" "${VN}"
+mv "${VN}/.git/modules/ns/inner" "${R}/refuse-inner.saved"
+ln -s "${R}/refuse-inner.saved" "${VN}/.git/modules/ns/inner"
+VW="${R}/refuse-wt"
+git_q -C "${VN}" worktree add "${VW}" -b refuse-wt
+python3 -I -c 'import json,sys;print(json.dumps({"toolPermission":"always-proceed","artifactReviewPolicy":"always-proceed","allowNonWorkspaceAccess":True,"enableTerminalSandbox":False,"trustedWorkspaces":sys.argv[1:]}))' \
+    "${V}" "${VN}" "${VW}" >"${FAKE_HOME}/.gemini/antigravity-cli/settings.json"
+canary_before="$(ls -A "${R}/refuse-inner.saved")"
 for client in claude codex agy copilot cursor_agent; do
     out="$(cd "${V}" && bash "${REPO_ROOT}/bin/executable_${client}_wrapper.bash" x </dev/null 2>&1)"; rc=$?
     assert_eq "${rc}" "1" "${client}: symlinked hooks/ exits 1"
     assert_contains "${out}" "is a symlink" "${client}: ... with the refusal ERROR"
     assert_not_contains "${out}" "LIVE_CLIENT_TRAP" "${client}: ... before the client runs"
+    out="$(cd "${VN}" && bash "${REPO_ROOT}/bin/executable_${client}_wrapper.bash" x </dev/null 2>&1)"; rc=$?
+    assert_eq "${rc}" "1" "${client}: symlinked nested submodule namespace exits 1"
+    assert_contains "${out}" "is a symlink" "${client}: ... with the refusal ERROR"
+    assert_not_contains "${out}" "LIVE_CLIENT_TRAP" "${client}: ... before the client runs"
+    # cursor-agent never binds a worktree's common dir (nothing to refuse).
+    [[ "${client}" == "cursor_agent" ]] && continue
+    out="$(cd "${VW}" && bash "${REPO_ROOT}/bin/executable_${client}_wrapper.bash" x </dev/null 2>&1)"; rc=$?
+    assert_eq "${rc}" "1" "${client}: symlinked submodule namespace in a worktree's common dir exits 1"
+    assert_contains "${out}" "is a symlink" "${client}: ... with the refusal ERROR"
+    assert_not_contains "${out}" "LIVE_CLIENT_TRAP" "${client}: ... before the client runs"
 done
-rm -rf "${V}"
+assert_eq "$(ls -A "${R}/refuse-inner.saved")" "${canary_before}" "nested refusals: symlink target untouched"
+git_q -C "${VN}" worktree remove --force "${VW}"
+rm -rf "${V}" "${VN}" "${VW}" "${R}/refuse-inner.saved"
 
 # ---------------------------------------------------------------------------
 echo "-- native enforcement (codex wrapper)"
@@ -427,6 +643,43 @@ _assert_normal_persisted() {
     assert_eq "$(git -C "${E}" symbolic-ref --short HEAD)" "main" "${label}: checkout returned to main"
     assert_eq "$(git -C "${E}" status --porcelain)" "" "${label}: index and work tree consistent on the host"
     assert_eq "$(git -C "${E}/remote.git" log --format=%s -1 main 2>&1)" "sandboxed-${tag}" "${label}: push reached the remote"
+}
+
+# Probes for the nested-submodule fixture (_new_nested_super), run from
+# its work tree. TAG makes the submodule commits fresh. Temp files stay in
+# the directory they replace (a cross-mount rename would fail with EXDEV
+# for the wrong reason); every move probe moves the directory back.
+_nested_probes() {
+    local tag="${1}"
+    printf '%s\n' \
+        "(cd plain && g commit --allow-empty -m sub-${tag}) && echo SUB_COMMIT_OK" \
+        "(cd ns/inner/mid/deep/leaf && g commit --allow-empty -m leaf-${tag}) && echo LEAF_COMMIT_OK"
+    cat <<'PROBES'
+M=.git/modules
+L=${M}/ns/inner/mid/modules/deep/leaf
+mvback() { ren "$1" "$2"; rc=$?; [ "${rc}" = 0 ] && ren "$2" "$1"; return "${rc}"; }
+export -f mvback
+probe leaf-config-append sh -c "echo evil >>${L}/config"
+probe mid-config-replace bash -c "cp ${M}/ns/inner/mid/config ${M}/ns/inner/mid/cfg.tmp && echo '[core] fsmonitor = ./x' >>${M}/ns/inner/mid/cfg.tmp && ren ${M}/ns/inner/mid/cfg.tmp ${M}/ns/inner/mid/config"
+probe leaf-hook-create sh -c "echo evil >${L}/hooks/post-commit"
+probe modules-move bash -c "mvback ${M} .git/modules.moved"
+probe namespace-move bash -c "mvback ${M}/ns ${M}/ns.moved"
+probe namespace-swap bash -c "ren ${M}/ns/inner ${M}/ns/inner.old && mkdir -p ${M}/ns/inner/mid"
+probe nested-modules-move bash -c "mvback ${M}/ns/inner/mid/modules ${M}/ns/inner/mid/modules.moved"
+probe deep-namespace-move bash -c "mvback ${M}/ns/inner/mid/modules/deep ${M}/ns/inner/mid/modules/deep.moved"
+probe leaf-move bash -c "mvback ${L} ${L}.moved"
+probe module-root-move bash -c "mvback ${M}/plain ${M}/plain.moved"
+probe scratch-move bash -c "mkdir ${M}/scratch && mvback ${M}/scratch ${M}/scratch.moved && rmdir ${M}/scratch"
+rm -f ${M}/ns/inner/mid/cfg.tmp
+PROBES
+}
+_nested_moves="modules-move namespace-move namespace-swap nested-modules-move deep-namespace-move leaf-move module-root-move"
+# The nested fixture's config bytes and hook dirs.
+_nested_sums() {
+    local top="${1}" g
+    for g in plain ns/inner/mid ns/inner/mid/modules/deep/leaf; do
+        _sums "${top}/.git/modules/${g}/config" "${top}/.git/modules/${g}/hooks"
+    done
 }
 
 if [[ "${sandbox_e2e}" == "1" ]]; then
@@ -617,6 +870,76 @@ probe hook-create sh -c "echo evil >hooks/post-receive"
     assert_eq "$(_sums "${EB}/config" "${EB}/hooks")" "${before}" "e2e bare: config and hooks/ unchanged on the host"
     ok=0; git -C "${EB}" rev-parse -q --verify bare-side >/dev/null && ok=1
     assert_eq "${ok}" "1" "e2e bare: branch persisted on the host"
+
+    echo "-- e2e: nested submodules, protected (#12)"
+    EN="${R}/e2e-nested"
+    _new_nested_super "${EN}"
+    ENM="${EN}/.git/modules"
+    rm -rf "${ENM}/plain/hooks"
+    nested_required="${ENM}/ns/inner/mid/modules/deep/leaf/config ${ENM}/ns/inner/mid/modules/deep/leaf/hooks ${ENM}/ns/inner/mid/config ${ENM}/plain/HEAD ${EN}/plain/.git ${EN}/ns/inner/mid/deep/leaf/.git"
+    before="$(_nested_sums "${EN}" 2>&1)"
+    _write_probe "${EN}/.git" "${nested_required}" '
+[[ -e .git/modules/plain/hooks ]] && echo PLAIN_HOOKS_PRESENT_AT_START || echo PLAIN_HOOKS_ABSENT_AT_START
+'"$(_nested_probes protected)"'
+probe plain-hooks-create sh -c "mkdir .git/modules/plain/hooks && echo probe >.git/modules/plain/hooks/residual-probe"
+'
+    out="$(_launch "${EN}")"; rc=$?
+    _assert_ran "${out}" "${rc}" "e2e nested protected"
+    assert_contains "${out}" "SUB_COMMIT_OK" "e2e nested protected: submodule commit works"
+    assert_contains "${out}" "LEAF_COMMIT_OK" "e2e nested protected: nested submodule commit works"
+    assert_eq "$(git -C "${EN}/plain" log --format=%s -1)" "sub-protected" "e2e nested protected: submodule commit persisted on the host"
+    assert_eq "$(git -C "${EN}/ns/inner/mid/deep/leaf" log --format=%s -1)" "leaf-protected" "e2e nested protected: nested submodule commit persisted on the host"
+    for p in leaf-config-append mid-config-replace leaf-hook-create ${_nested_moves}; do
+        assert_contains "${out}" "DENIED:${p}" "e2e nested protected: ${p} denied"
+    done
+    assert_contains "${out}" "WROTE:scratch-move" "e2e nested protected: new dirs below modules/ still movable (positive control)"
+    assert_contains "${out}" "PLAIN_HOOKS_ABSENT_AT_START" "e2e nested protected: wrapper did not create the absent submodule hooks/"
+    assert_contains "${out}" "${ENM}/plain/hooks/" "e2e nested protected: absent submodule hooks/ WARNed"
+    assert_contains "${out}" "WROTE:plain-hooks-create" "e2e nested protected: absent submodule hooks/ stays creatable (documented residual)"
+    rm -rf "${ENM}/plain/hooks"
+    assert_eq "$(_nested_sums "${EN}" 2>&1)" "${before}" "e2e nested protected: submodule config bytes and hooks/ unchanged on the host"
+    ok=0; [[ -d "${ENM}/ns/inner/mid/modules/deep/leaf" && ! -e "${ENM}/ns.moved" && ! -e "${ENM}/ns/inner.old" && ! -e "${EN}/.git/modules.moved" ]] && ok=1
+    assert_eq "${ok}" "1" "e2e nested protected: module tree still in place on the host"
+    mkdir "${ENM}/plain/hooks"
+
+    echo "-- e2e: nested submodules, AI_SANDBOX_ALLOW_GIT_CONFIG=1"
+    saved="${R}/e2e-nested-saved"; rm -rf "${saved}"; mkdir -p "${saved}"
+    cp "${ENM}/ns/inner/mid/config" "${saved}/mid"; cp "${ENM}/ns/inner/mid/modules/deep/leaf/config" "${saved}/leaf"
+    _write_probe "${EN}/.git" "${nested_required}" "$(_nested_probes relaxed)"
+    out="$(_launch "${EN}" AI_SANDBOX_ALLOW_GIT_CONFIG=1)"; rc=$?
+    _assert_ran "${out}" "${rc}" "e2e nested relaxed"
+    assert_contains "${out}" "LEAF_COMMIT_OK" "e2e nested relaxed: nested submodule commit works"
+    assert_eq "$(git -C "${EN}/ns/inner/mid/deep/leaf" log --format=%s -1)" "leaf-relaxed" "e2e nested relaxed: nested commit persisted on the host"
+    for p in leaf-config-append mid-config-replace leaf-hook-create; do
+        assert_contains "${out}" "WROTE:${p}" "e2e nested relaxed: ${p} allowed (positive control)"
+    done
+    for p in ${_nested_moves}; do
+        assert_contains "${out}" "DENIED:${p}" "e2e nested relaxed: ${p} denied (chain integrity)"
+    done
+    ok=0; grep -q evil "${ENM}/ns/inner/mid/modules/deep/leaf/config" && ok=1
+    assert_eq "${ok}" "1" "e2e nested relaxed: nested config edit persisted on the host"
+    cp "${saved}/mid" "${ENM}/ns/inner/mid/config"; cp "${saved}/leaf" "${ENM}/ns/inner/mid/modules/deep/leaf/config"
+    rm -rf "${saved}" "${ENM}/ns/inner/mid/modules/deep/leaf/hooks/post-commit"
+
+    echo "-- e2e: nested submodules through a symlinked WORKDIR and a resolved-path RW alias"
+    ENL="${FAKE_HOME}/repos-link/e2e-nested"
+    enl_expect="${ENL}/.git"; [[ "${OS}" == "Darwin" ]] && enl_expect="${EN}/.git"
+    before="$(_nested_sums "${EN}" 2>&1)"
+    alias_probe="probe resolved-alias-leaf-config sh -c \"echo evil >>${ENM}/ns/inner/mid/modules/deep/leaf/config\""
+    alias_probe+="${NL}probe resolved-alias-namespace-move bash -c \"mvback ${ENM}/ns ${ENM}/ns.moved\""
+    [[ "${OS}" == "Darwin" ]] && alias_probe=""
+    _write_probe "${enl_expect}" ".git/modules/ns/inner/mid/modules/deep/leaf/config" "$(_nested_probes alias)${NL}${alias_probe}"
+    out="$(_launch "${ENL}" AI_SANDBOX_EXTRA_RW_DIRS="${R}")"; rc=$?
+    _assert_ran "${out}" "${rc}" "e2e nested symlinked cwd"
+    for p in leaf-config-append mid-config-replace leaf-hook-create ${_nested_moves}; do
+        assert_contains "${out}" "DENIED:${p}" "e2e nested symlinked cwd: ${p} denied"
+    done
+    if [[ -n "${alias_probe}" ]]; then
+        assert_contains "${out}" "DENIED:resolved-alias-leaf-config" "e2e nested symlinked cwd: resolved-path alias config write denied"
+        assert_contains "${out}" "DENIED:resolved-alias-namespace-move" "e2e nested symlinked cwd: resolved-path alias namespace move denied"
+    fi
+    assert_contains "${out}" "LEAF_COMMIT_OK" "e2e nested symlinked cwd: nested submodule commit works"
+    assert_eq "$(_nested_sums "${EN}" 2>&1)" "${before}" "e2e nested symlinked cwd: submodule config bytes and hooks/ unchanged on the host"
 
     echo "-- e2e: non-repo scaffolding"
     ES="${R}/e2e-scaffold"

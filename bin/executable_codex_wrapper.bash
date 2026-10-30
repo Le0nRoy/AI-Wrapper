@@ -40,7 +40,7 @@ check_agent_binary
 WRAPPER_FLAGS=()
 
 # Shared .git of a `git worktree` checkout (see ai_wrapper_lib.bash).
-_wrapper_bind_git_common_dir
+_wrapper_bind_git_common_dir || exit 1
 
 # Codex CLI flags - full autonomy within sandbox (no approvals needed)
 AGENT_FLAGS=(
