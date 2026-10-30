@@ -487,10 +487,13 @@ denied except below an RW `--bind` nested strictly inside it (so
 `commondir`/`gitdir` are RO again). An equal or broader RW grant —
 WORKDIR, `AI_SANDBOX_EXTRA_RW_DIRS`, a duplicate `--bind` — never
 reopens an RO path. Because Seatbelt matches paths rather than inodes,
-every ancestor directory of an RO path (and the root of each nested RW
-exception) is also write-denied as a literal: renaming a writable
-parent away, editing the file under its new name and renaming it back
-fails. `file-link` blocks hard-linking a protected file into a writable
+every ancestor directory of an RO path below `$HOME` (and the root of
+each nested RW exception) is also write-denied as a literal: renaming a
+writable parent away, editing the file under its new name and renaming
+it back fails. `$HOME` and its ancestors have no write grant, so they
+are not pinned; they get stat-only (`file-read-metadata`) grants instead
+so git/realpath can walk a `$HOME` that is not directly under `/Users`.
+`file-link` blocks hard-linking a protected file into a writable
 directory. The same rules apply to `AI_SANDBOX_EXTRA_RO_DIRS`, the
 glab config bind and `_extra_sandbox_setup` entries. Native coverage:
 `tests/test_bind_hardening.bash` (worktree e2e through the codex
