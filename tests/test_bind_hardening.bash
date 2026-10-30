@@ -73,11 +73,11 @@ if command -v git >/dev/null 2>&1; then
     assert_contains "${out}" "--bind${NL}${FAKE_HOME}/repos/main/.git" "legit worktree: shared .git bound"
     assert_not_contains "${out}" "WARN" "legit worktree: no WARN"
     mg="${FAKE_HOME}/repos/main/.git"
+    for ro in config hooks worktrees worktrees/wt/commondir worktrees/wt/gitdir; do
+        assert_contains "${out}" "--ro-bind${NL}${mg}/${ro}${NL}" "legit worktree: ${ro} over-mounted read-only"
+    done
+    assert_contains "${out}" "--bind${NL}${mg}/worktrees/wt${NL}" "legit worktree: own worktree entry RW"
     if [[ "${OS}" == "Linux" ]]; then
-        for ro in config hooks worktrees worktrees/wt/commondir worktrees/wt/gitdir; do
-            assert_contains "${out}" "--ro-bind${NL}${mg}/${ro}${NL}" "legit worktree: ${ro} over-mounted read-only"
-        done
-        assert_contains "${out}" "--bind${NL}${mg}/worktrees/wt${NL}" "legit worktree: own worktree entry RW"
         # Order matters for bwrap (later mount wins): RW common first,
         # RO worktrees/ before the RW own entry, RO links last.
         order="$(printf '%s\n' "${out}" | grep -n -x -e "${mg}" -e "${mg}/worktrees" -e "${mg}/worktrees/wt" -e "${mg}/worktrees/wt/gitdir" | awk -F: 'NR%2==1{print $2}' | tr '\n' ' ')"
@@ -116,19 +116,15 @@ if command -v git >/dev/null 2>&1; then
     out="$(_gitbind "${FAKE_HOME}/repos/wt")"
     cw_made=0; [[ -f "${mg}/worktrees/wt/config.worktree" ]] && cw_made=1
     assert_eq "${cw_made}" "1" "worktreeConfig: config.worktree pre-created"
-    if [[ "${OS}" == "Linux" ]]; then
-        assert_contains "${out}" "--ro-bind${NL}${mg}/worktrees/wt/config.worktree" "worktreeConfig: config.worktree RO"
-    fi
+    assert_contains "${out}" "--ro-bind${NL}${mg}/worktrees/wt/config.worktree" "worktreeConfig: config.worktree RO"
     git -C "${FAKE_HOME}/repos/main" config --unset extensions.worktreeConfig
     rm -f "${mg}/worktrees/wt/config.worktree"
 
     # Submodule git dirs: hooks/ and config RO.
     mkdir -p "${mg}/modules/sub1"; : >"${mg}/modules/sub1/config"
     out="$(_gitbind "${FAKE_HOME}/repos/wt")"
-    if [[ "${OS}" == "Linux" ]]; then
-        assert_contains "${out}" "--ro-bind${NL}${mg}/modules/sub1/hooks" "submodule hooks/ RO"
-        assert_contains "${out}" "--ro-bind${NL}${mg}/modules/sub1/config" "submodule config RO"
-    fi
+    assert_contains "${out}" "--ro-bind${NL}${mg}/modules/sub1/hooks" "submodule hooks/ RO"
+    assert_contains "${out}" "--ro-bind${NL}${mg}/modules/sub1/config" "submodule config RO"
     rm -rf "${mg}/modules"
 
     # Crafted commondir -> ~/.ssh (made git-dir shaped so git accepts it).
@@ -190,11 +186,9 @@ if command -v git >/dev/null 2>&1; then
     out="$(_gitbind "${nested_wt}")"
     assert_contains "${out}" "--bind${NL}${nested_common}${NL}" "nested submodule worktree: parent .git/modules metadata bound"
     assert_not_contains "${out}" "WARN" "nested submodule worktree: validated links accepted"
-    if [[ "${OS}" == "Linux" ]]; then
-        assert_contains "${out}" "--ro-bind${NL}${nested_common}/config${NL}" "nested submodule worktree: common config stays read-only"
-        assert_contains "${out}" "--ro-bind${NL}${nested_common}/hooks${NL}" "nested submodule worktree: common hooks stay read-only"
-        assert_contains "${out}" "--bind${NL}${nested_entry}${NL}" "nested submodule worktree: own worktree entry stays writable"
-    fi
+    assert_contains "${out}" "--ro-bind${NL}${nested_common}/config${NL}" "nested submodule worktree: common config stays read-only"
+    assert_contains "${out}" "--ro-bind${NL}${nested_common}/hooks${NL}" "nested submodule worktree: common hooks stay read-only"
+    assert_contains "${out}" "--bind${NL}${nested_entry}${NL}" "nested submodule worktree: own worktree entry stays writable"
 
     # Crafted commondir via a symlink inside WORKDIR -> ~/.ssh: the
     # resolved target is what's checked (and would be bound).
@@ -238,38 +232,172 @@ if command -v git >/dev/null 2>&1; then
     out="$(_ok "${FAKE_HOME}/repos/realparent/.git/modules/m")"
     assert_contains "${out}" "basename 'm'" "submodule: modules/<name> outside ~/.local/share rejected"
 
-    # End-to-end on Linux: a legit worktree can commit / branch / checkout
-    # inside the sandbox, but cannot write hooks/, config, another
-    # worktree's entry, or its own commondir link.
-    if [[ "${OS}" == "Linux" ]] && command -v bwrap >/dev/null 2>&1; then
-        git_q -C "${FAKE_HOME}/repos/main" worktree add "${FAKE_HOME}/repos/wt2" -b wt2
-        mkdir -p "${FAKE_HOME}/bin"
-        cat >"${FAKE_HOME}/bin/codex" <<'STUB'
-#!/bin/bash
-m="$(git rev-parse --git-common-dir)"
+    # End-to-end through the codex wrapper (bwrap on Linux, native
+    # sandbox-exec on macOS): a legit worktree can commit / branch /
+    # checkout inside the sandbox, but every way of changing hooks/,
+    # config, another worktree's entry or its own link files fails and the
+    # protected bytes are unchanged on the host. On macOS a missing
+    # sandbox-exec is a failure, not a skip: this block is the native
+    # certification of the Seatbelt write-deny rules.
+    # Probe client for the e2e block below, written to DEST. ALIAS_COMMON
+    # is an optional alias path of the common dir. Before any write the stub
+    # proves it found the fixture: git discovery must succeed and name
+    # exactly the expected common dir and own entry, every probe target must
+    # exist and the entry's links must point back. Otherwise it prints
+    # SETUP_FAILED and exits 3, so an empty or wrong path can never turn
+    # into a DENIED (or rm -f into a WROTE) on an unrelated path.
+    _write_probe_stub() {
+        local dest="${1}" alias_common="${2}"
+        {
+            printf '#!/bin/bash\nalias_common=%q\nexpect_m=%q\nexpect_w=%q\nexpect_wt_git=%q\n' \
+                "${alias_common}" "${mg}" "${mg}/worktrees/wt" "${FAKE_HOME}/repos/wt/.git"
+            cat <<'STUB'
+setup_failed() { echo "SETUP_FAILED: $*"; exit 3; }
+m="$(git rev-parse --git-common-dir 2>&1)" || setup_failed "git rev-parse --git-common-dir: ${m}"
+w="$(git rev-parse --absolute-git-dir 2>&1)" || setup_failed "git rev-parse --absolute-git-dir: ${w}"
+[[ -n "${m}" && -n "${w}" ]] || setup_failed "empty git dirs (common='${m}' own='${w}')"
+m="$(cd "${m}" 2>&1 && pwd -P)" || setup_failed "cannot enter common dir: ${m}"
+[[ "${m}" == "${expect_m}" && "${w}" == "${expect_w}" ]] \
+    || setup_failed "discovered common='${m}' own='${w}', expected '${expect_m}' '${expect_w}'"
+for p in config hooks/pre-commit.sample modules/sub1/hooks modules/sub1/config objects refs logs/HEAD \
+        worktrees/wt2/commondir worktrees/wt2/HEAD; do
+    [[ -e "${m}/${p}" ]] || setup_failed "missing ${m}/${p}"
+done
+[[ "$(cat "${w}/gitdir" 2>&1)" == "${expect_wt_git}" ]] || setup_failed "${w}/gitdir does not point back to ${expect_wt_git}"
+[[ "$(cd "${w}/$(cat "${w}/commondir")" 2>&1 && pwd -P)" == "${m}" ]] || setup_failed "${w}/commondir does not resolve to ${m}"
+echo DISCOVERY_OK
 g() { git -c user.name=t -c user.email=t@t "$@" >/dev/null 2>&1; }
 echo x >file && g add file && g commit -m sandboxed && echo COMMIT_OK
 g branch side && echo BRANCH_OK
 g checkout -b feature && g checkout wt && echo CHECKOUT_OK
-for f in "${m}/hooks/post-commit" "${m}/config" "${m}/worktrees/wt2/commondir" "${m}/worktrees/wt/commondir" "${m}/worktrees/newentry"; do
-    if (echo evil >>"${f}" || mkdir "${f}") 2>/dev/null; then echo "WROTE:${f##*/.git/}"; else echo "DENIED:${f##*/.git/}"; fi
-done
+# rename(2) without mv's cross-device copy+delete fallback, which under
+# bwrap would delete files from the (writable) source instead of failing.
+ren() { perl -e 'rename($ARGV[0], $ARGV[1]) or exit 1' "$@"; }
+export -f ren
+probe() { local name="${1}"; shift; if ("$@") >/dev/null 2>&1; then echo "WROTE:${name}"; else echo "DENIED:${name}"; fi; }
+probe append-config sh -c 'echo evil >>"$1"' _ "${m}/config"
+probe truncate-config sh -c ': >"$1"' _ "${m}/config"
+probe replace-config bash -c 'echo evil >cfg.tmp && ren cfg.tmp "$1"' _ "${m}/config"
+probe unlink-config sh -c 'rm -f "$1" && [ ! -e "$1" ]' _ "${m}/config"
+probe symlink-config sh -c 'ln -sf "$1" cfg-link && echo evil >>cfg-link' _ "${m}/config"
+probe hardlink-config sh -c 'ln -f "$1" cfg-hard && echo evil >>cfg-hard' _ "${m}/config"
+[[ -n "${alias_common}" ]] && probe alias-config sh -c 'echo evil >>"$1"' _ "${alias_common}/config"
+probe hook-create sh -c 'echo evil >"$1"' _ "${m}/hooks/post-commit"
+probe hook-mkdir mkdir "${m}/hooks/sub"
+probe hook-chmod chmod +x "${m}/hooks/pre-commit.sample"
+probe hooks-rename ren "${m}/hooks" "${m}/hooks.old"
+probe hooks-recreate sh -c 'rm -rf "$1" && mkdir "$1" && echo evil >"$1/post-commit"' _ "${m}/hooks"
+probe submodule-hook-dance bash -c 'ren "$1/modules/sub1" "$1/objects/sub1-moved"; echo evil >"$1/objects/sub1-moved/hooks/post-commit"; rc=$?; ren "$1/objects/sub1-moved" "$1/modules/sub1"; exit "${rc}"' _ "${m}"
+probe wt2-commondir sh -c 'echo evil >>"$1"' _ "${m}/worktrees/wt2/commondir"
+probe wt2-head sh -c 'echo evil >"$1"' _ "${m}/worktrees/wt2/HEAD"
+probe worktrees-newentry mkdir "${m}/worktrees/newentry"
+probe own-commondir sh -c 'echo evil >>"$1"' _ "${w}/commondir"
+probe own-gitdir sh -c 'echo evil >>"$1"' _ "${w}/gitdir"
+probe own-entry-dance bash -c 'ren "$1" "$2/objects/wt-moved" && echo evil >>"$2/objects/wt-moved/commondir"; rc=$?; ren "$2/objects/wt-moved" "$1"; exit "${rc}"' _ "${w}" "${m}"
+probe objects-touch sh -c 'touch "$1/objects/probe" && rm -f "$1/objects/probe"' _ "${m}"
+probe refs-touch sh -c 'mkdir -p "$1/refs/probe" && rmdir "$1/refs/probe"' _ "${m}"
+probe logs-touch touch "${m}/logs/HEAD"
+probe own-entry-file sh -c 'touch "$1/probe" && rm -f "$1/probe"' _ "${w}"
+echo PROBES_DONE
 STUB
-        chmod +x "${FAKE_HOME}/bin/codex"
+        } >"${dest}"
+        chmod +x "${dest}"
+    }
+
+    # Negative controls (any OS, unconfined): the same stub where discovery
+    # fails or finds a different repo must stop before any probe or write.
+    _write_probe_stub "${OUTSIDE}/probe-stub" ""
+    nogit_dir="$(mktemp -d)"
+    out="$(cd "${nogit_dir}" && GIT_CEILING_DIRECTORIES="${nogit_dir%/*}" bash "${OUTSIDE}/probe-stub" 2>&1)"; rc=$?
+    rmdir "${nogit_dir}"
+    assert_eq "${rc}" "3" "probe stub: failed git discovery exits 3"
+    assert_contains "${out}" "SETUP_FAILED: git rev-parse" "probe stub: failed git discovery reported"
+    assert_not_contains "${out}" "WROTE:" "probe stub: failed discovery runs no probe (WROTE)"
+    assert_not_contains "${out}" "DENIED:" "probe stub: failed discovery runs no probe (DENIED)"
+    private_cfg="$(cksum <"${FAKE_HOME}/repos/private/.git/config")"
+    out="$(cd "${FAKE_HOME}/repos/private" && bash "${OUTSIDE}/probe-stub" 2>&1)"; rc=$?
+    assert_eq "${rc}" "3" "probe stub: discovery of another repo exits 3"
+    assert_contains "${out}" "SETUP_FAILED: discovered" "probe stub: wrong repo reported with the paths found"
+    assert_not_contains "${out}" "DENIED:" "probe stub: wrong repo runs no probe"
+    assert_not_contains "${out}" "COMMIT_OK" "probe stub: wrong repo runs no git write"
+    assert_eq "$(cksum <"${FAKE_HOME}/repos/private/.git/config")" "${private_cfg}" "probe stub: wrong repo config untouched"
+    rm -f "${OUTSIDE}/probe-stub"
+
+    sandbox_e2e=0
+    if [[ "${OS}" == "Linux" ]] && command -v bwrap >/dev/null 2>&1; then
+        sandbox_e2e=1
+    elif [[ "${OS}" == "Darwin" ]]; then
+        if command -v sandbox-exec >/dev/null 2>&1; then
+            sandbox_e2e=1
+        else
+            _test_report 0 "e2e legit worktree: sandbox-exec available on macOS"
+        fi
+    fi
+    if [[ "${sandbox_e2e}" == "1" ]]; then
+        git_q -C "${FAKE_HOME}/repos/main" worktree add "${FAKE_HOME}/repos/wt2" -b wt2
+        # Every protected path exists before the snapshot, so wrapper
+        # setup (which creates a missing hooks/) cannot change it.
+        mkdir -p "${mg}/modules/sub1/hooks" "${FAKE_HOME}/bin"
+        : >"${mg}/modules/sub1/config"
+        [[ -e "${mg}/hooks/pre-commit.sample" ]] || : >"${mg}/hooks/pre-commit.sample"
+        # Host-side alias of the common dir through /tmp (itself a symlink
+        # to /private/tmp on macOS). /tmp is a private tmpfs under bwrap, so
+        # only the macOS run can follow it.
+        alias_dir=""
+        if [[ "${OS}" == "Darwin" ]]; then
+            alias_dir="$(mktemp -d /tmp/ai-wrapper-alias.XXXXXX)"
+            ln -s "${mg}" "${alias_dir}/common"
+        fi
+        _protected_sums() {
+            local f
+            for f in config worktrees/wt/commondir worktrees/wt/gitdir worktrees/wt2/commondir worktrees/wt2/HEAD; do
+                printf '%s ' "${f}"; cksum <"${mg}/${f}" 2>&1
+            done
+            ls -A "${mg}/hooks" "${mg}/modules/sub1/hooks" 2>&1
+        }
+        sums_before="$(_protected_sums)"
+        assert_not_contains "${sums_before}" "No such file" "e2e legit worktree: fixture has every protected path before the run"
+        _write_probe_stub "${FAKE_HOME}/bin/codex" "${alias_dir:+${alias_dir}/common}"
+        # macOS: ~/bin is not on the base read allowlist, so expose the stub
+        # through the RO extra-dir setting (it gets the same deny rules).
+        stub_ro_dirs=""
+        [[ "${OS}" == "Darwin" ]] && stub_ro_dirs="${FAKE_HOME}/bin"
         out="$(cd "${FAKE_HOME}/repos/wt" && PATH="${FAKE_HOME}/bin:${PATH}" \
+            AI_SANDBOX_EXTRA_RO_DIRS="${stub_ro_dirs}" \
             bash "${REPO_ROOT}/bin/executable_codex_wrapper.bash" x </dev/null 2>&1)"
+        rc=$?
+        echo "  (e2e legit worktree output: ${out})"
+        assert_eq "${rc}" "0" "e2e legit worktree: probe client exits 0"
+        assert_contains "${out}" "DISCOVERY_OK" "e2e legit worktree: probe found the fixture git dirs"
+        assert_not_contains "${out}" "SETUP_FAILED" "e2e legit worktree: no probe setup failure"
+        assert_contains "${out}" "PROBES_DONE" "e2e legit worktree: probe client ran to the end"
         for ok in COMMIT_OK BRANCH_OK CHECKOUT_OK; do
             assert_contains "${out}" "${ok}" "e2e legit worktree: ${ok}"
         done
-        for f in hooks/post-commit config worktrees/wt2/commondir worktrees/wt/commondir worktrees/newentry; do
-            assert_contains "${out}" "DENIED:${f}" "e2e legit worktree: write to ${f} denied"
+        for p in append-config truncate-config replace-config unlink-config symlink-config hardlink-config \
+                hook-create hook-mkdir hook-chmod hooks-rename hooks-recreate submodule-hook-dance \
+                wt2-commondir wt2-head worktrees-newentry own-commondir own-gitdir own-entry-dance; do
+            assert_contains "${out}" "DENIED:${p}" "e2e legit worktree: ${p} denied"
         done
+        if [[ -n "${alias_dir}" ]]; then
+            assert_contains "${out}" "DENIED:alias-config" "e2e legit worktree: write through a /tmp alias of the common dir denied"
+        fi
+        for p in objects-touch refs-touch logs-touch own-entry-file; do
+            assert_contains "${out}" "WROTE:${p}" "e2e legit worktree: ${p} still writable"
+        done
+        assert_eq "$(_protected_sums)" "${sums_before}" "e2e legit worktree: protected bytes and hook dirs unchanged on the host"
         log="$(git -C "${FAKE_HOME}/repos/main" log --format=%s -1 wt)"
         assert_eq "${log}" "sandboxed" "e2e legit worktree: commit landed in the shared repo"
-        hooks_planted=0; [[ -e "${mg}/hooks/post-commit" ]] && hooks_planted=1
+        side_ok=0; git -C "${FAKE_HOME}/repos/main" rev-parse --verify -q side >/dev/null && side_ok=1
+        assert_eq "${side_ok}" "1" "e2e legit worktree: branch landed in the shared repo"
+        hooks_planted=0
+        [[ -e "${mg}/hooks/post-commit" || -e "${mg}/modules/sub1/hooks/post-commit" ]] && hooks_planted=1
         assert_eq "${hooks_planted}" "0" "e2e legit worktree: no hook planted on the host"
+        entry_in_place=0; [[ -f "${mg}/worktrees/wt/commondir" && -d "${mg}/modules/sub1/hooks" ]] && entry_in_place=1
+        assert_eq "${entry_in_place}" "1" "e2e legit worktree: worktree entry and submodule dir still in place"
+        [[ -n "${alias_dir}" ]] && rm -rf "${alias_dir}"
+        rm -rf "${mg}/modules" "${mg}/objects/wt-moved" "${mg}/objects/sub1-moved"
     fi
-
     # End-to-end on Linux: the crafted repo launches (no abort) and the
     # agent cannot write into ~/.ssh.
     if [[ "${OS}" == "Linux" ]] && command -v bwrap >/dev/null 2>&1; then

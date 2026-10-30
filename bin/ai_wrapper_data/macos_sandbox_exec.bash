@@ -309,6 +309,21 @@ _run_sandboxed_agent_impl() {
         unset _wd_parent
     fi
 
+    # The walks above stop at HOME, and the base profile only grants
+    # /Users and HOME itself, so HOME's own ancestors are stat-able only
+    # when HOME is /Users/<name>. A HOME one level deeper (a test fake HOME,
+    # /Volumes/<disk>/Users/<name>) made realpath()/git fail with
+    # "Invalid path '<HOME parent>': Operation not permitted". Grant
+    # metadata on each HOME ancestor too.
+    if [[ -n "${resolved_home}" ]]; then
+        local _home_parent="${resolved_home%/*}"
+        while [[ -n "${_home_parent}" ]]; do
+            binds_meta+=("${_home_parent}")
+            _home_parent="${_home_parent%/*}"
+        done
+        unset _home_parent
+    fi
+
     # Same ancestor-metadata rationale as the WORKDIR walk above, applied
     # to every per-call --bind / --ro-bind entry too. Without this the
     # kernel's namei walk denies stat on intermediate dirs between HOME
@@ -641,9 +656,10 @@ _run_sandboxed_agent_impl() {
     # vs directories (e.g. Library/Caches/claude-cli-nodejs) and avoids
     # ambiguity around whether `subpath` on a regular file is intended to match.
     #
-    # --ro-bind: now allowlists the path under file-read* (was no-op before the
-    # S1 default-deny rewrite). Per-call binds compose with the static read
-    # allowlist in claude_wrapper.sb.
+    # --ro-bind: allowlists the path under file-read* and denies writes to it
+    # (_append_ro_deny_rules), so an RO bind nested under an RW --bind or
+    # WORKDIR is actually read-only. Per-call binds compose with the static
+    # read allowlist in claude_wrapper.sb.
     local profile; profile="$(<"${profile_path}")"
 
     # WS3 / U-C: sanity-check the loaded profile body. An AI_SANDBOX_PROFILE
@@ -716,6 +732,13 @@ _run_sandboxed_agent_impl() {
         # the kernel's path canonicalization on intermediate dirs (e.g. for
         # git worktree's gitdir-line validation) without exposing siblings.
         extra_rules="$(_append_bind_rules "${tag}" "file-read-metadata" "--meta-bind" "${binds_meta[@]}" --force-literal)" || return 1
+        profile+="${extra_rules}"
+    fi
+    # --ro-bind write denial, rendered last so it overrides every allow
+    # above (base profile, WORKDIR, --bind). See _append_ro_deny_rules for
+    # the nesting rule that replaces bwrap's mount-order semantics.
+    if [[ ${#binds_ro[@]} -gt 0 ]]; then
+        extra_rules="$(_append_ro_deny_rules "${tag}" "${resolved_home}" "${binds_ro[@]}" -- "${binds_rw[@]+"${binds_rw[@]}"}")" || return 1
         profile+="${extra_rules}"
     fi
 
@@ -931,18 +954,39 @@ _validate_sandbox_path() {
     return 0
 }
 
+# Resolve a bind path for SBPL interpolation and print it without a trailing
+# slash. Signature: _resolve_bind_target TAG FLAG_NAME PATH
+# The path is realpath-resolved (rules must name the canonical path the
+# kernel matches, e.g. /private/tmp not /tmp) and validated for SBPL safety;
+# bare "/" (or any path that collapses to empty after trailing-slash strip)
+# is rejected to avoid emitting a malformed `(subpath "")` rule.
+_resolve_bind_target() {
+    local tag="${1}" flag_name="${2}" p="${3}" resolved stripped
+    if ! resolved="$(_realpath "${p}")" || [[ -z "${resolved}" ]]; then
+        echo_log "ERROR" "[${tag}] Could not resolve ${flag_name} path: ${p}"
+        return 1
+    fi
+    if ! _validate_sandbox_path "${resolved}"; then
+        echo_log "ERROR" "[${tag}] ${flag_name} path is unsafe for SBPL interpolation: ${resolved}"
+        return 1
+    fi
+    stripped="${resolved%/}"
+    if [[ -z "${stripped}" ]]; then
+        echo_log "ERROR" "[${tag}] ${flag_name} path '${resolved}' is too broad to sandbox (would emit an empty subpath rule)."
+        return 1
+    fi
+    printf '%s' "${stripped}"
+}
+
 # Emit SBPL bind rules to stdout for a list of paths.
 # Signature: _append_bind_rules TAG RULE_PREFIX FLAG_NAME [PATH...]
 #   TAG          — log tag for error messages
 #   RULE_PREFIX  — SBPL rule head (e.g. "file*", "file-read*")
 #   FLAG_NAME    — CLI flag name for diagnostics (e.g. "--bind", "--ro-bind")
 #   PATH...      — zero or more paths to bind
-# Each path is realpath-resolved and validated for SBPL safety; bare "/" (or
-# any path that collapses to empty after trailing-slash strip) is rejected to
-# avoid emitting a malformed `(subpath "")` rule that would surprise the SBPL
-# parser. Directories use `(subpath ...)`, files use `(literal ...)`. Output
-# is concatenated by the caller; errors go to stderr and produce a non-zero
-# return.
+# Each path goes through _resolve_bind_target. Directories use
+# `(subpath ...)`, files use `(literal ...)`. Output is concatenated by the
+# caller; errors go to stderr and produce a non-zero return.
 _append_bind_rules() {
     local tag="${1}" rule_prefix="${2}" flag_name="${3}"
     shift 3
@@ -959,26 +1003,109 @@ _append_bind_rules() {
             paths+=("${arg}")
         fi
     done
-    local p resolved stripped
+    local p stripped
     for p in "${paths[@]}"; do
-        if ! resolved="$(_realpath "${p}")" || [[ -z "${resolved}" ]]; then
-            echo_log "ERROR" "[${tag}] Could not resolve ${flag_name} path: ${p}"
-            return 1
-        fi
-        if ! _validate_sandbox_path "${resolved}"; then
-            echo_log "ERROR" "[${tag}] ${flag_name} path is unsafe for SBPL interpolation: ${resolved}"
-            return 1
-        fi
-        stripped="${resolved%/}"
-        if [[ -z "${stripped}" ]]; then
-            echo_log "ERROR" "[${tag}] ${flag_name} path '${resolved}' is too broad to sandbox (would emit an empty subpath rule)."
-            return 1
-        fi
-        if [[ "${force_literal}" == "1" || ! -d "${resolved}" ]]; then
+        stripped="$(_resolve_bind_target "${tag}" "${flag_name}" "${p}")" || return 1
+        if [[ "${force_literal}" == "1" || ! -d "${stripped}" ]]; then
             printf '\n(allow %s (literal "%s"))' "${rule_prefix}" "${stripped}"
         else
             printf '\n(allow %s (subpath "%s"))' "${rule_prefix}" "${stripped}"
         fi
     done
+    return 0
+}
+
+# SBPL operations denied on --ro-bind targets. file-write* covers write,
+# truncate, create, unlink/rename, chmod/chown and xattrs; file-link stops a
+# protected file from being hard-linked into a writable directory and then
+# modified through the new name.
+_SBPL_RO_DENY_OPS="file-write* file-link"
+
+# Emit SBPL write-deny rules for --ro-bind paths to stdout.
+# Signature: _append_ro_deny_rules TAG HOME RO_PATH... -- RW_PATH...
+#   HOME        — resolved $HOME (may be empty); ancestor pins stop below it
+#   RO_PATH...  — every --ro-bind path (wrapper, AI_SANDBOX_EXTRA_RO_DIRS,
+#                 _extra_sandbox_setup)
+#   RW_PATH...  — every --bind path, used only to carve exceptions
+#
+# Seatbelt has no mounts, so bwrap's "later mount wins" cannot be copied
+# literally, and the parser keeps RW and RO binds in separate arrays. The
+# rules are order-independent instead: an RO path is write-denied except
+# below an RW bind nested strictly inside it ("most specific bind wins").
+# That reproduces the worktree layout (RW common dir -> RO worktrees/ -> RW
+# own entry -> RO commondir/gitdir) and means a broader or equal RW bind
+# (WORKDIR, AI_SANDBOX_EXTRA_RW_DIRS) never neutralises an RO overlay.
+# The rules are appended after every allow, and Seatbelt applies the last
+# matching rule.
+#
+# Every ancestor directory of an RO path (and the root of each nested RW
+# exception) is also write-denied as a literal. Seatbelt matches paths, so
+# renaming a writable parent away, editing the RO file under its new name
+# and renaming it back would bypass the subpath rule; bwrap mount points
+# cannot be moved like that. Literal denial blocks rename/rmdir/chmod of the
+# directory itself while leaving its other children writable. Pins stop
+# below $HOME: $HOME and its ancestors have no write grant in the profile,
+# so pinning them adds nothing.
+_append_ro_deny_rules() {
+    local tag="${1}" home="${2%/}"
+    shift 2
+    local -a ro_paths=() rw_paths=() pins=()
+    local resolved
+    while [[ $# -gt 0 && "${1}" != "--" ]]; do
+        resolved="$(_resolve_bind_target "${tag}" "--ro-bind" "${1}")" || return 1
+        ro_paths+=("${resolved}")
+        shift
+    done
+    [[ "${1:-}" == "--" ]] && shift
+    local p
+    for p in "$@"; do
+        [[ -z "${p}" ]] && continue
+        resolved="$(_resolve_bind_target "${tag}" "--bind" "${p}")" || return 1
+        rw_paths+=("${resolved}")
+    done
+
+    local ro rw exceptions ancestor pin seen
+    for ro in "${ro_paths[@]}"; do
+        if [[ -d "${ro}" ]]; then
+            exceptions=""
+            for rw in "${rw_paths[@]+"${rw_paths[@]}"}"; do
+                [[ "${rw}" == "${ro}"/* ]] || continue
+                if [[ -d "${rw}" ]]; then
+                    exceptions+=" (require-not (regex #\"^$(_regex_escape "${rw}")/\"))"
+                    pins+=("${rw}")
+                else
+                    exceptions+=" (require-not (literal \"${rw}\"))"
+                fi
+            done
+            if [[ -n "${exceptions}" ]]; then
+                printf '\n(deny %s (require-all (subpath "%s")%s))' "${_SBPL_RO_DENY_OPS}" "${ro}" "${exceptions}"
+            else
+                printf '\n(deny %s (subpath "%s"))' "${_SBPL_RO_DENY_OPS}" "${ro}"
+            fi
+        else
+            printf '\n(deny %s (literal "%s"))' "${_SBPL_RO_DENY_OPS}" "${ro}"
+        fi
+        ancestor="${ro%/*}"
+        while [[ -n "${ancestor}" && "${ancestor}" != "${home}" ]]; do
+            pins+=("${ancestor}")
+            ancestor="${ancestor%/*}"
+        done
+    done
+
+    # Linear de-duplication: bash 3.2 has no associative arrays.
+    local -a unique_pins=()
+    for pin in "${pins[@]+"${pins[@]}"}"; do
+        for seen in "${unique_pins[@]+"${unique_pins[@]}"}"; do
+            [[ "${seen}" == "${pin}" ]] && continue 2
+        done
+        unique_pins+=("${pin}")
+    done
+    if [[ ${#unique_pins[@]} -gt 0 ]]; then
+        printf '\n(deny file-write*'
+        for pin in "${unique_pins[@]}"; do
+            printf ' (literal "%s")' "${pin}"
+        done
+        printf ')'
+    fi
     return 0
 }

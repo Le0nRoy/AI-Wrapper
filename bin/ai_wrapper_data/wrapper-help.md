@@ -87,10 +87,12 @@ The sandbox bounds *writes* — it does not bound *reads* or *network*. Be aware
   session legitimately needs `docker` from inside the sandbox.
 <!-- os:darwin -->
 - `--ro-bind SRC` adds a read-allowlist rule for SRC (single positional
-  argument post-WS1; no DST — sandbox-exec cannot remap paths). The source
-  path must exist at launch — a missing source is a hard error (exit 1),
-  not a silent skip. This matches `--bind` strictness and prevents
-  typo-induced silent failures.
+  argument post-WS1; no DST — sandbox-exec cannot remap paths) and denies
+  writes to it, even under a broader `--bind`, WORKDIR or
+  `AI_SANDBOX_EXTRA_RW_DIRS` grant. Only a `--bind` nested strictly inside
+  SRC stays writable. The source path must exist at launch — a missing
+  source is a hard error (exit 1), not a silent skip. This matches
+  `--bind` strictness and prevents typo-induced silent failures.
 <!-- os:end -->
 <!-- os:linux -->
 - `--bind SRC DST` / `--ro-bind SRC DST` (two positional arguments) adds a

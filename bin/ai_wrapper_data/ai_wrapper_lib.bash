@@ -226,10 +226,10 @@ _check_workdir_breadth() {
 # push -u, branch --set-upstream-to), git worktree add/prune and
 # submodule updates fail inside the sandbox.
 #
-# macOS: Seatbelt grants are additive allows; a nested --ro-bind under a
-# --bind does not remove write access, and the macOS backend has no
-# deny-write helper yet. The RO over-mounts are therefore only enforced on
-# Linux; on macOS the wrapper WARNs (see docs/security-concerns.md B-λ).
+# macOS: the Seatbelt backend renders each --ro-bind as a trailing write
+# deny that wins over the RW --bind of the common dir except below the
+# nested RW own-entry bind (_append_ro_deny_rules in macos_sandbox_exec.bash;
+# docs/security-concerns.md B-λ).
 _wrapper_bind_git_common_dir() {
     local git_common_dir git_common_resolved wd_resolved home_resolved wt_parent
     git_common_dir="$(git -C "$(pwd -P)" rev-parse --git-common-dir 2>/dev/null)" || return 0
@@ -307,9 +307,6 @@ _wrapper_bind_git_common_dir() {
     for p in "${wt_entry}/commondir" "${wt_entry}/gitdir" "${wt_entry}/config.worktree"; do
         [[ -f "${p}" ]] && _wrapper_add_ro_bind "${p}"
     done
-    if [[ "${_wrapper_os}" == "Darwin" ]]; then
-        echo_log "WARN" "[${AI_AGENT_COMMAND:-ai-wrapper}] macOS: ${git_common_resolved}/hooks and config are writable by the agent (no nested read-only on Seatbelt yet). Review them before running git outside the sandbox."
-    fi
 
     # Git canonicalizes the absolute paths in the gitdir line
     # (mainrepo/.git/worktrees/<name>) which requires stat() on every
