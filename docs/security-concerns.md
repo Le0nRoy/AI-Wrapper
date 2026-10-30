@@ -500,13 +500,98 @@ glab config bind and `_extra_sandbox_setup` entries. Native coverage:
 wrapper) and `tests/test_macos_ro_overlays.bash`, both in CI
 `smoke-macos`.
 
-Linux differs in one case: bwrap applies binds in order, so an
-`AI_SANDBOX_EXTRA_RW_DIRS` entry covering the common dir (appended
-after the wrapper's RO over-mounts) still hides them there.
+Linux used to differ in one case: bwrap applies binds in order, and
+`AI_SANDBOX_EXTRA_RW_DIRS` entries were appended after the wrapper's RO
+over-mounts, so an entry covering the common dir hid them. Since #10 the
+backend mounts user extra dirs before the wrapper's own binds, so the
+RO layers win on both OSes (`_extra_sandbox_setup` binds still come
+last).
 
-**Not covered (follow-up).** The same hooks/config vector exists for the
-WORKDIR's own `.git` (regular repos, and the worktree's `.git` file,
-which can be repointed): WORKDIR is RW by design.
+The WORKDIR's own `.git` is covered by B-ν.
+
+### B-ν — WORKDIR's own git metadata (MITIGATED, 2026-10, #10)
+
+WORKDIR is RW, and with it the repository's `.git/hooks/*` and
+`.git/config` (`core.hooksPath`, `core.fsmonitor`, `core.sshCommand`,
+aliases, filter/diff drivers, credential helpers), a linked worktree's
+`.git` file (repointable), `.git/commondir` (git takes config and hooks
+from the dir it names, even in a normal repo) and other checkouts'
+`worktrees/*` pointers. All of them run commands on the host,
+unsandboxed, on the user's next git command there.
+
+**Mitigation.** `_wrapper_protect_workdir_git` (`ai_wrapper_lib.bash`),
+called from `_apply_post_menu_binds` after the preset and menu in the
+claude, codex, agy and copilot wrappers (and directly in the
+cursor-agent wrapper). A refusal exits the wrapper before the client
+starts. It protects only entries that exist at launch:
+
+| WORKDIR | Always | Protected mode only |
+|---|---|---|
+| normal repo (`.git` dir) | `.git` pinned; `commondir`, `worktrees/` RO | `config`, `hooks/`, `config.worktree`, `modules/<name>/{config,hooks}` RO |
+| linked worktree / submodule checkout (`.git` file) | `.git` file RO | — (shared `.git`: B-λ) |
+| bare repo, or WORKDIR is a git dir | `commondir`, `worktrees/` RO | same entries directly under WORKDIR |
+| repository subdirectory | nothing to do: the git dir is outside WORKDIR and not writable | |
+| not a repository | WARN: metadata created in the session (`git init`, clone, nested repos) needs host review | |
+
+- **Pin (root integrity).** On Linux a self-bind makes `.git` a mount
+  point, so `rename(2)`/`rmdir(2)` fail with `EBUSY`. On macOS the new
+  backend flag `--pin` renders a literal write deny on `.git` and its
+  ancestors below `$HOME` (`_append_pin_rules`); RO entries alone pin it
+  only when one exists, which is not the case in relaxed mode or when
+  every protected entry is absent. Children stay writable, so the index,
+  objects, refs, logs, `HEAD` and lock files work as before.
+- **Setting.** `AI_SANDBOX_ALLOW_GIT_CONFIG=1` (menu: Sensitive, "Allow
+  editing git config and hooks"; default 0) drops the RO layers on
+  `config`, `hooks/`, `config.worktree` and submodule config/hooks only.
+  The pin, pointer files, `commondir`, `worktrees/` and all validation
+  stay. A value given explicitly at launch (even `=0`) wins over the
+  per-workdir preset; restoring `1` from a preset WARNs. It does not
+  relax the worktree common dir (B-λ).
+- **Validation (both modes).** A symlinked `.git`, `config`, `hooks`,
+  `config.worktree`, `commondir`, `worktrees`, `modules` or
+  `modules/<name>` (or `config`/`hooks` below it), or one with the wrong
+  file type, refuses the launch. So does a WORKDIR strictly inside a git
+  dir. Failure to resolve WORKDIR or its git dir fails closed. Host-side
+  detection runs `git rev-parse` / `git config --file` only (no hooks or
+  configured commands), with inherited `GIT_DIR` / `GIT_WORK_TREE` /
+  `GIT_COMMON_DIR` dropped.
+- **No host mutation.** Nothing is created or truncated, unlike the
+  common-dir helper (B-λ), and there is no post-session step.
+
+**Usability impact (protected mode).** Commit, branch, checkout,
+merge/rebase, fetch and plain push keep working and persist. `git
+config`, `git remote add`, `git branch --set-upstream-to`, `git
+worktree add/prune`, hook installers (`pre-commit install`, husky) and
+submodule updates fail with "could not lock/rename config" or EROFS.
+`git push -u` can update the remote and then fail to record the local
+tracking config: the push lands, the upstream is not set
+(`tests/test_workdir_git_protection.bash` checks both).
+
+**Residual (accepted by the owner).**
+
+- *Absent entries.* bwrap needs an existing mount point and Seatbelt
+  rules are only rendered for existing sources; creating them would
+  mutate the host. A missing `config`, `hooks/`, `commondir` (absent in
+  almost every repo, so this WARN appears on most normal-repo launches)
+  or `config.worktree` (with `extensions.worktreeConfig`) stays
+  creatable and is listed in a WARN. Created ones are not protected
+  until the next launch.
+- *Indirection.* WARNs (detection only) for `core.hooksPath`,
+  `core.fsmonitor` and `include.path` / `includeIf.*.path` resolving into
+  WORKDIR, hook symlinks into WORKDIR, a `.git` file pointing at a git dir
+  inside WORKDIR, and submodule checkouts (their `.git` pointer files
+  below WORKDIR stay writable). Other commands in config (filter drivers,
+  `sshCommand`, aliases) that run scripts from WORKDIR, and existing hooks
+  that read WORKDIR content (pre-commit's `.pre-commit-config.yaml`,
+  husky scripts, Makefiles), are not audited.
+- *Not sanitized.* RO protection freezes what is there; it does not
+  clean commands or hook symlinks already present, or metadata written by
+  an earlier unprotected session.
+- *Nested metadata.* Repos, submodule git dirs below `modules/<a>/modules`
+  and `.git` dirs created anywhere below WORKDIR are writable; recursive
+  submodule metadata is #12.
+- *Plugins.* `_extra_sandbox_setup` binds are applied last and can
+  re-grant RW (trusted code, S-β).
 
 ### B-κ — symlinked account paths (RESOLVED, 2026-10)
 

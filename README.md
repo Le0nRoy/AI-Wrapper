@@ -60,6 +60,8 @@ The wrappers dispatch to an OS-appropriate sandbox backend (`ai_agent_universal_
 - **Linux:** [bubblewrap](https://github.com/containers/bubblewrap) — read-only filesystem mounts (except specific project paths), network access controlled per-wrapper, no access to `~/.ssh`, `~/.gnupg`, or credentials outside the sandbox unless opted in via `AI_SANDBOX_PASS_*` flags.
 - **macOS:** `sandbox-exec` (Seatbelt), profile at `bin/ai_wrapper_data/claude_wrapper.sb` — same default-deny, opt-in-credential-gating model as the Linux backend.
 
+WORKDIR is writable, but its own git metadata is not: the `.git` dir is pinned and existing `config`, `hooks/` and pointer files are read-only, because host git runs hooks and config commands outside the sandbox. `git config`, `remote add` and upstream changes therefore fail inside the sandbox unless `AI_SANDBOX_ALLOW_GIT_CONFIG=1`; see `docs/security-concerns.md` B-ν for the residual risks.
+
 Resource-limit enforcement (`RLIMIT_*` via `prlimit`) was removed 2026-09 and is not currently reintroduced on either backend; see `AGENTS.md` Section 3.
 
 See `AGENTS.md` → Section 3 (Security) and `docs/security-concerns.md` for details.
