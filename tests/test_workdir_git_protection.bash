@@ -57,11 +57,13 @@ fi
 git_q() { git -c init.defaultBranch=main -c user.name=t -c user.email=t@t "$@" >/dev/null 2>&1; }
 _new_repo() { rm -rf "${1}"; git_q init "${1}" && git_q -C "${1}" commit --allow-empty -m init; }
 
-# Run the protection in DIR and print rc, WRAPPER_FLAGS and stderr. OS=
-# Darwin forces the single-arg macOS flag shape.
+# Run the protection in DIR and print rc, WRAPPER_FLAGS and stderr. These
+# are flag-shape snapshots, not native proof: OS (default Linux) is set
+# after sourcing so the host backend never decides the shape; Darwin
+# selects the single-arg macOS shape. Native enforcement is layer 4.
 _protect() {
-    local dir="${1}" os="${2:-}"
-    ( cd "${dir}" && _load && { [[ -z "${os}" ]] || _wrapper_os="${os}"; } && WRAPPER_FLAGS=() \
+    local dir="${1}" os="${2:-Linux}"
+    ( cd "${dir}" && _load && _wrapper_os="${os}" && WRAPPER_FLAGS=() \
         && { _wrapper_protect_workdir_git; rc=$?; printf 'rc=%s\n' "${rc}"; printf '%s\n' "${WRAPPER_FLAGS[@]+"${WRAPPER_FLAGS[@]}"}"; } ) 2>&1
 }
 # Linux-shaped flag for PATH: "--ro-bind\nP\nP\n".
@@ -387,13 +389,18 @@ _assert_ran() {
 }
 _sums() { local f; for f in "$@"; do printf '%s ' "${f}"; if [[ -d "${f}" ]]; then ls -A "${f}" | tr '\n' ' '; echo; else cksum <"${f}" 2>&1; fi; done; }
 
-# Probes shared by the normal-repo runs. .git/cfg.tmp keeps the atomic
-# replacement on the .git mount (a cross-mount rename would fail with
-# EXDEV for the wrong reason).
-NORMAL_PROBES='
-echo x >file && g add file && g commit -m sandboxed && echo COMMIT_OK
-g branch side && echo BRANCH_OK
-g checkout -b feature && g checkout main && echo CHECKOUT_OK
+# Probes shared by the normal-repo runs; TAG makes each run's commit,
+# branch and file content fresh, so a later run on the same fixture never
+# hits "nothing to commit" or "branch already exists". .git/cfg.tmp keeps
+# the atomic replacement on the .git mount (a cross-mount rename would
+# fail with EXDEV for the wrong reason).
+_normal_probes() {
+    local tag="${1}"
+    printf '%s\n' \
+        "echo ${tag} >file && g add file && g commit -m sandboxed-${tag} && echo COMMIT_OK" \
+        "g branch side-${tag} && echo BRANCH_OK" \
+        "g checkout -b feature-${tag} && g checkout main && echo CHECKOUT_OK"
+    cat <<'PROBES'
 probe git-config g config user.name evil
 probe remote-add g remote add evil /nonexistent
 probe append-config sh -c "echo \"[alias] x = !true\" >>.git/config"
@@ -404,7 +411,23 @@ probe gitdir-move bash -c "ren .git .git.moved; rc=\$?; [ \"\${rc}\" = 0 ] && re
 probe gitdir-rmdir-swap bash -c "ren .git .git.old && mkdir .git"
 g push -u origin main; echo "PUSH_RC=$?"
 rm -f .git/cfg.tmp
-'
+PROBES
+}
+# The persisted state a _normal_probes TAG run must leave on the host.
+_assert_normal_persisted() {
+    local tag="${1}" label="${2}" ok
+    for ok in COMMIT_OK BRANCH_OK CHECKOUT_OK; do
+        assert_contains "${out}" "${ok}" "${label}: ${ok}"
+    done
+    assert_eq "$(git -C "${E}" log --format=%s -1 main)" "sandboxed-${tag}" "${label}: commit persisted on the host"
+    assert_eq "$(git -C "${E}" show "main:file" 2>&1)" "${tag}" "${label}: committed content persisted on the host"
+    ok=0; git -C "${E}" rev-parse -q --verify "side-${tag}" >/dev/null \
+        && git -C "${E}" rev-parse -q --verify "feature-${tag}" >/dev/null && ok=1
+    assert_eq "${ok}" "1" "${label}: branches persisted on the host"
+    assert_eq "$(git -C "${E}" symbolic-ref --short HEAD)" "main" "${label}: checkout returned to main"
+    assert_eq "$(git -C "${E}" status --porcelain)" "" "${label}: index and work tree consistent on the host"
+    assert_eq "$(git -C "${E}/remote.git" log --format=%s -1 main 2>&1)" "sandboxed-${tag}" "${label}: push reached the remote"
+}
 
 if [[ "${sandbox_e2e}" == "1" ]]; then
     E="${R}/e2e"
@@ -421,32 +444,26 @@ if [[ "${sandbox_e2e}" == "1" ]]; then
     echo "-- e2e: normal repo, protected"
     before="$(_sums "${E}/.git/config" "${E}/.git/hooks")"
     # unlink last: in relaxed mode the same probe would delete the config.
-    _write_probe "${E}/.git" "${required}" "${NORMAL_PROBES}probe unlink-config rm -f .git/config"
+    _write_probe "${E}/.git" "${required}" "$(_normal_probes protected)${NL}probe unlink-config rm -f .git/config"
     out="$(_launch "${E}")"; rc=$?
     _assert_ran "${out}" "${rc}" "e2e protected"
-    for ok in COMMIT_OK BRANCH_OK CHECKOUT_OK; do
-        assert_contains "${out}" "${ok}" "e2e protected: ${ok}"
-    done
+    _assert_normal_persisted protected "e2e protected"
     for p in git-config remote-add append-config replace-config unlink-config hook-create hooks-rename \
             gitdir-move gitdir-rmdir-swap; do
         assert_contains "${out}" "DENIED:${p}" "e2e protected: ${p} denied"
     done
     assert_eq "$(_sums "${E}/.git/config" "${E}/.git/hooks")" "${before}" "e2e protected: config bytes and hooks/ unchanged on the host"
-    assert_eq "$(git -C "${E}" log --format=%s -1 main)" "sandboxed" "e2e protected: commit persisted on the host"
-    ok=0; git -C "${E}" rev-parse -q --verify side >/dev/null && git -C "${E}" rev-parse -q --verify feature >/dev/null && ok=1
-    assert_eq "${ok}" "1" "e2e protected: branches persisted on the host"
-    assert_eq "$(git -C "${E}" status --porcelain)" "" "e2e protected: index and work tree consistent on the host"
-    assert_eq "$(git -C "${E}/remote.git" log --format=%s -1 main 2>&1)" "sandboxed" "e2e protected: push -u reached the remote"
     assert_eq "$(git -C "${E}" config --get branch.main.remote)" "" "e2e protected: push -u tracking config not written locally"
     ok=0; [[ -d "${E}/.git" && ! -e "${E}/.git.moved" && ! -e "${E}/.git.old" ]] && ok=1
     assert_eq "${ok}" "1" "e2e protected: .git still in place on the host"
 
     echo "-- e2e: normal repo, AI_SANDBOX_ALLOW_GIT_CONFIG=1"
-    _write_probe "${E}/.git" "${required}" "${NORMAL_PROBES}"
+    _write_probe "${E}/.git" "${required}" "$(_normal_probes relaxed)"
     out="$(_launch "${E}" AI_SANDBOX_ALLOW_GIT_CONFIG=1)"; rc=$?
     _assert_ran "${out}" "${rc}" "e2e relaxed"
     assert_contains "${out}" "AI_SANDBOX_ALLOW_GIT_CONFIG=1" "e2e relaxed: WARN printed"
-    assert_contains "${out}" "COMMIT_OK" "e2e relaxed: COMMIT_OK"
+    _assert_normal_persisted relaxed "e2e relaxed"
+    assert_eq "$(git -C "${E}" config --get branch.main.remote)" "origin" "e2e relaxed: push -u tracking config written (positive control)"
     for p in git-config remote-add append-config replace-config hook-create; do
         assert_contains "${out}" "WROTE:${p}" "e2e relaxed: ${p} allowed (positive control)"
     done
@@ -460,6 +477,7 @@ if [[ "${sandbox_e2e}" == "1" ]]; then
     git -C "${E}" config --unset user.name; git -C "${E}" remote remove evil 2>/dev/null
     git -C "${E}" config --unset-all core.fsmonitor 2>/dev/null
     git -C "${E}" config --remove-section alias 2>/dev/null
+    git -C "${E}" config --remove-section branch.main 2>/dev/null
     rm -f "${E}/.git/hooks/post-checkout"
     # The relaxed hooks-rename probe moved hooks/ away; put it back.
     if [[ -d "${E}/.git/hooks.old" ]]; then
