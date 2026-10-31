@@ -166,7 +166,10 @@ _assert_protected_bind() {
         assert_contains "${out}" "--ro-bind${NL}${MG}/${ro}${NL}" "${label}: ${ro} read-only"
     done
     assert_contains "${out}" "--bind${NL}${MG}/worktrees/${entry}${NL}" "${label}: own worktree entry RW"
-    assert_not_contains "${out}" "${NL}${EXT}${NL}" "${label}: external parent not granted"
+    # Darwin adds a stat()-only --meta-bind on the parent (checked below);
+    # what must never appear is a content or RW grant on it.
+    assert_not_contains "${out}" "--bind${NL}${EXT}${NL}" "${label}: no RW grant on the external parent"
+    assert_not_contains "${out}" "--ro-bind${NL}${EXT}${NL}" "${label}: no read grant on the external parent"
     assert_not_contains "${out}" "${EXT}/sibling" "${label}: sibling repo not granted"
     assert_not_contains "${out}" "${EXT}/canary" "${label}: canary not granted"
 }
@@ -328,10 +331,11 @@ mkdir -p "${MG}/modules/sub1/hooks"; : >"${MG}/modules/sub1/config"
 
 # Probe client: proves discovery of exactly the fixture before any write
 # (SETUP_FAILED + exit 3 otherwise), then probes and ends with PROBES_DONE.
+_dev_ino() { stat -c '%d:%i' "$1" 2>/dev/null || stat -f '%d:%i' "$1"; }
 _write_probe_stub() {
     {
-        printf '#!/bin/bash\nexpect_m=%q\nexpect_w=%q\nexpect_wt_git=%q\next=%q\n' \
-            "${MG}" "${MG}/worktrees/wt" "${EXT}/wt/.git" "${EXT}"
+        printf '#!/bin/bash\nexpect_m=%q\nexpect_w=%q\nexpect_wt_git=%q\next=%q\next_id=%q\nwt_id=%q\n' \
+            "${MG}" "${MG}/worktrees/wt" "${EXT}/wt/.git" "${EXT}" "$(_dev_ino "${EXT}")" "$(_dev_ino "${EXT}/wt")"
         cat <<'STUB'
 setup_failed() { echo "SETUP_FAILED: $*"; exit 3; }
 m="$(git rev-parse --git-common-dir 2>&1)" || setup_failed "git rev-parse --git-common-dir: ${m}"
@@ -350,6 +354,19 @@ echo "$$-${RANDOM}" >file && g add file && g commit -m sandboxed && echo COMMIT_
 g branch ext-side && echo BRANCH_OK
 ren() { perl -e 'rename($ARGV[0], $ARGV[1]) or exit 1' "$@"; }
 export -f ren
+dev_ino() { stat -c '%d:%i' "$1" 2>/dev/null || stat -f '%d:%i' "$1" 2>/dev/null; }
+# Backing identity of the external parent as seen in the sandbox: same
+# st_dev:st_ino as on the host means host-backed (writes must be denied);
+# a different one is a private mountpoint skeleton (bwrap). Unknown
+# (stat denied) counts as host-backed. WORKDIR, bound from the host, is
+# the positive control that the identity check works in the sandbox.
+[[ "$(dev_ino .)" == "${wt_id}" ]] && echo "WT:host-backed" || echo "WT:mismatch"
+now_id="$(dev_ino "${ext}")"
+if [[ -n "${now_id}" && "${now_id}" != "${ext_id}" ]]; then echo "PARENT:private"; else echo "PARENT:host-backed"; fi
+# Listed before any write probe so a private scratch file planted by the
+# probes below cannot be mistaken for a host canary.
+listing="$(ls -A "${ext}" 2>/dev/null)"
+case "${listing}" in *sibling*|*canary*) echo "LEAK:parent-listing" ;; *) echo "NOLEAK:parent-listing" ;; esac
 probe() { local name="${1}"; shift; if ("$@") >/dev/null 2>&1; then echo "WROTE:${name}"; else echo "DENIED:${name}"; fi; }
 probe append-config sh -c 'echo evil >>"$1"' _ "${m}/config"
 probe replace-config bash -c 'echo evil >cfg.tmp && ren cfg.tmp "$1"' _ "${m}/config"
@@ -369,8 +386,6 @@ probe sibling-write sh -c 'echo evil >>"$1"' _ "${ext}/sibling/secret.txt"
 probe canary-read cat "${ext}/canary.txt"
 probe canary-write sh -c 'echo evil >>"$1"' _ "${ext}/canary.txt"
 probe parent-create sh -c 'echo evil >"$1"' _ "${ext}/planted"
-listing="$(ls -A "${ext}" 2>/dev/null)"
-case "${listing}" in *sibling*|*canary*) echo "LEAK:parent-listing" ;; *) echo "NOLEAK:parent-listing" ;; esac
 echo PROBES_DONE
 STUB
     } >"${FAKE_HOME}/bin/codex"
@@ -399,6 +414,7 @@ _launch_ext() {
 
 if [[ "${sandbox_e2e}" == "1" ]]; then
     sums_before="$(_protected_sums)"
+    canary_before="$(cksum <"${EXT}/canary.txt")"
     assert_not_contains "${sums_before}" "No such file" "e2e: fixture has every protected path before the run"
 
     # Opt-in off (unset, and an injected preset =1): git cannot reach the
@@ -424,10 +440,25 @@ if [[ "${sandbox_e2e}" == "1" ]]; then
     assert_contains "${out}" "COMMIT_OK" "e2e opt-in on: commit works"
     assert_contains "${out}" "BRANCH_OK" "e2e opt-in on: branch works"
     for p in append-config replace-config hook-create hooks-rename other-entry-head worktrees-newentry \
-            own-commondir own-gitdir module-config module-hook sibling-read sibling-write canary-read \
-            canary-write parent-create; do
+            own-commondir own-gitdir module-config module-hook sibling-read sibling-write canary-read; do
         assert_contains "${out}" "DENIED:${p}" "e2e opt-in on: ${p} denied"
     done
+    assert_contains "${out}" "WT:host-backed" "e2e opt-in on: identity probe sees the host-backed WORKDIR (positive control)"
+    # Writes into the external parent: denied when the sandbox sees the
+    # host directory. bwrap shows it as a private mountpoint skeleton
+    # (different st_dev:st_ino), where a new scratch file is not a host
+    # write; the host checks below prove nothing reached the host parent.
+    expect_parent="PARENT:host-backed"
+    [[ "${OS}" == "Linux" ]] && expect_parent="PARENT:private"
+    assert_contains "${out}" "${expect_parent}" "e2e opt-in on: external parent backing is ${expect_parent#PARENT:}"
+    if [[ "${out}" != *"PARENT:private"* ]]; then
+        for p in canary-write parent-create; do
+            assert_contains "${out}" "DENIED:${p}" "e2e opt-in on: ${p} denied on the host-backed parent"
+        done
+    fi
+    assert_eq "$(cksum <"${EXT}/canary.txt")" "${canary_before}" "e2e opt-in on: host canary bytes unchanged"
+    ok=0; [[ -e "${EXT}/planted" ]] || ok=1
+    assert_eq "${ok}" "1" "e2e opt-in on: nothing planted in the host external parent"
     for p in objects-touch refs-touch own-entry-file; do
         assert_contains "${out}" "WROTE:${p}" "e2e opt-in on: ${p} writable (positive control)"
     done
