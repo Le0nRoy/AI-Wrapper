@@ -1098,9 +1098,11 @@ _apply_post_menu_binds() {
 # 8th field instead — see AI_SANDBOX_PROFILE* and the darwin-only rows below.
 if [[ "${_wrapper_os}" == "Darwin" ]]; then
     _ai_sensitive_workdir_extra=", ~/Library"
+    _ai_sensitive_workdir_system=", and binding those or a top-level system directory as extra RW/RO dirs; launching from a system directory stays refused on macOS"
     _ai_gitlab_bind_note="RO-binds ~/Library/Application Support/glab-cli"
 else
     _ai_sensitive_workdir_extra=""
+    _ai_sensitive_workdir_system=", or a top-level system directory, and binding such dirs as extra RW/RO dirs"
     _ai_gitlab_bind_note="RO-binds the XDG glab-cli config paths (~/.config/glab-cli, ~/.local/share/glab-cli)"
 fi
 
@@ -1120,7 +1122,7 @@ _AI_SETTINGS_LIST=(
     "AI_SANDBOX_PROFILE_TRUST_ME|bool|0|red|Skip safety check on custom profile|Bypasses the (version 1) + (deny default) validation. Set only if your profile intentionally relaxes the sandbox.|additional|darwin"
 
     # Sensitive directories
-    "AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR|bool|0|red|Allow launch from sensitive dirs|Permits launching from \$HOME itself, a dotfile dir directly under \$HOME${_ai_sensitive_workdir_extra}, or a top-level system directory — the write fence then grants RW there, which likely exposes credentials|sensitive"
+    "AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR|bool|0|red|Allow launch from sensitive dirs|Permits launching from \$HOME itself, a dotfile dir directly under \$HOME${_ai_sensitive_workdir_extra}${_ai_sensitive_workdir_system} — the write fence then grants RW there, which likely exposes credentials|sensitive"
     "AI_SANDBOX_ALLOW_GIT_CONFIG|bool|0|red|Allow editing git config and hooks|Leaves WORKDIR's .git/config, hooks/, config.worktree and submodule config/hooks (also a linked worktree's own submodules) writable so git config, remote add and push -u work. The agent can then make host git run any command. Off: those edits and tracking-branch setup fail; commits, local branches and checkouts still work.|sensitive"
     "AI_SANDBOX_ALLOW_EXTERNAL_WORKTREES|bool|0|yellow|Allow git in worktrees of repos outside \$HOME|For a linked worktree whose repository's shared .git lies outside \$HOME (e.g. /Data/...), binds exactly that .git after the same link and path checks as \$HOME repos; its config, hooks/ and other worktrees stay read-only. System, temp and hidden locations are refused. This session only: never saved to or restored from the per-workdir preset.|sensitive"
     "AI_SANDBOX_ALLOW_RO_HOMEDIR|bool|0|yellow|Share home directory (read-only)|Agent can read everything in \$HOME except credentials|sensitive|darwin"
@@ -1139,7 +1141,7 @@ _AI_SETTINGS_LIST=(
     "AI_SANDBOX_ALLOW_DOCKER|bool|0|red|Mount Docker / Colima socket|RW on /var/run/docker.sock, ~/.colima, ~/.docker. With the daemon running this is a full sandbox escape: agent can launch privileged containers and obtain host root. Off by default — opt in only when the session needs docker.|networking"
     "AI_SANDBOX_PASS_DOCKER|bool|0|red|Share Docker client env vars + ~/.docker|Passes DOCKER_HOST, DOCKER_CONFIG, DOCKER_CERT_PATH, DOCKER_BUILDKIT and RO-grants ~/.docker (registry auth tokens). Pair with 'Mount Docker / Colima socket' to actually talk to the daemon.|networking"
 )
-unset _ai_sensitive_workdir_extra _ai_gitlab_bind_note
+unset _ai_sensitive_workdir_extra _ai_sensitive_workdir_system _ai_gitlab_bind_note
 
 # OS-scope filtering: drop catalog rows whose trailing OS_SCOPE field
 # doesn't match the current OS, so a setting with no backend on this OS

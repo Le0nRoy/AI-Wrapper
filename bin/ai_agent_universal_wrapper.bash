@@ -49,15 +49,18 @@ _sandbox_pass_env_add() {
 #             ~/Library), where credentials live
 # and returns 0; prints nothing and returns 1 when PATH is not sensitive.
 # Pure string classification: callers pass an already-resolved PATH and
-# HOME (trailing slashes are stripped here). Single source for the Linux
-# backend's WORKDIR and AI_SANDBOX_EXTRA_{RW,RO}_DIRS refusals and the
-# wrapper-side git-worktree bind guard (ai_wrapper_lib.bash); the lists
-# match the macOS backend's extra-dir refusal (macos_sandbox_exec.bash).
+# HOME (trailing slashes are stripped here). Single source for both
+# backends' WORKDIR and AI_SANDBOX_EXTRA_{RW,RO}_DIRS refusals (Linux below,
+# macOS in macos_sandbox_exec.bash; each backend keeps its own override
+# policy) and the wrapper-side git-worktree bind guard (ai_wrapper_lib.bash).
+# System entries are exact roots, not subtrees. On macOS /tmp, /var and
+# /etc are listed with their canonical /private/... targets, since callers
+# pass realpath-resolved paths.
 _sandbox_sensitive_dir_kind() {
     local path="${1%/}" home="${2%/}"
     if [[ "$(uname -s)" == "Darwin" ]]; then
         case "${path}" in
-            ""|/|/Users|/Users/Shared|/private|/private/tmp|/private/var|/private/var/tmp|/private/var/folders|/tmp|/var|/var/tmp|/etc|/usr|/usr/local|/bin|/sbin|/System|/Applications|/Library)
+            ""|/|/Users|/Users/Shared|/private|/private/tmp|/private/var|/private/var/tmp|/private/var/folders|/private/etc|/tmp|/var|/var/tmp|/etc|/usr|/usr/local|/bin|/sbin|/System|/Applications|/Library)
                 echo system; return 0 ;;
         esac
     else

@@ -35,10 +35,18 @@ The sandbox bounds *writes* — it does not bound *reads* or *network*. Be aware
 ## Environment variables
 
 - `AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1` — override the refusal to launch
-  from HOME dotfile dirs. Use only when you're deliberately editing one of
-  those locations and accept the wider write fence.
+  from `$HOME` or a HOME dotfile dir, and to accept such dirs or top-level
+  system dirs in `AI_SANDBOX_EXTRA_RW_DIRS` / `AI_SANDBOX_EXTRA_RO_DIRS`.
+  Use only when you're deliberately editing one of those locations and
+  accept the wider write fence.
+<!-- os:linux -->
+  Also overrides the refusal to launch from a top-level system directory
+  (`/`, `/etc`, `/tmp`, `/home`, ...).
+
 <!-- os:darwin -->
-  Also covers `~/Library`.
+  Also covers `~/Library`. Launching from a top-level system directory
+  (`/`, `/etc` = `/private/etc`, `/tmp`, `/Users`, `/Library`, ...) stays
+  refused on macOS; the setting does not override it.
 
 - `AI_SANDBOX_ALLOW_RO_HOMEDIR=1` — widen the read allowlist to `$HOME`
   except the credential exclusions in the SBPL profile (the 9 credential

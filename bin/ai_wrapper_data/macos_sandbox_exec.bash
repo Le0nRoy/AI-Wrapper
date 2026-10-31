@@ -202,16 +202,14 @@ _run_sandboxed_agent_impl() {
         echo_log "ERROR" "[${tag}] Workdir path is unsafe for SBPL interpolation: ${resolved_workdir}"
         return 1
     fi
-    # Refuse to sandbox with a WORKDIR that's a system root or $HOME itself:
-    # the profile grants RW on (subpath WORKDIR), so a too-broad cwd would
-    # effectively neutralise the write fence. Caller must cd into a project
-    # directory first.
-    case "${resolved_workdir}" in
-        /|/Users|/Users/Shared|/private|/private/tmp|/private/var|/private/var/tmp|/private/var/folders|/tmp|/var|/var/tmp|/etc|/usr|/usr/local|/bin|/sbin|/System|/Applications|/Library)
-            echo_log "ERROR" "[${tag}] Refusing to sandbox with WORKDIR=${resolved_workdir} (top-level or system location). cd into a project directory first."
-            return 1
-            ;;
-    esac
+    # Sensitive-location refusals. Classification is shared with the Linux
+    # backend (_sandbox_sensitive_dir_kind in ai_agent_universal_wrapper.bash,
+    # which sources this file); enforcement stays macOS-specific. Without the
+    # classifier every guard below would silently pass, so fail closed.
+    if ! declare -f _sandbox_sensitive_dir_kind >/dev/null 2>&1; then
+        echo_log "ERROR" "[${tag}] sensitive-path classifier _sandbox_sensitive_dir_kind is not loaded; refusing to launch. Run through ai_agent_universal_wrapper.bash's run_sandboxed_agent."
+        return 1
+    fi
     # Resolve HOME the same way we resolved WORKDIR so the comparisons below
     # survive macOS's /var → /private/var symlink (and any user-installed
     # symlinks in the HOME chain). Fall back to the raw HOME%/ when realpath
@@ -222,26 +220,35 @@ _run_sandboxed_agent_impl() {
         resolved_home="$(_realpath "${HOME}")" || resolved_home="${HOME%/}"
         resolved_home="${resolved_home%/}"
     fi
-    if [[ "${AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR:-}" != "1" && -n "${resolved_home}" && "${resolved_workdir}" == "${resolved_home}" ]]; then
-        echo_log "ERROR" "[${tag}] Refusing to sandbox with WORKDIR=\$HOME (${HOME}); that would grant RW on the entire home directory. cd into a subdirectory first, or set AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 to override."
-        return 1
-    fi
-    # Refuse WORKDIRs that sit on top of well-known credential / browser-data
-    # locations. The `(allow file* (subpath WORKDIR))` rule grants RW on the cwd
-    # unconditionally; picking a sensitive WORKDIR write-exposes files that the
-    # (default-deny) read fence would not even let the agent read. Network plus
-    # RW on a bad WORKDIR is sufficient for exfiltration of anything the agent
-    # itself writes there.
-    # Bypass with AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 when this is intentional
-    # (e.g. you're explicitly maintaining one of these directories).
-    if [[ "${AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR:-}" != "1" && -n "${resolved_home}" ]]; then
-        case "${resolved_workdir}" in
-            "${resolved_home}"/.*|"${resolved_home}"/Library|"${resolved_home}"/Library/*)
+    # Refuse to sandbox with a WORKDIR that's a system root, $HOME itself, or
+    # a well-known credential / browser-data location (HOME dotfile dirs,
+    # ~/Library): the profile grants RW on (subpath WORKDIR) unconditionally,
+    # so a too-broad cwd neutralises the write fence and write-exposes files
+    # the (default-deny) read fence would not even let the agent read.
+    # Network plus RW on a bad WORKDIR is sufficient for exfiltration of
+    # anything the agent itself writes there. A system WORKDIR is refused
+    # unconditionally on macOS; bypass the $HOME / dotfile / ~/Library
+    # refusals with AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 when this is
+    # intentional (e.g. you're explicitly maintaining one of these
+    # directories).
+    case "$(_sandbox_sensitive_dir_kind "${resolved_workdir}" "${resolved_home}")" in
+        system)
+            echo_log "ERROR" "[${tag}] Refusing to sandbox with WORKDIR=${resolved_workdir} (top-level or system location). cd into a project directory first."
+            return 1
+            ;;
+        home)
+            if [[ "${AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR:-}" != "1" ]]; then
+                echo_log "ERROR" "[${tag}] Refusing to sandbox with WORKDIR=\$HOME (${HOME}); that would grant RW on the entire home directory. cd into a subdirectory first, or set AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 to override."
+                return 1
+            fi
+            ;;
+        dotfile)
+            if [[ "${AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR:-}" != "1" ]]; then
                 echo_log "ERROR" "[${tag}] Refusing to sandbox with WORKDIR=${resolved_workdir} (under HOME dotfile dir or ~/Library — granting RW here likely exposes credentials). cd into a non-sensitive project directory, or set AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 to override."
                 return 1
-                ;;
-        esac
-    fi
+            fi
+            ;;
+    esac
 
     # Same sensitivity guard applied to every directory accepted from
     # AI_SANDBOX_EXTRA_RW_DIRS / AI_SANDBOX_EXTRA_RO_DIRS. Without this, a
@@ -255,25 +262,20 @@ _run_sandboxed_agent_impl() {
         local _sens_bind _sens_resolved
         for _sens_bind in "${_user_extra_bind_dirs[@]+"${_user_extra_bind_dirs[@]}"}"; do
             _sens_resolved="$(_realpath "${_sens_bind}" 2>/dev/null)" || _sens_resolved="${_sens_bind%/}"
-            _sens_resolved="${_sens_resolved%/}"
-            case "${_sens_resolved}" in
-                /|/Users|/Users/Shared|/private|/private/tmp|/private/var|/private/var/tmp|/private/var/folders|/tmp|/var|/var/tmp|/etc|/usr|/usr/local|/bin|/sbin|/System|/Applications|/Library)
+            case "$(_sandbox_sensitive_dir_kind "${_sens_resolved}" "${resolved_home}")" in
+                system)
                     echo_log "ERROR" "[${tag}] Refusing extra bind '${_sens_bind}' (top-level or system location). Remove it from AI_SANDBOX_EXTRA_RW_DIRS/AI_SANDBOX_EXTRA_RO_DIRS, or set AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 to override."
                     return 1
                     ;;
-            esac
-            if [[ -n "${resolved_home}" ]]; then
-                if [[ "${_sens_resolved}" == "${resolved_home}" ]]; then
+                home)
                     echo_log "ERROR" "[${tag}] Refusing extra bind '${_sens_bind}' (== \$HOME). Set AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 to override."
                     return 1
-                fi
-                case "${_sens_resolved}" in
-                    "${resolved_home}"/.*|"${resolved_home}"/Library|"${resolved_home}"/Library/*)
-                        echo_log "ERROR" "[${tag}] Refusing extra bind '${_sens_bind}' (under HOME dotfile dir or ~/Library — grants read/write on credentials). Set AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 to override."
-                        return 1
-                        ;;
-                esac
-            fi
+                    ;;
+                dotfile)
+                    echo_log "ERROR" "[${tag}] Refusing extra bind '${_sens_bind}' (under HOME dotfile dir or ~/Library — grants read/write on credentials). Set AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 to override."
+                    return 1
+                    ;;
+            esac
         done
         unset _sens_bind _sens_resolved
     fi
