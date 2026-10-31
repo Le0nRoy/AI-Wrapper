@@ -67,6 +67,7 @@ that launch a real sandbox.
 | `test_macos_ro_overlays.bash` | git repos in fake home; stub `getconf`/`sandbox-exec` off macOS | git; sandbox-exec for native checks | rule rendering + mocked dry-run; native part skipped | full, native write denial (missing sandbox-exec fails) |
 | `test_codex_wrapper.bash`, `test_agy_wrapper.bash`, `test_copilot_wrapper.bash` | git repos, sqlite db, stub clients in fake home; bwrap e2e | git, python3 (sqlite3, tomllib optional), bwrap for e2e | full with bwrap; e2e skipped without | argv/unit parts; bwrap e2e skipped |
 | `test_bind_hardening.bash` | git repos (incl. a worktree with nested submodules via local file:// clones), stub codex in fake home, temp alias dir under `/tmp` (macOS) | git, perl; bwrap or sandbox-exec for e2e | full with bwrap; e2e skipped without | full: native worktree write-denial e2e (missing sandbox-exec fails) |
+| `test_external_worktree.bash` | git repos in fake home and in a sibling dir outside it (real `$HOME` or the checkout's `tests/`), one in the system temp dir, preset files, stub codex; drives the interactive menu through a pty | git, perl, python3; bwrap or sandbox-exec for e2e | full with bwrap; e2e skipped without | full: native external-worktree write/read denial (missing sandbox-exec fails) |
 | `test_workdir_git_protection.bash` | git repos (normal, worktree, bare, scaffold, nested submodules via local file:// clones) and stub clients in fake home | git, perl, python3; bwrap or sandbox-exec for e2e | full with bwrap; missing bwrap fails | full: native WORKDIR git metadata write denial (missing sandbox-exec fails) |
 | `run-preset-tests.sh` | rewritten lib copy and scratch dirs under `$TMPDIR` (fallback `tests/preset/_scratch/`, git-ignored), removed on exit | BSD `stat -f` | exits 2 (not run) | full |
 
@@ -80,10 +81,10 @@ is the local equivalent. Keep both in sync when adding a test file.
   helper, live-client isolation canaries, agy host-side boundary, preset
   identity.
 - `smoke-linux`: bubblewrap installed; sandbox, extra-binds, isolation
-  canaries (with e2e), codex, bind-hardening, WORKDIR git metadata,
-  macOS RO-overlay rendering, agy, copilot.
+  canaries (with e2e), codex, bind-hardening, external worktrees,
+  WORKDIR git metadata, macOS RO-overlay rendering, agy, copilot.
 - `smoke-macos`: sandbox, macOS-only, extra-binds, bind-hardening,
-  WORKDIR git metadata and RO overlays (native write denial), preset
+  external worktrees, WORKDIR git metadata and RO overlays (native write denial), preset
   suite.
 
 ## Reading results
@@ -97,8 +98,9 @@ is the local equivalent. Keep both in sync when adding a test file.
 
 ## Native-OS limits
 
-- Worktree common-dir and WORKDIR git metadata write denial run
-  natively on both OSes (`test_bind_hardening.bash`,
+- Worktree common-dir (inside and, with the opt-in, outside `$HOME`)
+  and WORKDIR git metadata write denial run natively on both OSes
+  (`test_bind_hardening.bash`, `test_external_worktree.bash`,
   `test_workdir_git_protection.bash`, `test_macos_ro_overlays.bash`). Other
   wrapper e2e tests (account remap, credential-dir write denial) run on
   Linux bwrap only; on macOS argv snapshots that contain `--bind` do not

@@ -78,6 +78,22 @@ The sandbox bounds *writes* — it does not bound *reads* or *network*. Be aware
   `.git/commondir`, sometimes `hooks/`) cannot be protected and are
   listed in a WARN; nothing is created on the host. A value set at launch
   wins over the saved per-workdir preset. Red banner.
+- `AI_SANDBOX_ALLOW_EXTERNAL_WORKTREES=1` — let git work in a linked
+  worktree whose repository's shared `.git` lies outside `$HOME` (e.g.
+  `/Data/projects/app/.git`). Off by default: only shared `.git` dirs
+  strictly under `$HOME` are bound. On, the wrapper binds exactly that
+  validated `.git` — never its parent or sibling repos — after the same
+  checks as under `$HOME` (real git dir, forward and reverse worktree
+  links naming this checkout, no symlinks) and with the same read-only
+  `config`, `hooks/`, other worktrees, pointer files and submodule
+  metadata, also when `AI_SANDBOX_ALLOW_GIT_CONFIG=1`. A `.git` under
+  `/etc`, `/usr`, `/var`, `/tmp`, `/opt`, `/root`, `/private`,
+  `/Library`, `/Users/Shared` and similar system or shared temp trees, or
+  below a hidden directory, is refused. Set it in the launch environment
+  or toggle it in `s) Settings` for this session: it is never saved to or
+  restored from the per-workdir preset (a preset entry is ignored with a
+  WARN). The worktree links are ordinary files, not proof that you own
+  the repository; turn it on only for your own repositories.
 <!-- os:darwin -->
 - `AI_SANDBOX_PROFILE=<path>` — point at an alternative SBPL profile (absolute
   path, or relative to the universal wrapper's directory). Replaces the base
@@ -101,6 +117,12 @@ The sandbox bounds *writes* — it does not bound *reads* or *network*. Be aware
   the network or firewall layer if they matter. macOS only — no Linux
   backend.
 <!-- os:end -->
+- `AI_SANDBOX_EXTRA_RW_DIRS` entries that are a git dir or a repository
+  work tree get a WARN: the raw grant has none of the read-only `config` /
+  `hooks/` layers, so the agent can make host git run commands. For a
+  linked worktree, launch from the worktree instead (with
+  `AI_SANDBOX_ALLOW_EXTERNAL_WORKTREES=1` when the repository is outside
+  `$HOME`). The grant itself still applies.
 - `AI_SANDBOX_ALLOW_DOCKER=1` — emit RW rules for
   `/var/run/docker.sock`, `~/.colima`, `~/.docker`. **Off by default.**
   **WARNING:** when on and the Docker / Colima daemon is running, the

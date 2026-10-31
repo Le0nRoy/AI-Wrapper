@@ -445,7 +445,9 @@ write inside WORKDIR cannot create that back-link). Failure WARNs and
 skips the bind; the launch continues. `AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR`
 does not relax it. **Behaviour change:** worktrees of repos outside
 `$HOME` (or under a `$HOME` dotfile dir) no longer get the shared `.git`
-bound automatically — grant it explicitly with `AI_SANDBOX_EXTRA_RW_DIRS`.
+bound automatically. Outside `$HOME` see B-ο (session opt-in); a raw
+`AI_SANDBOX_EXTRA_RW_DIRS` grant works but has no read-only layers and
+is WARNed.
 
 ### B-λ — worktree common dir: borrowed entries and host code execution (RESOLVED, 2026-10)
 
@@ -519,6 +521,94 @@ them), so the RO layers win on both OSes (`_extra_sandbox_setup` binds
 still come last).
 
 The WORKDIR's own `.git` is covered by B-ν.
+
+### B-ο — worktrees of repositories outside `$HOME` (MITIGATED, 2026-10, #13)
+
+B-ι bound a worktree's shared `.git` only strictly under `$HOME`, so git
+failed in worktrees of repos elsewhere (e.g. `/Data/projects`). The only
+workaround, `AI_SANDBOX_EXTRA_RW_DIRS=<repo>/.git`, grants plain RW with
+none of B-λ's read-only layers — exactly the host-code-execution path
+B-λ closes — and the wrapper's rejection WARN recommended it.
+
+**Mitigation.** `AI_SANDBOX_ALLOW_EXTERNAL_WORKTREES` (bool, default 0,
+category *sensitive*). Off keeps HOME-only eligibility; `$HOME`
+worktrees (and the verified `~/.local/share/<repo>/.git/modules/<name>`
+layout) never need it. On, `_wrapper_git_common_dir_ok` accepts a
+common dir outside `$HOME` only if:
+
+- `_wrapper_git_external_location_ok` accepts its realpath: not equal to
+  or below `/bin /boot /dev /etc /lib* /nix /opt /proc /root /run /sbin
+  /snap /sys /tmp /usr /var /Applications /Library /System /Users/Shared
+  /cores /private` (matched per path component, so `/etcx` is not
+  `/etc`; macOS `/tmp`, `/var`, `/etc` resolve under `/private`), not
+  containing `$HOME`, and with no dot-prefixed directory above the git
+  dir (another user's `~/.config/...`, `<repo>/.git/modules/<name>`).
+  Mount points (`/mnt`, `/media`, `/srv`, `/Volumes`) and other users'
+  `/home` / `/Users` dirs stay eligible.
+- every existing check passes unchanged: real directory, sensitive
+  classifier, `.git` / `<name>.git` basename and git shape, forward link
+  (WORKDIR's gitdir is exactly `<common>/worktrees/<name>`) and reverse
+  link (that entry's `gitdir`, not a symlink, resolves to exactly this
+  checkout's `.git`). The submodule exception stays HOME-only.
+
+The bind is the same as under `$HOME`: exactly the validated common dir
+RW, its `config`, `hooks/`, `worktrees/` (except this worktree's entry),
+the entry's `commondir` / `gitdir` / `config.worktree` and all submodule
+metadata read-only in both `AI_SANDBOX_ALLOW_GIT_CONFIG` modes, the #12
+scan limits (16 levels / 256 module dirs). No parent or sibling of the
+common dir is granted. On macOS the external ancestors of the common dir
+and (when it is outside `$HOME`) of WORKDIR get `file-read-metadata` on
+the literal path only — stat, no listing or reads. Accepting an
+external dir is logged (WARN).
+
+*Session-only.* The value comes from the host launch environment or
+this session's `s) Settings`. `_preset_autosave` never writes it and
+`_preset_autoload` ignores it with a WARN (also in the legacy shared
+file), so a saved, injected or historical preset — which a sandboxed
+agent may be able to write — cannot authorize access; an explicit launch
+value, including `=0`, is kept. The common-dir bind therefore moved from
+before the menu into `_apply_post_menu_binds` (common dir, then WORKDIR
+metadata, then this worktree's submodules, then credential binds) in the
+claude, codex, agy and copilot wrappers. The cursor-agent wrapper never
+bound the common dir and still does not. The host shell configuration
+that may set the variable is not proven tamper-proof; separating
+persistent controls from agent-writable state is #48.
+
+*Raw RW grants.* `AI_SANDBOX_EXTRA_RW_DIRS` stays available. Both
+backends WARN when an accepted entry is a git dir or a work tree with a
+`.git` dir, unless that git dir is WORKDIR's own `.git` or the common dir
+the wrapper bound with read-only layers (those layers still win, see
+B-λ). The WARN points to the opt-in; the grant is not refused.
+
+**Residual risks.**
+
+- *Links are not ownership.* Worktree links are ordinary files. They
+  prove the checkout and the repository name each other, not that the
+  user meant to expose the repository. Anyone who can already write the
+  external repository on the host (another local user with write access
+  to a shared repo, an earlier unprotected session) can create a
+  matching entry. The opt-in is the user's decision for the session.
+- *Git ownership.* Eligibility uses `git rev-parse` without overriding
+  `safe.directory`: a repository git considers owned by someone else is
+  not discovered and not bound. No separate UID rule was added, so
+  shared repositories git accepts (via `safe.directory`) are eligible.
+  Tests only cover repos owned by the test user.
+- *Unchanged B-λ / B-ν residuals:* metadata absent at launch, config
+  indirection, content written by earlier sessions, the existing creation
+  of a missing top-level `hooks/` and `config.worktree` in the validated
+  common dir, and the check-to-mount window (#14). The location guard is
+  separate from `_sandbox_sensitive_dir_kind` / the macOS lists (#15).
+
+Coverage: `tests/test_external_worktree.bash` (CI `smoke-linux` and
+`smoke-macos`): location guard, opt-in off/on, HOME regression, prefix
+and alias paths, borrowed / forged / foreign backlinks, crafted
+commondir, refused real-Git locations, preset save/load exclusion and
+injection, raw-RW WARN, a pty-driven `s) Settings` toggle, and native
+enforcement (commit, branch, objects / refs / index; shared config,
+hooks, worktrees, pointers and submodule metadata denied; sibling repo
+and canary unreadable and unchanged). The macOS `--meta-bind` flag
+shape is also checked on Linux with a simulated `_wrapper_os`; that is
+not enforcement evidence.
 
 ### B-ν — WORKDIR's own git metadata (MITIGATED, 2026-10, #10)
 
