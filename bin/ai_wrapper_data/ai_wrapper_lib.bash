@@ -904,7 +904,7 @@ _wrapper_protect_git_dir() {
 }
 
 # Protect this linked worktree's own submodule git dirs
-# (<common>/worktrees/<name>/modules, found before the menu by
+# (<common>/worktrees/<name>/modules, found just before by
 # _wrapper_bind_git_common_dir) with the final AI_SANDBOX_ALLOW_GIT_CONFIG:
 # chains pinned and pointers read-only in both modes, config / hooks/ only
 # in protected mode. The shared <common>/modules stay read-only regardless.
