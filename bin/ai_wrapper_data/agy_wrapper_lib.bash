@@ -1409,15 +1409,21 @@ _agy_canonical_path() {
 _AGY_LATE_BIND_HOOKS=(_extra_post_menu_setup _extra_sandbox_setup)
 
 # Succeeds when PATH (canonicalized) lies inside a location the sandbox
-# exposes read-write: WORKDIR, the profile dir, the wrapper's fixed RW binds,
-# AI_SANDBOX_EXTRA_RW_DIRS, every --bind already in WRAPPER_FLAGS, and the
-# macOS shared temp dirs. Args: PATH PROFILE_DIR
+# exposes read-write: WORKDIR, the profile dir, XDG_RUNTIME_DIR, the Linux
+# host dirs whose RW opt-in is on (~/bin, ~/ai-wrapper/.agents, ~/Android;
+# read-only or absent otherwise), AI_SANDBOX_EXTRA_RW_DIRS, every --bind
+# already in WRAPPER_FLAGS, and the macOS shared temp dirs. A parent grant
+# still covers a protected child. Args: PATH PROFILE_DIR
 _agy_path_sandbox_writable() {
     local path profile_dir="${2}" root
     path="$(_agy_canonical_path "${1}")"
-    local -a roots=("$(pwd -P)" "${profile_dir}" "${HOME}/bin" "${HOME}/.kind"
-        "${HOME}/kind_dot_kube" "${HOME}/ai-wrapper/.agents" "${HOME}/Android"
-        "${XDG_RUNTIME_DIR:-}")
+    local -a roots=("$(pwd -P)" "${profile_dir}" "${XDG_RUNTIME_DIR:-}")
+    # shellcheck disable=SC2154  # _wrapper_os is set by ai_wrapper_lib.bash
+    if [[ "${_wrapper_os}" == "Linux" ]]; then
+        [[ "${AI_SANDBOX_ALLOW_BIN_RW:-0}" == "1" ]] && roots+=("${HOME}/bin")
+        [[ "${AI_SANDBOX_ALLOW_AGENTS_SKILLS_RW:-0}" == "1" ]] && roots+=("${HOME}/ai-wrapper/.agents")
+        [[ "${AI_SANDBOX_ALLOW_ANDROID:-0}" == "1" ]] && roots+=("${HOME}/Android")
+    fi
     local -a flags=(${WRAPPER_FLAGS[@]+"${WRAPPER_FLAGS[@]}"})
     local i
     for (( i = 0; i < ${#flags[@]}; i++ )); do
@@ -1432,7 +1438,6 @@ _agy_path_sandbox_writable() {
             [[ -n "${root}" ]] && roots+=("$(_agy_expand_tilde "${root}")")
         done
     fi
-    # shellcheck disable=SC2154  # _wrapper_os is set by ai_wrapper_lib.bash
     if [[ "${_wrapper_os}" == "Darwin" ]]; then
         roots+=(/tmp /private/tmp "$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null)" \
             "$(getconf DARWIN_USER_CACHE_DIR 2>/dev/null)")

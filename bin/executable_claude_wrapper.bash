@@ -33,7 +33,6 @@ set -u -o pipefail
 : "${XDG_RUNTIME_DIR:=}"
 : "${COLORTERM:=}"
 : "${TERM_PROGRAM:=}"
-: "${KIND_EXPERIMENTAL_PROVIDER:=}"
 
 source "$(dirname "${BASH_SOURCE[0]}")/ai_agent_universal_wrapper.bash"
 

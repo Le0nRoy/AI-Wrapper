@@ -67,6 +67,7 @@ that launch a real sandbox.
 | `test_macos_ro_overlays.bash` | git repos in fake home; stub `getconf`/`sandbox-exec` off macOS | git; sandbox-exec for native checks | rule rendering + mocked dry-run; native part skipped | full, native write denial (missing sandbox-exec fails) |
 | `test_codex_wrapper.bash`, `test_agy_wrapper.bash`, `test_copilot_wrapper.bash` | git repos, sqlite db, stub clients in fake home; bwrap e2e | git, python3 (sqlite3, tomllib optional), bwrap for e2e | full with bwrap; e2e skipped without | argv/unit parts; bwrap e2e skipped |
 | `test_bind_hardening.bash` | git repos (incl. a worktree with nested submodules via local file:// clones), stub codex in fake home, temp alias dir under `/tmp` (macOS) | git, perl; bwrap or sandbox-exec for e2e | full with bwrap; e2e skipped without | full: native worktree write-denial e2e (missing sandbox-exec fails) |
+| `test_linux_host_binds.bash` | fake home under `$HOME` (synthetic `~/bin`, skills, Android, Kind and kube dirs), stub `bwrap`/`sysctl` dir, a synthetic UNIX socket served by python3 | bash, python3; bwrap for native probes | full: argv gates, agy trust grants, native denial/persistence (missing bwrap fails) | agy trust grants only; Linux parts skipped |
 | `test_sensitive_path_parity.bash` | fake home under `$HOME`; stub `getconf`/`sandbox-exec` off macOS; refusals from `/etc` (never granted to a client) | bash; bwrap or sandbox-exec for native refusals | classifier tables + mocked macOS backend; native Linux refusals need bwrap (missing bwrap fails) | full, native refusals incl. `/private/etc` |
 | `test_external_worktree.bash` | git repos in fake home and in a sibling dir outside it (real `$HOME` or the checkout's `tests/`), one in the system temp dir, preset files, stub codex; drives the interactive menu through a pty | git, perl, python3; bwrap or sandbox-exec for e2e | full with bwrap; e2e skipped without | full: native external-worktree write/read denial (missing sandbox-exec fails) |
 | `test_workdir_git_protection.bash` | git repos (normal, worktree, bare, scaffold, nested submodules via local file:// clones) and stub clients in fake home | git, perl, python3; bwrap or sandbox-exec for e2e | full with bwrap; missing bwrap fails | full: native WORKDIR git metadata write denial (missing sandbox-exec fails) |
@@ -83,10 +84,11 @@ is the local equivalent. Keep both in sync when adding a test file.
   identity.
 - `smoke-linux`: bubblewrap installed; sandbox, extra-binds, isolation
   canaries (with e2e), codex, bind-hardening, external worktrees,
-  WORKDIR git metadata, macOS RO-overlay rendering, agy, copilot.
+  WORKDIR git metadata, macOS RO-overlay rendering, agy, copilot, Linux
+  host-path gates (native ~/bin / skills / Android / Tailscale / Kind probes).
 - `smoke-macos`: sandbox, macOS-only, extra-binds, bind-hardening,
-  external worktrees, WORKDIR git metadata and RO overlays (native write denial), preset
-  suite.
+  external worktrees, WORKDIR git metadata and RO overlays (native write denial),
+  agy trust grants for the Linux host-path gates, preset suite.
 
 ## Reading results
 

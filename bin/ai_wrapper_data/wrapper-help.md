@@ -102,6 +102,37 @@ The sandbox bounds *writes* — it does not bound *reads* or *network*. Be aware
   restored from the per-workdir preset (a preset entry is ignored with a
   WARN). The worktree links are ordinary files, not proof that you own
   the repository; turn it on only for your own repositories.
+<!-- os:linux -->
+- `AI_SANDBOX_ALLOW_BIN_RW=1` — bind `~/bin` read-write. Off by default:
+  `~/bin` is read-only, so its programs still run (it is first on the
+  sandbox PATH) but cannot be added, replaced or deleted. On, the agent
+  can plant programs you later run outside the sandbox. Red banner.
+- `AI_SANDBOX_ALLOW_AGENTS_SKILLS_RW=1` — bind the shared skill source
+  `~/ai-wrapper/.agents` read-write. Off by default (read-only):
+  `setup_skills.bash` copies it into every client's skill directory, so a
+  writable copy lets the agent rewrite skills other sessions load. Red
+  banner.
+- `AI_SANDBOX_ALLOW_ANDROID=1` — bind `~/Android` (SDK, emulator images,
+  debug keystores) read-write. Off by default: not visible in the sandbox.
+- `AI_SANDBOX_PASS_TAILSCALE=1` — bind `/run/tailscale/tailscaled.sock`
+  read-only. Off by default: no socket in the sandbox. The read-only bind
+  only stops the socket file being replaced or removed; it does **not**
+  make the Tailscale API read-only. `tailscaled` authorises each LocalAPI
+  request by the caller's user ID, and the sandbox runs as your user, so
+  the agent can do whatever `tailscaled` allows your user (with
+  `tailscale set --operator=$USER`, that includes changing settings).
+  Red banner.
+
+These four controls are Linux-only and ordinary settings: saved to and
+restored from the per-workdir preset like the other toggles. A path
+missing on the host is skipped, never created. An explicit wider grant
+still applies: launching from (or `AI_SANDBOX_EXTRA_RW_DIRS` on) a
+directory at or above `~/bin` or `~/ai-wrapper/.agents` makes that tree
+writable whatever these toggles say. Kind support was removed: `~/.kind`
+and `~/kind_dot_kube` are never mounted and `KIND_EXPERIMENTAL_PROVIDER`
+is not passed; Kubernetes access is `AI_SANDBOX_PASS_KUBE` (`~/.kube`,
+`KUBECONFIG`).
+<!-- os:end -->
 <!-- os:darwin -->
 - `AI_SANDBOX_PROFILE=<path>` — point at an alternative SBPL profile (absolute
   path, or relative to the universal wrapper's directory). Replaces the base
