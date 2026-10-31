@@ -55,10 +55,10 @@ _run_sandboxed_agent_impl() {
     # agent runs without access it was promised, which surfaces as confusing
     # failures deep inside the sandboxed command. Callers must gate optional
     # binds at the call site (e.g. `[[ -e X ]] && WRAPPER_FLAGS+=(--bind X)`).
-    local -a binds_rw=() binds_ro=() binds_meta=()
+    local -a binds_rw=() binds_ro=() binds_meta=() binds_pin=()
     while [[ $# -gt 0 && "${1}" != "--" ]]; do
         case "${1}" in
-            --bind|--ro-bind|--meta-bind)
+            --bind|--ro-bind|--meta-bind|--pin)
                 # Single positional SRC. sandbox-exec cannot remap paths, so
                 # there's no DST. A legacy two-arg call `--bind SRC DST` would
                 # now consume DST as the next flag in the loop and almost
@@ -70,6 +70,12 @@ _run_sandboxed_agent_impl() {
                 # Used for path-traversal-only access (e.g. parent dirs of a
                 # worktree's shared .git that git needs to canonicalize but
                 # not actually read). Tighter than --ro-bind.
+                #
+                # --pin grants nothing: it write-denies the literal path and
+                # its ancestors below HOME (_append_pin_rules) so a
+                # directory inside a writable area cannot be renamed,
+                # removed or replaced; its children are unaffected. The
+                # Linux equivalent is a self-bind (_wrapper_add_pin).
                 if [[ $# -lt 2 ]]; then
                     echo_log "ERROR" "[${tag}] ${1} requires SRC (got: ${*})"
                     return 2
@@ -89,6 +95,7 @@ _run_sandboxed_agent_impl() {
                     --bind)      binds_rw+=("${2}") ;;
                     --ro-bind)   binds_ro+=("${2}") ;;
                     --meta-bind) binds_meta+=("${2}") ;;
+                    --pin)       binds_pin+=("${2}") ;;
                 esac
                 shift 2
                 ;;
@@ -99,7 +106,7 @@ _run_sandboxed_agent_impl() {
                 # old two-arg form catches callers migrating from the
                 # pre-WS1 bubblewrap-shape vocabulary.
                 if [[ -e "${1}" ]]; then
-                    echo_log "ERROR" "[${tag}] Unexpected path '${1}' in flag position. Hint: --bind / --ro-bind / --meta-bind are single-arg (SRC only)."
+                    echo_log "ERROR" "[${tag}] Unexpected path '${1}' in flag position. Hint: --bind / --ro-bind / --meta-bind / --pin are single-arg (SRC only)."
                 else
                     echo_log "ERROR" "[${tag}] Unsupported sandbox flag: ${1}"
                 fi
@@ -137,6 +144,7 @@ _run_sandboxed_agent_impl() {
             if [[ -d "${_d}" ]]; then
                 binds_rw+=("${_d}")
                 _user_extra_bind_dirs+=("${_d}")
+                _sandbox_warn_extra_rw_git "${tag}" "${_d}"
             else
                 echo_log "WARN" "[${tag}] AI_SANDBOX_EXTRA_RW_DIRS: skipping '${_d}' (not a directory)"
             fi
@@ -194,16 +202,14 @@ _run_sandboxed_agent_impl() {
         echo_log "ERROR" "[${tag}] Workdir path is unsafe for SBPL interpolation: ${resolved_workdir}"
         return 1
     fi
-    # Refuse to sandbox with a WORKDIR that's a system root or $HOME itself:
-    # the profile grants RW on (subpath WORKDIR), so a too-broad cwd would
-    # effectively neutralise the write fence. Caller must cd into a project
-    # directory first.
-    case "${resolved_workdir}" in
-        /|/Users|/Users/Shared|/private|/private/tmp|/private/var|/private/var/tmp|/private/var/folders|/tmp|/var|/var/tmp|/etc|/usr|/usr/local|/bin|/sbin|/System|/Applications|/Library)
-            echo_log "ERROR" "[${tag}] Refusing to sandbox with WORKDIR=${resolved_workdir} (top-level or system location). cd into a project directory first."
-            return 1
-            ;;
-    esac
+    # Sensitive-location refusals. Classification is shared with the Linux
+    # backend (_sandbox_sensitive_dir_kind in ai_agent_universal_wrapper.bash,
+    # which sources this file); enforcement stays macOS-specific. Without the
+    # classifier every guard below would silently pass, so fail closed.
+    if ! declare -f _sandbox_sensitive_dir_kind >/dev/null 2>&1; then
+        echo_log "ERROR" "[${tag}] sensitive-path classifier _sandbox_sensitive_dir_kind is not loaded; refusing to launch. Run through ai_agent_universal_wrapper.bash's run_sandboxed_agent."
+        return 1
+    fi
     # Resolve HOME the same way we resolved WORKDIR so the comparisons below
     # survive macOS's /var → /private/var symlink (and any user-installed
     # symlinks in the HOME chain). Fall back to the raw HOME%/ when realpath
@@ -214,26 +220,35 @@ _run_sandboxed_agent_impl() {
         resolved_home="$(_realpath "${HOME}")" || resolved_home="${HOME%/}"
         resolved_home="${resolved_home%/}"
     fi
-    if [[ "${AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR:-}" != "1" && -n "${resolved_home}" && "${resolved_workdir}" == "${resolved_home}" ]]; then
-        echo_log "ERROR" "[${tag}] Refusing to sandbox with WORKDIR=\$HOME (${HOME}); that would grant RW on the entire home directory. cd into a subdirectory first, or set AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 to override."
-        return 1
-    fi
-    # Refuse WORKDIRs that sit on top of well-known credential / browser-data
-    # locations. The `(allow file* (subpath WORKDIR))` rule grants RW on the cwd
-    # unconditionally; picking a sensitive WORKDIR write-exposes files that the
-    # (default-deny) read fence would not even let the agent read. Network plus
-    # RW on a bad WORKDIR is sufficient for exfiltration of anything the agent
-    # itself writes there.
-    # Bypass with AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 when this is intentional
-    # (e.g. you're explicitly maintaining one of these directories).
-    if [[ "${AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR:-}" != "1" && -n "${resolved_home}" ]]; then
-        case "${resolved_workdir}" in
-            "${resolved_home}"/.*|"${resolved_home}"/Library|"${resolved_home}"/Library/*)
+    # Refuse to sandbox with a WORKDIR that's a system root, $HOME itself, or
+    # a well-known credential / browser-data location (HOME dotfile dirs,
+    # ~/Library): the profile grants RW on (subpath WORKDIR) unconditionally,
+    # so a too-broad cwd neutralises the write fence and write-exposes files
+    # the (default-deny) read fence would not even let the agent read.
+    # Network plus RW on a bad WORKDIR is sufficient for exfiltration of
+    # anything the agent itself writes there. A system WORKDIR is refused
+    # unconditionally on macOS; bypass the $HOME / dotfile / ~/Library
+    # refusals with AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 when this is
+    # intentional (e.g. you're explicitly maintaining one of these
+    # directories).
+    case "$(_sandbox_sensitive_dir_kind "${resolved_workdir}" "${resolved_home}")" in
+        system)
+            echo_log "ERROR" "[${tag}] Refusing to sandbox with WORKDIR=${resolved_workdir} (top-level or system location). cd into a project directory first."
+            return 1
+            ;;
+        home)
+            if [[ "${AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR:-}" != "1" ]]; then
+                echo_log "ERROR" "[${tag}] Refusing to sandbox with WORKDIR=\$HOME (${HOME}); that would grant RW on the entire home directory. cd into a subdirectory first, or set AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 to override."
+                return 1
+            fi
+            ;;
+        dotfile)
+            if [[ "${AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR:-}" != "1" ]]; then
                 echo_log "ERROR" "[${tag}] Refusing to sandbox with WORKDIR=${resolved_workdir} (under HOME dotfile dir or ~/Library — granting RW here likely exposes credentials). cd into a non-sensitive project directory, or set AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 to override."
                 return 1
-                ;;
-        esac
-    fi
+            fi
+            ;;
+    esac
 
     # Same sensitivity guard applied to every directory accepted from
     # AI_SANDBOX_EXTRA_RW_DIRS / AI_SANDBOX_EXTRA_RO_DIRS. Without this, a
@@ -247,25 +262,20 @@ _run_sandboxed_agent_impl() {
         local _sens_bind _sens_resolved
         for _sens_bind in "${_user_extra_bind_dirs[@]+"${_user_extra_bind_dirs[@]}"}"; do
             _sens_resolved="$(_realpath "${_sens_bind}" 2>/dev/null)" || _sens_resolved="${_sens_bind%/}"
-            _sens_resolved="${_sens_resolved%/}"
-            case "${_sens_resolved}" in
-                /|/Users|/Users/Shared|/private|/private/tmp|/private/var|/private/var/tmp|/private/var/folders|/tmp|/var|/var/tmp|/etc|/usr|/usr/local|/bin|/sbin|/System|/Applications|/Library)
+            case "$(_sandbox_sensitive_dir_kind "${_sens_resolved}" "${resolved_home}")" in
+                system)
                     echo_log "ERROR" "[${tag}] Refusing extra bind '${_sens_bind}' (top-level or system location). Remove it from AI_SANDBOX_EXTRA_RW_DIRS/AI_SANDBOX_EXTRA_RO_DIRS, or set AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 to override."
                     return 1
                     ;;
-            esac
-            if [[ -n "${resolved_home}" ]]; then
-                if [[ "${_sens_resolved}" == "${resolved_home}" ]]; then
+                home)
                     echo_log "ERROR" "[${tag}] Refusing extra bind '${_sens_bind}' (== \$HOME). Set AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 to override."
                     return 1
-                fi
-                case "${_sens_resolved}" in
-                    "${resolved_home}"/.*|"${resolved_home}"/Library|"${resolved_home}"/Library/*)
-                        echo_log "ERROR" "[${tag}] Refusing extra bind '${_sens_bind}' (under HOME dotfile dir or ~/Library — grants read/write on credentials). Set AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 to override."
-                        return 1
-                        ;;
-                esac
-            fi
+                    ;;
+                dotfile)
+                    echo_log "ERROR" "[${tag}] Refusing extra bind '${_sens_bind}' (under HOME dotfile dir or ~/Library — grants read/write on credentials). Set AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 to override."
+                    return 1
+                    ;;
+            esac
         done
         unset _sens_bind _sens_resolved
     fi
@@ -307,6 +317,21 @@ _run_sandboxed_agent_impl() {
             _wd_parent="${_wd_parent%/*}"
         done
         unset _wd_parent
+    fi
+
+    # The walks above stop at HOME, and the base profile only grants
+    # /Users and HOME itself, so HOME's own ancestors are stat-able only
+    # when HOME is /Users/<name>. A HOME one level deeper (a test fake HOME,
+    # /Volumes/<disk>/Users/<name>) made realpath()/git fail with
+    # "Invalid path '<HOME parent>': Operation not permitted". Grant
+    # metadata on each HOME ancestor too.
+    if [[ -n "${resolved_home}" ]]; then
+        local _home_parent="${resolved_home%/*}"
+        while [[ -n "${_home_parent}" ]]; do
+            binds_meta+=("${_home_parent}")
+            _home_parent="${_home_parent%/*}"
+        done
+        unset _home_parent
     fi
 
     # Same ancestor-metadata rationale as the WORKDIR walk above, applied
@@ -641,9 +666,10 @@ _run_sandboxed_agent_impl() {
     # vs directories (e.g. Library/Caches/claude-cli-nodejs) and avoids
     # ambiguity around whether `subpath` on a regular file is intended to match.
     #
-    # --ro-bind: now allowlists the path under file-read* (was no-op before the
-    # S1 default-deny rewrite). Per-call binds compose with the static read
-    # allowlist in claude_wrapper.sb.
+    # --ro-bind: allowlists the path under file-read* and denies writes to it
+    # (_append_ro_deny_rules), so an RO bind nested under an RW --bind or
+    # WORKDIR is actually read-only. Per-call binds compose with the static
+    # read allowlist in claude_wrapper.sb.
     local profile; profile="$(<"${profile_path}")"
 
     # WS3 / U-C: sanity-check the loaded profile body. An AI_SANDBOX_PROFILE
@@ -694,7 +720,7 @@ _run_sandboxed_agent_impl() {
 
     # Downstream extension hook (see AI_WRAPPER_EXTRA_PROFILE in
     # bin/executable_claude_wrapper.bash). Fires before binds are baked into
-    # the SBPL profile so the callback can append to binds_rw / binds_ro /
+    # the SBPL profile so the callback can append to binds_rw / binds_ro / binds_pin /
     # binds_meta and mutate env_allowlist. Runs in the outer function scope
     # (not the subshell), matching the arrays' scope.
     if declare -f _extra_sandbox_setup >/dev/null 2>&1; then
@@ -716,6 +742,17 @@ _run_sandboxed_agent_impl() {
         # the kernel's path canonicalization on intermediate dirs (e.g. for
         # git worktree's gitdir-line validation) without exposing siblings.
         extra_rules="$(_append_bind_rules "${tag}" "file-read-metadata" "--meta-bind" "${binds_meta[@]}" --force-literal)" || return 1
+        profile+="${extra_rules}"
+    fi
+    # --ro-bind write denial, rendered last so it overrides every allow
+    # above (base profile, WORKDIR, --bind). See _append_ro_deny_rules for
+    # the nesting rule that replaces bwrap's mount-order semantics.
+    if [[ ${#binds_pin[@]} -gt 0 ]]; then
+        extra_rules="$(_append_pin_rules "${tag}" "${resolved_home}" "${binds_pin[@]}")" || return 1
+        profile+="${extra_rules}"
+    fi
+    if [[ ${#binds_ro[@]} -gt 0 ]]; then
+        extra_rules="$(_append_ro_deny_rules "${tag}" "${resolved_home}" "${binds_ro[@]}" -- "${binds_rw[@]+"${binds_rw[@]}"}")" || return 1
         profile+="${extra_rules}"
     fi
 
@@ -931,18 +968,39 @@ _validate_sandbox_path() {
     return 0
 }
 
+# Resolve a bind path for SBPL interpolation and print it without a trailing
+# slash. Signature: _resolve_bind_target TAG FLAG_NAME PATH
+# The path is realpath-resolved (rules must name the canonical path the
+# kernel matches, e.g. /private/tmp not /tmp) and validated for SBPL safety;
+# bare "/" (or any path that collapses to empty after trailing-slash strip)
+# is rejected to avoid emitting a malformed `(subpath "")` rule.
+_resolve_bind_target() {
+    local tag="${1}" flag_name="${2}" p="${3}" resolved stripped
+    if ! resolved="$(_realpath "${p}")" || [[ -z "${resolved}" ]]; then
+        echo_log "ERROR" "[${tag}] Could not resolve ${flag_name} path: ${p}"
+        return 1
+    fi
+    if ! _validate_sandbox_path "${resolved}"; then
+        echo_log "ERROR" "[${tag}] ${flag_name} path is unsafe for SBPL interpolation: ${resolved}"
+        return 1
+    fi
+    stripped="${resolved%/}"
+    if [[ -z "${stripped}" ]]; then
+        echo_log "ERROR" "[${tag}] ${flag_name} path '${resolved}' is too broad to sandbox (would emit an empty subpath rule)."
+        return 1
+    fi
+    printf '%s' "${stripped}"
+}
+
 # Emit SBPL bind rules to stdout for a list of paths.
 # Signature: _append_bind_rules TAG RULE_PREFIX FLAG_NAME [PATH...]
 #   TAG          — log tag for error messages
 #   RULE_PREFIX  — SBPL rule head (e.g. "file*", "file-read*")
 #   FLAG_NAME    — CLI flag name for diagnostics (e.g. "--bind", "--ro-bind")
 #   PATH...      — zero or more paths to bind
-# Each path is realpath-resolved and validated for SBPL safety; bare "/" (or
-# any path that collapses to empty after trailing-slash strip) is rejected to
-# avoid emitting a malformed `(subpath "")` rule that would surprise the SBPL
-# parser. Directories use `(subpath ...)`, files use `(literal ...)`. Output
-# is concatenated by the caller; errors go to stderr and produce a non-zero
-# return.
+# Each path goes through _resolve_bind_target. Directories use
+# `(subpath ...)`, files use `(literal ...)`. Output is concatenated by the
+# caller; errors go to stderr and produce a non-zero return.
 _append_bind_rules() {
     local tag="${1}" rule_prefix="${2}" flag_name="${3}"
     shift 3
@@ -959,26 +1017,132 @@ _append_bind_rules() {
             paths+=("${arg}")
         fi
     done
-    local p resolved stripped
+    local p stripped
     for p in "${paths[@]}"; do
-        if ! resolved="$(_realpath "${p}")" || [[ -z "${resolved}" ]]; then
-            echo_log "ERROR" "[${tag}] Could not resolve ${flag_name} path: ${p}"
-            return 1
-        fi
-        if ! _validate_sandbox_path "${resolved}"; then
-            echo_log "ERROR" "[${tag}] ${flag_name} path is unsafe for SBPL interpolation: ${resolved}"
-            return 1
-        fi
-        stripped="${resolved%/}"
-        if [[ -z "${stripped}" ]]; then
-            echo_log "ERROR" "[${tag}] ${flag_name} path '${resolved}' is too broad to sandbox (would emit an empty subpath rule)."
-            return 1
-        fi
-        if [[ "${force_literal}" == "1" || ! -d "${resolved}" ]]; then
+        stripped="$(_resolve_bind_target "${tag}" "${flag_name}" "${p}")" || return 1
+        if [[ "${force_literal}" == "1" || ! -d "${stripped}" ]]; then
             printf '\n(allow %s (literal "%s"))' "${rule_prefix}" "${stripped}"
         else
             printf '\n(allow %s (subpath "%s"))' "${rule_prefix}" "${stripped}"
         fi
     done
+    return 0
+}
+
+# SBPL operations denied on --ro-bind targets. file-write* covers write,
+# truncate, create, unlink/rename, chmod/chown and xattrs; file-link stops a
+# protected file from being hard-linked into a writable directory and then
+# modified through the new name.
+_SBPL_RO_DENY_OPS="file-write* file-link"
+
+# Emit SBPL write-deny rules for --ro-bind paths to stdout.
+# Signature: _append_ro_deny_rules TAG HOME RO_PATH... -- RW_PATH...
+#   HOME        — resolved $HOME (may be empty); ancestor pins stop below it
+#   RO_PATH...  — every --ro-bind path (wrapper, AI_SANDBOX_EXTRA_RO_DIRS,
+#                 _extra_sandbox_setup)
+#   RW_PATH...  — every --bind path, used only to carve exceptions
+#
+# Seatbelt has no mounts, so bwrap's "later mount wins" cannot be copied
+# literally, and the parser keeps RW and RO binds in separate arrays. The
+# rules are order-independent instead: an RO path is write-denied except
+# below an RW bind nested strictly inside it ("most specific bind wins").
+# That reproduces the worktree layout (RW common dir -> RO worktrees/ -> RW
+# own entry -> RO commondir/gitdir) and means a broader or equal RW bind
+# (WORKDIR, AI_SANDBOX_EXTRA_RW_DIRS) never neutralises an RO overlay.
+# The rules are appended after every allow, and Seatbelt applies the last
+# matching rule.
+#
+# Every ancestor directory of an RO path (and the root of each nested RW
+# exception) is also write-denied as a literal. Seatbelt matches paths, so
+# renaming a writable parent away, editing the RO file under its new name
+# and renaming it back would bypass the subpath rule; bwrap mount points
+# cannot be moved like that. Literal denial blocks rename/rmdir/chmod of the
+# directory itself while leaving its other children writable. Pins stop
+# below $HOME: $HOME and its ancestors have no write grant in the profile,
+# so pinning them adds nothing.
+_append_ro_deny_rules() {
+    local tag="${1}" home="${2%/}"
+    shift 2
+    local -a ro_paths=() rw_paths=() pins=()
+    local resolved
+    while [[ $# -gt 0 && "${1}" != "--" ]]; do
+        resolved="$(_resolve_bind_target "${tag}" "--ro-bind" "${1}")" || return 1
+        ro_paths+=("${resolved}")
+        shift
+    done
+    [[ "${1:-}" == "--" ]] && shift
+    local p
+    for p in "$@"; do
+        [[ -z "${p}" ]] && continue
+        resolved="$(_resolve_bind_target "${tag}" "--bind" "${p}")" || return 1
+        rw_paths+=("${resolved}")
+    done
+
+    local ro rw exceptions ancestor pin seen
+    for ro in "${ro_paths[@]}"; do
+        if [[ -d "${ro}" ]]; then
+            exceptions=""
+            for rw in "${rw_paths[@]+"${rw_paths[@]}"}"; do
+                [[ "${rw}" == "${ro}"/* ]] || continue
+                if [[ -d "${rw}" ]]; then
+                    exceptions+=" (require-not (regex #\"^$(_regex_escape "${rw}")/\"))"
+                    pins+=("${rw}")
+                else
+                    exceptions+=" (require-not (literal \"${rw}\"))"
+                fi
+            done
+            if [[ -n "${exceptions}" ]]; then
+                printf '\n(deny %s (require-all (subpath "%s")%s))' "${_SBPL_RO_DENY_OPS}" "${ro}" "${exceptions}"
+            else
+                printf '\n(deny %s (subpath "%s"))' "${_SBPL_RO_DENY_OPS}" "${ro}"
+            fi
+        else
+            printf '\n(deny %s (literal "%s"))' "${_SBPL_RO_DENY_OPS}" "${ro}"
+        fi
+        ancestor="${ro%/*}"
+        while [[ -n "${ancestor}" && "${ancestor}" != "${home}" ]]; do
+            pins+=("${ancestor}")
+            ancestor="${ancestor%/*}"
+        done
+    done
+
+    # Linear de-duplication: bash 3.2 has no associative arrays.
+    local -a unique_pins=()
+    for pin in "${pins[@]+"${pins[@]}"}"; do
+        for seen in "${unique_pins[@]+"${unique_pins[@]}"}"; do
+            [[ "${seen}" == "${pin}" ]] && continue 2
+        done
+        unique_pins+=("${pin}")
+    done
+    if [[ ${#unique_pins[@]} -gt 0 ]]; then
+        printf '\n(deny file-write*'
+        for pin in "${unique_pins[@]}"; do
+            printf ' (literal "%s")' "${pin}"
+        done
+        printf ')'
+    fi
+    return 0
+}
+
+# Emit one SBPL literal write deny for --pin paths and their ancestors
+# below HOME. Signature: _append_pin_rules TAG HOME PATH...
+# Same pin semantics as the ancestor pins in _append_ro_deny_rules (blocks
+# rename/rmdir/chmod of the directory itself, not writes to its children),
+# for roots that have no --ro-bind child to derive a pin from. Rendered
+# after every allow; denies need no ordering among themselves.
+_append_pin_rules() {
+    local tag="${1}" home="${2%/}"
+    shift 2
+    local p resolved ancestor
+    printf '\n(deny file-write*'
+    for p in "$@"; do
+        resolved="$(_resolve_bind_target "${tag}" "--pin" "${p}")" || return 1
+        ancestor="${resolved}"
+        while [[ -n "${ancestor}" && "${ancestor}" != "${home}" ]]; do
+            printf ' (literal "%s")' "${ancestor}"
+            ancestor="${ancestor%/*}"
+        done
+    done
+    printf ')'
     return 0
 }

@@ -13,7 +13,7 @@
 #
 # BIND_FLAGS on Linux are bwrap-shaped: --bind SRC DST / --ro-bind SRC DST.
 # BIND_FLAGS on macOS are single-arg (see macos_sandbox_exec.bash header):
-# --bind SRC / --ro-bind SRC / --meta-bind SRC.
+# --bind SRC / --ro-bind SRC / --meta-bind SRC / --pin SRC.
 # Callers that need to run on both OSes must branch on `uname -s` themselves
 # when building BIND_FLAGS, same as executable_claude_wrapper.bash does.
 
@@ -49,15 +49,18 @@ _sandbox_pass_env_add() {
 #             ~/Library), where credentials live
 # and returns 0; prints nothing and returns 1 when PATH is not sensitive.
 # Pure string classification: callers pass an already-resolved PATH and
-# HOME (trailing slashes are stripped here). Single source for the Linux
-# backend's WORKDIR and AI_SANDBOX_EXTRA_{RW,RO}_DIRS refusals and the
-# wrapper-side git-worktree bind guard (ai_wrapper_lib.bash); the lists
-# match the macOS backend's extra-dir refusal (macos_sandbox_exec.bash).
+# HOME (trailing slashes are stripped here). Single source for both
+# backends' WORKDIR and AI_SANDBOX_EXTRA_{RW,RO}_DIRS refusals (Linux below,
+# macOS in macos_sandbox_exec.bash; each backend keeps its own override
+# policy) and the wrapper-side git-worktree bind guard (ai_wrapper_lib.bash).
+# System entries are exact roots, not subtrees. On macOS /tmp, /var and
+# /etc are listed with their canonical /private/... targets, since callers
+# pass realpath-resolved paths.
 _sandbox_sensitive_dir_kind() {
     local path="${1%/}" home="${2%/}"
     if [[ "$(uname -s)" == "Darwin" ]]; then
         case "${path}" in
-            ""|/|/Users|/Users/Shared|/private|/private/tmp|/private/var|/private/var/tmp|/private/var/folders|/tmp|/var|/var/tmp|/etc|/usr|/usr/local|/bin|/sbin|/System|/Applications|/Library)
+            ""|/|/Users|/Users/Shared|/private|/private/tmp|/private/var|/private/var/tmp|/private/var/folders|/private/etc|/tmp|/var|/var/tmp|/etc|/usr|/usr/local|/bin|/sbin|/System|/Applications|/Library)
                 echo system; return 0 ;;
         esac
     else
@@ -77,6 +80,28 @@ _sandbox_sensitive_dir_kind() {
             if [[ "$(uname -s)" == "Darwin" ]]; then echo dotfile; return 0; fi ;;
     esac
     return 1
+}
+
+# Warn when an accepted AI_SANDBOX_EXTRA_RW_DIRS entry DIR is a git dir or
+# a work tree with a .git dir: the raw grant gets none of the read-only
+# config / hooks/ overlays the wrapper puts on git metadata it binds
+# itself. Silent for the metadata that does get them (WORKDIR's own .git,
+# the validated worktree common dir in _WRAPPER_GIT_COMMON_PROTECTED, set
+# by _wrapper_bind_git_common_dir). A warning only — the grant stays.
+# Args: AGENT_TAG DIR
+_sandbox_warn_extra_rw_git() {
+    local tag="${1}" dir="${2}" resolved gd="" wd IFS=$' \t\n'
+    resolved="$(cd "${dir}" 2>/dev/null && pwd -P)" || return 0
+    if [[ -f "${resolved}/HEAD" && -d "${resolved}/objects" && -d "${resolved}/refs" ]]; then
+        gd="${resolved}"
+    elif [[ -d "${resolved}/.git" ]]; then
+        gd="$(cd "${resolved}/.git" 2>/dev/null && pwd -P)" || return 0
+    fi
+    [[ -n "${gd}" ]] || return 0
+    [[ -n "${_WRAPPER_GIT_COMMON_PROTECTED:-}" && "${gd}" == "${_WRAPPER_GIT_COMMON_PROTECTED}" ]] && return 0
+    wd="$(pwd -P)"
+    [[ "${gd}" == "${wd%/}/.git" ]] && return 0
+    echo_log "WARNING" "[${tag}] AI_SANDBOX_EXTRA_RW_DIRS: '${dir}' exposes git metadata ${gd} read-write without the read-only config / hooks/ overlays: the agent can plant hooks or config (core.hooksPath, core.fsmonitor, aliases) that run on the host the next time you use git there. For a linked worktree, launch from the worktree instead (with AI_SANDBOX_ALLOW_EXTERNAL_WORKTREES=1 if the repository is outside \$HOME): its shared .git is then bound after link validation with config and hooks/ read-only."
 }
 
 run_sandboxed_agent() {
@@ -196,7 +221,7 @@ _run_sandboxed_agent_linux() {
     # wholesale would also flag those trusted binds and refuse to launch.
     # Tilde is preserved verbatim in preset files; quoted [[ -d ]] does not
     # expand it, so use parameter substitution to expand a leading ~ to $HOME.
-    local -a _user_extra_bind_dirs=()
+    local -a _user_extra_bind_dirs=() _user_extra_bwrap_flags=()
     local _extra_dirs_ifs _d
     if [[ -n "${AI_SANDBOX_EXTRA_RW_DIRS:-}" ]]; then
         _extra_dirs_ifs="${IFS}"; IFS=','
@@ -206,8 +231,9 @@ _run_sandboxed_agent_linux() {
             [[ -z "${_d}" ]] && continue
             _d="${_d/#\~/${HOME}}"
             if [[ -d "${_d}" ]]; then
-                extra_bwrap_flags+=(--bind "${_d}" "${_d}")
+                _user_extra_bwrap_flags+=(--bind "${_d}" "${_d}")
                 _user_extra_bind_dirs+=("${_d}")
+                _sandbox_warn_extra_rw_git "${agent_name}" "${_d}"
             else
                 echo_log "WARNING" "[$agent_name] AI_SANDBOX_EXTRA_RW_DIRS: skipping '${_d}' (not a directory)"
             fi
@@ -230,6 +256,16 @@ _run_sandboxed_agent_linux() {
         done
         IFS="${_extra_dirs_ifs}"
     fi
+
+    # User RW extras mount BEFORE the wrapper's own binds: bwrap's later
+    # mount wins, so an extra RW dir equal to or above WORKDIR (or a
+    # worktree's shared .git) must not cover the wrapper's read-only git
+    # metadata layers. User RO extras stay after them, so the wrapper's RW
+    # binds (git dir pin, worktree common dir) cannot reopen a directory
+    # the user asked to be read-only. (The macOS backend renders RO as
+    # order-independent denies instead.)
+    extra_bwrap_flags=("${_user_extra_bwrap_flags[@]+"${_user_extra_bwrap_flags[@]}"}" \
+        "${extra_bwrap_flags[@]+"${extra_bwrap_flags[@]}"}")
 
     # Setup paths
     WORKDIR="$(pwd)"

@@ -19,9 +19,6 @@ check_agent_binary
 
 WRAPPER_FLAGS=()
 
-# Bind shared Git metadata for worktrees after validating its path and links.
-_wrapper_bind_git_common_dir
-
 # Keep Copilot runtime state in its standard home paths while preventing broad
 # access to unrelated system directories. Symlinked config paths are refused
 # when they resolve outside $HOME or into credential directories.
@@ -41,7 +38,7 @@ if [[ $# -eq 0 && -t 0 && -t 1 ]]; then
     _preset_autosave
     # Apply toggle-dependent binds AFTER the menu so flips made in the
     # Settings sub-menu reach WRAPPER_FLAGS.
-    _apply_post_menu_binds
+    _apply_post_menu_binds || exit 1
 
     if declare -f _extra_post_menu_setup >/dev/null 2>&1; then
         _extra_post_menu_setup
@@ -64,7 +61,7 @@ if [[ $# -eq 0 && -t 0 && -t 1 ]]; then
 fi
 
 _preset_autoload
-_apply_post_menu_binds
+_apply_post_menu_binds || exit 1
 if declare -f _extra_post_menu_setup >/dev/null 2>&1; then
     _extra_post_menu_setup
 fi

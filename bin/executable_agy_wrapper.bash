@@ -16,8 +16,9 @@
 #   ~/.gemini-<name>/ (bound at ~/.gemini) instead of the default ~/.gemini,
 #   or pick "Account profile" from the s) Settings menu
 # - Full autonomy inside the OS sandbox: passes `--dangerously-skip-permissions`
-#   and configures `antigravity-cli/settings.json` with `always-proceed` tool
-#   and artifact policies, workspace trust, and outer-sandbox compatibility
+#   and checks (read-only) that `antigravity-cli/settings.json` has
+#   `always-proceed` tool and artifact policies, workspace trust, and
+#   outer-sandbox compatibility; the launch fails with instructions otherwise
 # - Git worktree support (shared .git bound RW), glab config bind when
 #   AI_SANDBOX_PASS_GITLAB=1, AI_WRAPPER_EXTRA_PROFILE plugin hooks
 
@@ -43,9 +44,6 @@ check_agent_binary
 # Sandbox flags - filesystem bindings. The ~/.gemini bind is added after the
 # menu by _bind_agy_account (AGY_ACCOUNT may change there).
 WRAPPER_FLAGS=()
-
-# Shared .git of a `git worktree` checkout (see ai_wrapper_lib.bash).
-_wrapper_bind_git_common_dir
 
 # User-installed CLI binaries (agy is commonly installed in ~/.local/bin).
 if [[ -d "${HOME}/.local/bin" ]]; then
@@ -75,7 +73,7 @@ if [[ $# -eq 0 && -t 0 && -t 1 ]]; then
     # Resolve AGY_ACCOUNT and apply toggle-dependent binds AFTER the
     # menu so flips made in the Settings sub-menu reach WRAPPER_FLAGS.
     _bind_agy_account
-    _apply_post_menu_binds
+    _apply_post_menu_binds || exit 1
 
     # Plugin post-menu hook (AI_WRAPPER_EXTRA_PROFILE); no-op when undefined.
     if declare -f _extra_post_menu_setup >/dev/null 2>&1; then
@@ -101,7 +99,7 @@ fi
 # up settings saved from an earlier interactive session in this workdir.
 _preset_autoload
 _bind_agy_account
-_apply_post_menu_binds
+_apply_post_menu_binds || exit 1
 if declare -f _extra_post_menu_setup >/dev/null 2>&1; then
     _extra_post_menu_setup
 fi

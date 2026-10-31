@@ -8,6 +8,9 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 FAKE_HOME="$(mktemp -d "${TMPDIR:-${HOME}}/ai-wrapper-skills-test.XXXXXX")"
 trap 'rm -rf "${FAKE_HOME}"' EXIT
+# shellcheck source=./lib_test_helpers.bash
+source "${REPO_ROOT}/tests/lib_test_helpers.bash"
+isolate_test_env "${FAKE_HOME}"
 
 mkdir -p \
     "${FAKE_HOME}/ai-wrapper/.agents" \

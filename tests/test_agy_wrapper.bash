@@ -3,7 +3,7 @@
 #   - agy orchestrate / resume / start argv construction
 #   - AGY_ACCOUNT validation and binding (invalid name, missing profile,
 #     default ~/.gemini symlink guards, credential-dir symlink refusal)
-#   - sandbox-internal permission setup (antigravity-cli/settings.json) and
+#   - read-only settings.json validation (antigravity-cli/settings.json) and
 #     managed skill sync (config/skills/orchestrator-mode/SKILL.md)
 #   - per-agent per-workdir presets (<hash>-agy.env isolation from claude/codex)
 #   - agy-help.md OS-conditional rendering
@@ -17,9 +17,7 @@ source "${REPO_ROOT}/tests/lib_test_helpers.bash"
 
 FAKE_HOME="$(mktemp -d "${HOME}/ai-wrapper-test.XXXXXX")"
 FAKE_HOME="$(cd "${FAKE_HOME}" && pwd -P)"
-REAL_HOME="${HOME}"
-export HOME="${FAKE_HOME}"
-export XDG_CONFIG_HOME="${FAKE_HOME}/.config"
+isolate_test_env "${FAKE_HOME}"
 mkdir -p "${FAKE_HOME}/work"
 
 cleanup() { rm -rf "${FAKE_HOME}"; }
@@ -27,10 +25,6 @@ trap cleanup EXIT
 
 OS="$(uname -s)"
 NL=$'\n'
-if ! command -v shasum >/dev/null 2>&1; then
-    shasum() { sha256sum; }
-    export -f shasum
-fi
 
 _load() {
     # shellcheck source=../bin/ai_agent_universal_wrapper.bash
@@ -243,11 +237,21 @@ del_brain_exists=0
 assert_eq "${del_brain_exists}" "1" "... without deleting conversation artifacts"
 
 # A failed artifact removal is propagated instead of reported as success.
+# Removal runs in the host helper (not rm), so make the artifact really
+# undeletable: a read-only conversation dir with content. Root ignores
+# directory permissions, so the check needs an unprivileged user.
 rm -f "${del_profile}/antigravity-cli/conversation_summaries.db"
-err_out="$( ( _load agy; rm() { return 1; }; _agy_delete_conversation "${del_profile}" "${del_cid}" ) 2>&1 )"; rc=$?
-assert_eq "${rc}" "1" "_agy_delete_conversation fails when an artifact cannot be removed"
-assert_contains "${err_out}" "Failed to remove ${del_profile}/antigravity-cli/brain/${del_cid}" \
-    "... and names the artifact left behind"
+if [[ "$(id -u)" != "0" ]]; then
+    : >"${del_profile}/antigravity-cli/brain/${del_cid}/artifact"
+    chmod 0500 "${del_profile}/antigravity-cli/brain/${del_cid}"
+    err_out="$( ( _load agy; _agy_delete_conversation "${del_profile}" "${del_cid}" ) 2>&1 )"; rc=$?
+    chmod 0700 "${del_profile}/antigravity-cli/brain/${del_cid}"
+    assert_eq "${rc}" "1" "_agy_delete_conversation fails when an artifact cannot be removed"
+    assert_contains "${err_out}" "Failed to remove ${del_profile}/antigravity-cli/brain/${del_cid}" \
+        "... and names the artifact left behind"
+else
+    echo "  skip - undeletable-artifact check (running as root)"
+fi
 
 # The picker reports partial batch failures instead of a blanket success.
 out="$(
@@ -273,18 +277,19 @@ assert_not_contains "${err_out}" "ValueError" "_agy_list_conversations: stderr s
 err_out="$( ( _load agy; AI_WRAPPER_DEBUG=1 _agy_list_conversations "${FAKE_HOME}/.gemini" "${FAKE_HOME}/work" "not-an-int" ) 2>&1 )"
 assert_contains "${err_out}" "ValueError" "_agy_list_conversations: stderr exposed when AI_WRAPPER_DEBUG=1"
 
-if command -v agy >/dev/null 2>&1; then
-    prompt_file="${REPO_ROOT}/bin/ai_wrapper_data/orchestrator-prompt.md"
-    ( cd "${FAKE_HOME}/work" && HOME="${REAL_HOME}" agy --dangerously-skip-permissions --prompt-interactive "$(cat "${prompt_file}")" --help >/dev/null 2>&1 )
-    assert_eq "$?" "0" "real agy accepts --dangerously-skip-permissions --prompt-interactive <orchestrator prompt>"
-    ( cd "${FAKE_HOME}/work" && HOME="${REAL_HOME}" agy --dangerously-skip-permissions --conversation=11111111-aaaa-bbbb-cccc-dddddddddddd --help >/dev/null 2>&1 )
-    assert_eq "$?" "0" "real agy accepts --dangerously-skip-permissions --conversation=<uuid>"
-else
-    echo "  skip - agy not installed; real-CLI argv acceptance not checked"
-fi
+# Real-CLI flag acceptance is not checked here: tests never launch an
+# installed, possibly authenticated agy (see isolate_test_env).
+echo "  skip - real agy argv acceptance (manual check only; no live clients in tests)"
 
 # ---------------------------------------------------------------------------
-echo "-- AGY_ACCOUNT binding, permissions, and skills sync"
+echo "-- AGY_ACCOUNT binding, settings validation, and skills sync"
+# Write a settings.json that passes validation for the given workspaces.
+_write_valid_settings() {
+    local file="${1}"
+    shift
+    mkdir -p "$(dirname "${file}")"
+    python3 -I -c 'import json,sys;print(json.dumps({"toolPermission":"always-proceed","artifactReviewPolicy":"always-proceed","allowNonWorkspaceAccess":True,"enableTerminalSandbox":False,"trustedWorkspaces":sys.argv[1:]}))' "$@" >"${file}"
+}
 _bind() {
     (
         cd "${FAKE_HOME}/work" || exit 1
@@ -316,23 +321,25 @@ assert_eq "${rc}" "1" "missing profile directory is an error"
 assert_contains "${out}" "Account profile directory not found: ${FAKE_HOME}/.gemini-missing" "... naming the missing dir"
 assert_contains "${out}" "Available profiles: alt" "... and listing existing profiles"
 
+alt_file="${FAKE_HOME}/.gemini-alt/antigravity-cli/settings.json"
+alt_before="$(cat "${alt_file}")"
 out="$(_bind 'alt')"; rc=$?
-assert_eq "${rc}" "0" "existing named profile binds"
+assert_eq "${rc}" "1" "settings.json lacking the sandbox settings fails the bind"
+assert_contains "${out}" '"toolPermission" is "request-review"; required: "always-proceed"' "... naming each wrong setting"
+assert_contains "${out}" '"enableTerminalSandbox" is true; required: false' "... including the terminal sandbox"
+assert_contains "${out}" "does not include the current workspace \"${FAKE_HOME}/work\"" "... and the missing workspace trust"
+assert_contains "${out}" "then relaunch" "... with how to retry"
+assert_eq "$(cat "${alt_file}")" "${alt_before}" "... and the wrapper never edits settings.json"
+
+_write_valid_settings "${alt_file}" /existing/workspace "${FAKE_HOME}/work"
+out="$(_bind 'alt')"; rc=$?
+assert_eq "${rc}" "0" "existing named profile binds once settings.json is valid"
 if [[ "${OS}" == "Darwin" ]]; then
     assert_eq "${out}" "--bind${NL}${FAKE_HOME}/.gemini-alt${NL}NAME=Antigravity CLI [alt]" "named profile: single-arg bind on macOS"
 else
     assert_eq "${out}" "--bind${NL}${FAKE_HOME}/.gemini-alt${NL}${FAKE_HOME}/.gemini${NL}NAME=Antigravity CLI [alt]" "named profile remapped to ~/.gemini"
 fi
 
-alt_settings="$(cat "${FAKE_HOME}/.gemini-alt/antigravity-cli/settings.json")"
-assert_contains "${alt_settings}" '"colorScheme": "tokyo night"' "existing user setting colorScheme preserved"
-assert_contains "${alt_settings}" '"vimInsertFirst": true' "existing user setting vimInsertFirst preserved"
-assert_contains "${alt_settings}" '"toolPermission": "always-proceed"' "toolPermission set to always-proceed"
-assert_contains "${alt_settings}" '"artifactReviewPolicy": "always-proceed"' "artifactReviewPolicy set to always-proceed"
-assert_contains "${alt_settings}" '"allowNonWorkspaceAccess": true' "allowNonWorkspaceAccess enabled inside OS sandbox"
-assert_contains "${alt_settings}" '"enableTerminalSandbox": false' "enableTerminalSandbox disabled inside outer OS sandbox"
-assert_contains "${alt_settings}" "\"${FAKE_HOME}/work\"" "WORKDIR added to trustedWorkspaces"
-assert_contains "${alt_settings}" '"/existing/workspace"' "existing trustedWorkspaces entry preserved"
 
 skill_synced=0
 [[ -f "${FAKE_HOME}/.gemini-alt/config/skills/orchestrator-mode/SKILL.md" ]] && skill_synced=1
@@ -347,9 +354,14 @@ assert_eq "$(cat "${FAKE_HOME}/.gemini-alt/config/skills/orchestrator-mode/SKILL
     "unmanaged skill directory is not overwritten"
 
 out="$(_bind 'private')"; rc=$?
-assert_eq "${rc}" "0" "default account binds"
+assert_eq "${rc}" "1" "default account without settings.json fails the bind"
+assert_contains "${out}" "${FAKE_HOME}/.gemini/antigravity-cli/settings.json: does not exist" "... naming the file to create"
 created=0; [[ -d "${FAKE_HOME}/.gemini" ]] && created=1
 assert_eq "${created}" "1" "default ~/.gemini is created when absent"
+assert_eq "$([[ -e "${FAKE_HOME}/.gemini/antigravity-cli/settings.json" ]] && echo yes || echo no)" "no" "... but settings.json is not"
+_write_valid_settings "${FAKE_HOME}/.gemini/antigravity-cli/settings.json" "${FAKE_HOME}/work"
+out="$(_bind 'private')"; rc=$?
+assert_eq "${rc}" "0" "default account binds once settings.json is valid"
 assert_eq "${out##*${NL}}" "NAME=Antigravity CLI" "default account keeps the plain agent name"
 assert_eq "$(_bind '')" "$(_bind 'private')" "empty AGY_ACCOUNT behaves like 'private'"
 
@@ -369,6 +381,7 @@ assert_contains "${out}" "credential location" "... with credential location err
 rm -f "${FAKE_HOME}/.gemini"
 
 mkdir -p "${FAKE_HOME}/gemini-real"
+_write_valid_settings "${FAKE_HOME}/gemini-real/antigravity-cli/settings.json" "${FAKE_HOME}/work"
 ln -s "${FAKE_HOME}/gemini-real" "${FAKE_HOME}/.gemini"
 out="$(_bind 'private')"; rc=$?
 assert_eq "${rc}" "0" "default ~/.gemini symlinked inside \$HOME is allowed"
@@ -453,6 +466,20 @@ echo "-- end-to-end: real agy wrapper + stub agy in ~/.local/bin inside sandbox"
 if [[ "${OS}" == "Linux" ]] && command -v bwrap >/dev/null 2>&1; then
     mkdir -p "${FAKE_HOME}/.local/bin" "${FAKE_HOME}/.gemini-alt"
     echo "alt-gemini-profile" >"${FAKE_HOME}/.gemini-alt/marker"
+    _write_valid_settings "${FAKE_HOME}/.gemini-alt/antigravity-cli/settings.json" "${FAKE_HOME}/work"
+    # Inside bwrap, PATH is ~/bin:<system dirs>:~/.local/bin. Without the
+    # ~/bin trap, an agy in a system dir would beat the ~/.local/bin stub, so
+    # the trap is only dropped when no such agy exists; otherwise the stub
+    # also goes to ~/bin and ~/.local/bin resolution is reported as skipped.
+    if sys_agy="$(sandbox_system_client agy)"; then
+        echo "  skip - ${sys_agy} precedes ~/.local/bin on the sandbox PATH; ~/.local/bin resolution not checked"
+    else
+        rm -f "${FAKE_HOME}/bin/agy"
+    fi
+    _sync_agy_stub() {
+        chmod +x "${FAKE_HOME}/.local/bin/agy"
+        if [[ -n "${sys_agy}" ]]; then cp "${FAKE_HOME}/.local/bin/agy" "${FAKE_HOME}/bin/agy"; fi
+    }
     cat >"${FAKE_HOME}/.local/bin/agy" <<'STUB'
 #!/bin/bash
 printf 'ARGV:%s\n' "$*"
@@ -460,9 +487,13 @@ cat "${HOME}/.gemini/marker" 2>&1
 [[ -f "${HOME}/.gemini/antigravity-cli/settings.json" ]] && echo "SETTINGS_OK"
 [[ -f "${HOME}/.gemini/config/skills/orchestrator-mode/SKILL.md" ]] && echo "SKILL_OK"
 STUB
-    chmod +x "${FAKE_HOME}/.local/bin/agy"
+    _sync_agy_stub
+    # Host-side launches put ~/.local/bin first, so check resolution on
+    # that same PATH (the ~/bin trap may have been removed above).
+    agy_path="${FAKE_HOME}/.local/bin:${PATH}"
+    PATH="${agy_path}" assert_client_is_fake agy
 
-    out="$(cd "${FAKE_HOME}/work" && PATH="${FAKE_HOME}/.local/bin:${PATH}" AGY_ACCOUNT=alt \
+    out="$(cd "${FAKE_HOME}/work" && PATH="${agy_path}" AGY_ACCOUNT=alt \
         bash "${REPO_ROOT}/bin/executable_agy_wrapper.bash" chat hello </dev/null 2>&1)"
     rc=$?
     assert_eq "${rc}" "0" "wrapper launches stub agy from ~/.local/bin inside sandbox"
@@ -472,7 +503,7 @@ STUB
     assert_contains "${out}" "SKILL_OK" "orchestrator-mode skill is visible inside the sandbox"
 
     _fresh_dir="$(mktemp -d "${FAKE_HOME}/work-invalid-XXXXXX")"
-    out="$(cd "${_fresh_dir}" && PATH="${FAKE_HOME}/.local/bin:${PATH}" AGY_ACCOUNT='x;y' \
+    out="$(cd "${_fresh_dir}" && PATH="${agy_path}" AGY_ACCOUNT='x;y' \
         bash "${REPO_ROOT}/bin/executable_agy_wrapper.bash" chat hello </dev/null 2>&1)"
     rc=$?
     assert_eq "${rc}" "1" "wrapper refuses an invalid AGY_ACCOUNT before launch"
@@ -483,12 +514,13 @@ STUB
         git_q init "${FAKE_HOME}/repos/main"
         git_q -C "${FAKE_HOME}/repos/main" commit --allow-empty -m init
         git_q -C "${FAKE_HOME}/repos/main" worktree add "${FAKE_HOME}/wt" -b wt
+        _write_valid_settings "${FAKE_HOME}/.gemini/antigravity-cli/settings.json" "${FAKE_HOME}/wt"
         cat >"${FAKE_HOME}/.local/bin/agy" <<'STUB'
 #!/bin/bash
 git log --format='LOG:%s' -1 2>&1
 STUB
-        chmod +x "${FAKE_HOME}/.local/bin/agy"
-        out="$(cd "${FAKE_HOME}/wt" && PATH="${FAKE_HOME}/.local/bin:${PATH}" \
+        _sync_agy_stub
+        out="$(cd "${FAKE_HOME}/wt" && PATH="${agy_path}" \
             bash "${REPO_ROOT}/bin/executable_agy_wrapper.bash" x </dev/null 2>&1)"
         assert_contains "${out}" "LOG:init" "agy wrapper: git works in a worktree inside the sandbox"
     fi
@@ -496,4 +528,5 @@ else
     echo "  skip - Linux + bwrap required"
 fi
 
+assert_no_live_client_reached
 tests_summary_and_exit

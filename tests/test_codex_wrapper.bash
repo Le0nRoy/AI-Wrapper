@@ -23,9 +23,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${REPO_ROOT}/tests/lib_test_helpers.bash"
 
 FAKE_HOME="$(mktemp -d "${HOME}/ai-wrapper-test.XXXXXX")"
-REAL_HOME="${HOME}"
-export HOME="${FAKE_HOME}"
-export XDG_CONFIG_HOME="${FAKE_HOME}/.config"
+isolate_test_env "${FAKE_HOME}"
 mkdir -p "${FAKE_HOME}/work"
 
 cleanup() { rm -rf "${FAKE_HOME}"; }
@@ -78,15 +76,9 @@ else
     echo "  skip - python3 tomllib unavailable; TOML round-trip not checked"
 fi
 
-if command -v codex >/dev/null 2>&1; then
-    enc="$(_toml "$(cat "${prompt_file}")")"
-    ( cd "${FAKE_HOME}/work" && HOME="${REAL_HOME}" codex -c "developer_instructions=${enc}" --help >/dev/null 2>&1 )
-    assert_eq "$?" "0" "real codex accepts -c developer_instructions=<encoded orchestrator prompt>"
-    ( cd "${FAKE_HOME}/work" && HOME="${REAL_HOME}" codex resume --dangerously-bypass-approvals-and-sandbox --help >/dev/null 2>&1 )
-    assert_eq "$?" "0" "real codex accepts 'resume --dangerously-bypass-approvals-and-sandbox'"
-else
-    echo "  skip - codex not installed; real-CLI argv acceptance not checked"
-fi
+# Real-CLI flag acceptance is not checked here: tests never launch an
+# installed, possibly authenticated codex (see isolate_test_env).
+echo "  skip - real codex argv acceptance (manual check only; no live clients in tests)"
 
 # ---------------------------------------------------------------------------
 echo "-- argv construction (codex)"
@@ -234,16 +226,13 @@ else
 fi
 
 mkdir -p "${FAKE_HOME}/.config/glab-cli"
-out="$( set -u; _load claude; WRAPPER_FLAGS=(); AI_SANDBOX_PASS_GITLAB=1 _apply_post_menu_binds; printf '%s\n' "${WRAPPER_FLAGS[@]}" )"
+out="$( set -u; cd "${FAKE_HOME}/work" && _load claude; WRAPPER_FLAGS=(); AI_SANDBOX_PASS_GITLAB=1 _apply_post_menu_binds; printf '%s\n' "${WRAPPER_FLAGS[@]}" )"
 assert_contains "${out}" "--ro-bind${NL}${FAKE_HOME}/.config/glab-cli" "PASS_GITLAB=1 RO-binds glab config"
-out="$( set -u; _load codex; WRAPPER_FLAGS=(); AI_SANDBOX_PASS_GITLAB=0 _apply_post_menu_binds; printf '%s\n' "${WRAPPER_FLAGS[@]}" )"
+out="$( set -u; cd "${FAKE_HOME}/work" && _load codex; WRAPPER_FLAGS=(); AI_SANDBOX_PASS_GITLAB=0 _apply_post_menu_binds; printf '%s\n' "${WRAPPER_FLAGS[@]}" )"
 assert_eq "${out}" "" "PASS_GITLAB=0 adds no glab bind"
 
 # ---------------------------------------------------------------------------
 echo "-- per-agent per-workdir presets (claude and codex in one workdir)"
-if ! command -v shasum >/dev/null 2>&1; then
-    shasum() { sha256sum; }   # Linux hosts without perl's shasum
-fi
 # Each case gets its own workdir so preset files never leak between cases.
 _pdir() { mkdir -p "${FAKE_HOME}/preset-${1}" && printf '%s' "${FAKE_HOME}/preset-${1}"; }
 # Print the per-agent preset path for agent $1 in dir $2.
@@ -352,6 +341,7 @@ printf 'ARGV:%s\n' "$*"
 cat "${HOME}/.codex/marker" 2>&1
 STUB
     chmod +x "${FAKE_HOME}/bin/codex"
+    assert_client_is_fake codex
     out="$(cd "${FAKE_HOME}/work" && PATH="${FAKE_HOME}/bin:${PATH}" CODEX_ACCOUNT=alt \
         bash "${REPO_ROOT}/bin/executable_codex_wrapper.bash" exec hello </dev/null 2>&1)"
     rc=$?
@@ -385,4 +375,5 @@ else
     echo "  skip - Linux + bwrap required"
 fi
 
+assert_no_live_client_reached
 tests_summary_and_exit

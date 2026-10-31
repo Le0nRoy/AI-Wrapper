@@ -1,8 +1,10 @@
 #!/bin/bash
-# Runs every test file in this directory, in order. Same entry point used
-# locally (on either Linux or macOS during development) and by CI — see
-# ../.github/workflows/ci.yml. macOS-only tests skip themselves on Linux;
-# there is currently no Linux-only equivalent test file.
+# Runs every test file in this directory, in order — the local "run
+# everything" entry point on Linux or macOS. CI runs the same files as
+# separate steps per job (../.github/workflows/ci.yml); keep the two in
+# sync. macOS-only tests skip themselves on Linux; Linux bwrap e2e blocks
+# print "skip" lines on macOS. See docs/testing.md for side effects and
+# per-OS scope.
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -28,12 +30,14 @@ for test_file in dot_agents/skills/*/scripts/test_*.py; do
 done
 
 # Preset test suite (macOS only — run-preset-tests.sh exits 2 on non-Darwin).
+echo ""
 if [[ "$(uname -s)" == "Darwin" ]]; then
-    echo ""
     echo "### tests/run-preset-tests.sh (macOS only)"
     if ! bash "tests/run-preset-tests.sh"; then
         failed=1
     fi
+else
+    echo "### tests/run-preset-tests.sh: SKIPPED (macOS only; covered by CI smoke-macos)"
 fi
 
 echo ""

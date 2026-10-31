@@ -35,10 +35,18 @@ The sandbox bounds *writes* — it does not bound *reads* or *network*. Be aware
 ## Environment variables
 
 - `AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1` — override the refusal to launch
-  from HOME dotfile dirs. Use only when you're deliberately editing one of
-  those locations and accept the wider write fence.
+  from `$HOME` or a HOME dotfile dir, and to accept such dirs or top-level
+  system dirs in `AI_SANDBOX_EXTRA_RW_DIRS` / `AI_SANDBOX_EXTRA_RO_DIRS`.
+  Use only when you're deliberately editing one of those locations and
+  accept the wider write fence.
+<!-- os:linux -->
+  Also overrides the refusal to launch from a top-level system directory
+  (`/`, `/etc`, `/tmp`, `/home`, ...).
+
 <!-- os:darwin -->
-  Also covers `~/Library`.
+  Also covers `~/Library`. Launching from a top-level system directory
+  (`/`, `/etc` = `/private/etc`, `/tmp`, `/Users`, `/Library`, ...) stays
+  refused on macOS; the setting does not override it.
 
 - `AI_SANDBOX_ALLOW_RO_HOMEDIR=1` — widen the read allowlist to `$HOME`
   except the credential exclusions in the SBPL profile (the 9 credential
@@ -56,6 +64,44 @@ The sandbox bounds *writes* — it does not bound *reads* or *network*. Be aware
   (~/.config/gcloud, ~/.gnupg, ~/.netrc, ~/.npmrc, ~/.pypirc). The
   per-service cred dirs (~/.ssh, ~/.aws, ~/.kube, ~/.docker) are
   enabled by their matching `AI_SANDBOX_PASS_*` flag instead. Red banner.
+- `AI_SANDBOX_ALLOW_GIT_CONFIG=1` — leave WORKDIR's `.git/config`,
+  `.git/hooks/`, `config.worktree` and submodule config/hooks writable.
+  By default (0) they are read-only because host git runs hooks and
+  commands from config outside the sandbox; commit, local branches,
+  checkout of local branches and push still work, but anything that
+  writes config fails: `git config`, `git remote add`,
+  `branch --set-upstream-to`, hook installers, submodule init. Some
+  commands fail half-way: `git push -u` may update the remote yet not
+  record the upstream, checking out a remote-only branch creates the
+  branch but exits non-zero, and `git branch -m` renames before failing.
+  Submodule git dirs are covered at any depth (nested and slash-named),
+  including a linked worktree's own submodules; at most 16 directory
+  levels and 256 submodule git dirs, beyond which the launch is refused.
+  It does not relax a linked worktree's shared `.git` or its shared
+  submodules (always protected).
+  The `.git` dir
+  stays pinned (cannot be moved or replaced), a worktree's `.git` file
+  and `commondir` stay read-only, and symlinked metadata refuses the
+  launch in both modes. Entries absent at launch (often
+  `.git/commondir`, sometimes `hooks/`) cannot be protected and are
+  listed in a WARN; nothing is created on the host. A value set at launch
+  wins over the saved per-workdir preset. Red banner.
+- `AI_SANDBOX_ALLOW_EXTERNAL_WORKTREES=1` — let git work in a linked
+  worktree whose repository's shared `.git` lies outside `$HOME` (e.g.
+  `/Data/projects/app/.git`). Off by default: only shared `.git` dirs
+  strictly under `$HOME` are bound. On, the wrapper binds exactly that
+  validated `.git` — never its parent or sibling repos — after the same
+  checks as under `$HOME` (real git dir, forward and reverse worktree
+  links naming this checkout, no symlinks) and with the same read-only
+  `config`, `hooks/`, other worktrees, pointer files and submodule
+  metadata, also when `AI_SANDBOX_ALLOW_GIT_CONFIG=1`. A `.git` under
+  `/etc`, `/usr`, `/var`, `/tmp`, `/opt`, `/root`, `/private`,
+  `/Library`, `/Users/Shared` and similar system or shared temp trees, or
+  below a hidden directory, is refused. Set it in the launch environment
+  or toggle it in `s) Settings` for this session: it is never saved to or
+  restored from the per-workdir preset (a preset entry is ignored with a
+  WARN). The worktree links are ordinary files, not proof that you own
+  the repository; turn it on only for your own repositories.
 <!-- os:darwin -->
 - `AI_SANDBOX_PROFILE=<path>` — point at an alternative SBPL profile (absolute
   path, or relative to the universal wrapper's directory). Replaces the base
@@ -79,6 +125,12 @@ The sandbox bounds *writes* — it does not bound *reads* or *network*. Be aware
   the network or firewall layer if they matter. macOS only — no Linux
   backend.
 <!-- os:end -->
+- `AI_SANDBOX_EXTRA_RW_DIRS` entries that are a git dir or a repository
+  work tree get a WARN: the raw grant has none of the read-only `config` /
+  `hooks/` layers, so the agent can make host git run commands. For a
+  linked worktree, launch from the worktree instead (with
+  `AI_SANDBOX_ALLOW_EXTERNAL_WORKTREES=1` when the repository is outside
+  `$HOME`). The grant itself still applies.
 - `AI_SANDBOX_ALLOW_DOCKER=1` — emit RW rules for
   `/var/run/docker.sock`, `~/.colima`, `~/.docker`. **Off by default.**
   **WARNING:** when on and the Docker / Colima daemon is running, the
@@ -87,10 +139,12 @@ The sandbox bounds *writes* — it does not bound *reads* or *network*. Be aware
   session legitimately needs `docker` from inside the sandbox.
 <!-- os:darwin -->
 - `--ro-bind SRC` adds a read-allowlist rule for SRC (single positional
-  argument post-WS1; no DST — sandbox-exec cannot remap paths). The source
-  path must exist at launch — a missing source is a hard error (exit 1),
-  not a silent skip. This matches `--bind` strictness and prevents
-  typo-induced silent failures.
+  argument post-WS1; no DST — sandbox-exec cannot remap paths) and denies
+  writes to it, even under a broader `--bind`, WORKDIR or
+  `AI_SANDBOX_EXTRA_RW_DIRS` grant. Only a `--bind` nested strictly inside
+  SRC stays writable. The source path must exist at launch — a missing
+  source is a hard error (exit 1), not a silent skip. This matches
+  `--bind` strictness and prevents typo-induced silent failures.
 <!-- os:end -->
 <!-- os:linux -->
 - `--bind SRC DST` / `--ro-bind SRC DST` (two positional arguments) adds a
@@ -254,7 +308,9 @@ per-agent operation — no naming, no confirmation, no sub-menu required.
   `bool=0` values) to
   `${XDG_CONFIG_HOME:-$HOME/.config}/ai-wrapper/last-preset/<hash>-<agent>.env`
   where `<hash>` is the first 12 hex chars of the SHA-256 of the
-  resolved working directory path and `<agent>` is `claude`, `codex` or
+  resolved (physical) working directory path, computed with
+  `sha256sum` (GNU coreutils, Linux) or `shasum -a 256` (macOS) — one
+  of them must be on `PATH` — and `<agent>` is `claude`, `codex` or
   `cursor`. One file per workdir and agent, so running the Claude and
   Codex wrappers in the same directory never clobbers the other's
   settings.
@@ -275,6 +331,14 @@ per-agent operation — no naming, no confirmation, no sub-menu required.
   marker so the header line disappears on the next render. Other
   agents' `<hash>-<agent>.env` files are left alone. No confirmation.
   Use this as the escape hatch to start fresh from catalog defaults.
+- **Fails closed** — if the workdir hash cannot be computed (neither
+  `sha256sum` nor `shasum` on `PATH`, the command fails or prints
+  something other than a SHA-256 digest, or `pwd -P` fails), the wrapper
+  prints an `ERROR:` line, the header shows `Saved settings disabled`,
+  and nothing is restored, saved or cleared for that session. The
+  session itself still launches with the current settings; other
+  workdirs' presets are never read or touched as a fallback. Install
+  coreutils or perl's `shasum` to restore presets.
 
 The preset file is plain `KEY=VALUE` per line with a comment header
 (`# workdir: <path>` and `# agent: <id>`); you can

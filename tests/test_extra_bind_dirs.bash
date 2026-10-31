@@ -14,11 +14,11 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=./lib_test_helpers.bash
 source "${REPO_ROOT}/tests/lib_test_helpers.bash"
-# shellcheck source=../bin/ai_agent_universal_wrapper.bash
-source "${REPO_ROOT}/bin/ai_agent_universal_wrapper.bash"
 
 FAKE_HOME="$(mktemp -d "${HOME}/ai-wrapper-test.XXXXXX")"
-export HOME="${FAKE_HOME}"
+isolate_test_env "${FAKE_HOME}"
+# shellcheck source=../bin/ai_agent_universal_wrapper.bash
+source "${REPO_ROOT}/bin/ai_agent_universal_wrapper.bash"
 mkdir -p "${FAKE_HOME}/project" "${FAKE_HOME}/.claude" "${FAKE_HOME}/extra_data" "${FAKE_HOME}/.ssh"
 echo "extra-dir-ok" >"${FAKE_HOME}/extra_data/marker.txt"
 
