@@ -40,10 +40,12 @@ this section records the disposition.
   and any `npm_config_*authToken*` / `*authtoken*` / `*_auth` name).
 - **3.I → `AI_SANDBOX_ALLOW_DOCKER` env knob.** New **S-η** entry in
   the threat model. SBPL Docker / Colima / `~/.docker` rules are now
-  wrapped in `(when (equal? (param "ALLOW_DOCKER") "1") …)`. Default
-  remains `1` (preserves the working-out-of-the-box `docker` CLI);
-  set `0` to omit the rules and close the host-root escape path when
-  the daemon is up.
+  wrapped in `(when (equal? (param "ALLOW_DOCKER") "1") …)`. The
+  default is now `0` on both backends (settings catalog, the Linux
+  bwrap wrapper and the SBPL param), which omits the rules and closes
+  the host-root escape path; set `1` only when the session needs the
+  `docker` CLI. (This entry originally said the default stayed `1`;
+  corrected by #62.)
 - **3.J → BLOCK_LOCALHOST scope clarified.** README now states
   explicitly that the flag is IP-only — it does not cover Unix-domain
   sockets or link-local addresses (AWS IMDS at `169.254.169.254`).
@@ -398,6 +400,54 @@ causes operational pain; a real per-process fork limit on macOS would
 need launchd integration, which remains out of scope. OS-level OOM
 kills can still happen but the wrapper no longer claims to interpret
 them as rlimit-induced.
+
+### S-θ — Linux host dirs and the Tailscale socket bound unconditionally (RESOLVED, 2026-10, #62)
+
+The bwrap backend bound, whenever they existed and with no setting:
+`~/bin` RW (first on the sandbox PATH and on the host user's), the
+shared skill source `~/ai-wrapper/.agents` RW (copied into every
+client's skill dir by `setup_skills.bash`), `~/Android` RW, `~/.kind`
+RW, `~/kind_dot_kube` RW *onto `~/.kube`* (a kubeconfig even with
+`AI_SANDBOX_PASS_KUBE=0`), and `/run/tailscale/tailscaled.sock` RW. An
+agent could plant a program or rewrite a skill that later runs outside
+the sandbox, or use Kubernetes / Tailscale access nobody granted.
+
+**Resolution.** Linux-only catalog settings (default `0`, shown only on
+Linux, saved in the per-workdir preset like other toggles):
+
+| Resource | Default | Opt-in |
+|----------|---------|--------|
+| `~/bin` | `--ro-bind` (runs, not writable) | `AI_SANDBOX_ALLOW_BIN_RW=1` → `--bind` |
+| `~/ai-wrapper/.agents` | `--ro-bind` | `AI_SANDBOX_ALLOW_AGENTS_SKILLS_RW=1` → `--bind` |
+| `~/Android` | absent | `AI_SANDBOX_ALLOW_ANDROID=1` → `--bind` |
+| `/run/tailscale/tailscaled.sock` | absent | `AI_SANDBOX_PASS_TAILSCALE=1` → `--ro-bind` |
+| `~/.kind`, `~/kind_dot_kube`, `KIND_EXPERIMENTAL_PROVIDER` | removed (Kind support dropped) | none |
+
+`~/.kube` / `KUBECONFIG` stay behind `AI_SANDBOX_PASS_KUBE` (RO).
+Relaxed modes log a `WARNING` at launch. Missing host paths are
+skipped, never created; host Kind files are left in place. The
+protected binds mount before WORKDIR and the extra binds, so an
+explicit grant at or above them still wins (bwrap's later mount
+covers the earlier one): launching from `~/ai-wrapper`, or
+`AI_SANDBOX_EXTRA_RW_DIRS=~/bin`, makes that tree writable whatever
+the toggles say, and a WORKDIR inside `~/bin` stays writable while
+the rest of `~/bin` stays read-only. `_agy_path_sandbox_writable`
+follows the same rules (Linux + opt-in, or a covering grant).
+
+**Residual.**
+- A read-only bind of a UNIX socket stops the socket file being
+  removed or replaced, not `connect()`/`send()`. With
+  `AI_SANDBOX_PASS_TAILSCALE=1` the agent talks to the LocalAPI with
+  the host user's UID (`SO_PEERCRED`), so it can do whatever
+  `tailscaled` allows that user — read-only for a plain user,
+  settings changes for `--operator=$USER`. There is no read-only
+  Tailscale API mode.
+- `/run/user/$UID` (`XDG_RUNTIME_DIR`) is still bound RW; tracked by
+  #63.
+- macOS binds none of these paths; unchanged.
+- Native enforcement is tested by `tests/test_linux_host_binds.bash`
+  under real bubblewrap (CI `smoke-linux`), with a synthetic socket
+  standing in for `tailscaled`.
 
 ## Local bugs / brittleness
 
@@ -928,8 +978,10 @@ are gone.
   than enforced by the helper. On macOS the probe dir is in `$TMPDIR`,
   which the sandbox can write; a running agent could make the probe fail
   (a refusal) but cannot change how the library behaves.
-- `~/bin` (which holds the deployed wrapper itself) is bound RW into the
-  sandbox. That shared-sandbox gap is tracked separately (#17).
+- `~/bin` was bound RW into the sandbox on Linux. Since #62 it is
+  read-only unless `AI_SANDBOX_ALLOW_BIN_RW=1` (S-θ); the trust check
+  counts it as writable only then, or when a wider grant (WORKDIR,
+  `AI_SANDBOX_EXTRA_RW_DIRS`, a `--bind` in `WRAPPER_FLAGS`) covers it.
 
 ### B-β — `_realpath` fallback chain has multiple silent branches (RESOLVED, 2026-05-24, WS6)
 
@@ -953,8 +1005,9 @@ Each `--bind` / `--ro-bind` appends to the profile string passed to
 
 **Disposition.** Deferred. The bind-array growth pattern this
 concerned was largely a Linux-side artifact (the upstream bwrap
-wrapper auto-binds `~/.kube`, `~/.kind`, `~/Android`, `~/bin`,
-`~/.agents`, etc., growing the array fast). Post-WS1 the macOS flag
+wrapper auto-bound `~/.kube`, `~/.kind`, `~/Android`, `~/bin`,
+`~/.agents`, etc., growing the array fast; since #62 only `~/bin` and
+`~/ai-wrapper/.agents` are bound by default, read-only, see S-θ). Post-WS1 the macOS flag
 surface is single-arg and the wrapper only adds three to four binds
 in practice. Revisit if a future caller ever needs hundreds of binds
 or if the auto-bind set grows substantially.
@@ -1088,10 +1141,12 @@ does not re-open the question.
   Re-evaluate if a second account is required. (Was tracked as R2 in
   the README "Linux merge" section; both the env-var row and the R2
   paragraph have been removed; this entry is the breadcrumb.)
-- **Tailscale integration** — not needed. No reachability to
-  Tailscale-bound services required from the sandbox. Upstream
-  `cb4aaa5` (unconditional Tailscale socket bind) explicitly NOT
-  pulled. Historical references to Tailscale inside
+- **Tailscale integration** — the Linux wrapper did carry an
+  unconditional `--bind` of `/run/tailscale/tailscaled.sock` (from
+  upstream `cb4aaa5`) despite this entry saying it was not pulled.
+  Since #62 it is off by default and only `AI_SANDBOX_PASS_TAILSCALE=1`
+  RO-binds the socket (S-θ); macOS has no Tailscale grant. Historical
+  references to Tailscale inside
   `docs/plans/2026-05-23-sandbox-migration.md` and
   `docs/plans/2026-05-23-sandbox-hardening-context.md` stay as
   upstream-example context — they are not active grants.

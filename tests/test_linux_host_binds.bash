@@ -1,5 +1,5 @@
 #!/bin/bash
-# shellcheck disable=SC2088,SC2163  # "~/x" is display text in test names; export "$@" takes NAME=VALUE pairs
+# shellcheck disable=SC2034,SC2088,SC2163  # "~/x" is display text in test names; export "$@" takes NAME=VALUE pairs
 # Linux host-path gates (#62): ~/bin and the shared agent-skill source
 # ~/ai-wrapper/.agents are read-only unless AI_SANDBOX_ALLOW_BIN_RW /
 # AI_SANDBOX_ALLOW_AGENTS_SKILLS_RW; ~/Android and the Tailscale daemon
@@ -9,10 +9,10 @@
 # and never created. Also checks that the agy trust analysis
 # (_agy_path_sandbox_writable) follows the same grants.
 #
-# Three layers: bwrap argv through a stub bwrap/sysctl (Linux code path on
-# any host with bash), _agy_path_sandbox_writable (pure logic, any OS), and
-# native bubblewrap probes (denial + persistence of legitimate writes) when
-# real bwrap is installed. Synthetic fake HOME only; no real client is ever
+# Three layers: _agy_path_sandbox_writable (pure logic, Linux and macOS),
+# then on Linux only bwrap argv through a stub bwrap/sysctl, and native
+# bubblewrap probes (denial + persistence of legitimate writes; a missing
+# bwrap fails). Synthetic fake HOME only; no real client is ever
 # launched (isolate_test_env traps every client name).
 set -uo pipefail
 
@@ -232,8 +232,10 @@ assert_not_contains "${out}" "WARNING" "protected default launch logs no relaxed
 
 # ---------------------------------------------------------------------------
 echo "-- native bubblewrap probes"
-if [[ "${OS}" != "Linux" || -z "${REAL_BWRAP}" ]]; then
-    echo "  skip - native probes need Linux with bubblewrap (CI smoke-linux)"
+# Native certification of the gates: on Linux a missing bwrap is a
+# failure, not a skip (CI smoke-linux installs bubblewrap).
+if [[ -z "${REAL_BWRAP}" ]]; then
+    _test_report 0 "native probes: bubblewrap (bwrap) available on Linux"
     tests_summary_and_exit
 fi
 
@@ -273,22 +275,22 @@ for p in bin-create bin-append bin-unlink skills-create skills-mkdir android-vis
         kind-kube-visible tailscale-visible; do
     assert_contains "${out}" "DENIED:${p}" "default: ${p} denied"
 done
-assert_eq "$(_yes test -e "${H}/bin/${canary}")" no "default: no canary in host ${H}/bin"
-assert_eq "$(cat "${H}/bin/existing-${RUN_ID}")" "bin-original" "default: host ${H}/bin file unchanged"
+assert_eq "$(_yes test -e "${H}/bin/${canary}")" no "default: no canary in host ~/bin"
+assert_eq "$(cat "${H}/bin/existing-${RUN_ID}")" "bin-original" "default: host ~/bin file unchanged"
 assert_eq "$(_yes test -e "${H}/ai-wrapper/.agents/skills/${canary}")" no "default: no canary in host skills"
 assert_eq "$(cat "${WORK}/legit-${RUN_ID}" 2>/dev/null)" "ok" "default: WORKDIR write persists on host"
 
-# PASS_KUBE=1: ${H}/.kube is the real one (not kind_dot_kube) and RO.
+# PASS_KUBE=1: ~/.kube is the real one (not kind_dot_kube) and RO.
 out="$(_native "${PROBE_LIB}
 cat ${H}/.kube/config
 probe kube-read cat ${H}/.kube/config
 probe kube-write sh -c 'echo evil >>${H}/.kube/config'
 probe kind-visible test -e ${H}/.kind
 echo PROBES_DONE" AI_SANDBOX_PASS_KUBE=1)"
-assert_contains "${out}" "kube-cred-${RUN_ID}" "PASS_KUBE=1: ${H}/.kube shows the real kubeconfig"
-assert_not_contains "${out}" "kind-cred-${RUN_ID}" "PASS_KUBE=1: kind_dot_kube does not shadow ${H}/.kube"
-assert_contains "${out}" "DENIED:kube-write" "PASS_KUBE=1: ${H}/.kube stays read-only"
-assert_contains "${out}" "DENIED:kind-visible" "PASS_KUBE=1: ${H}/.kind still absent"
+assert_contains "${out}" "kube-cred-${RUN_ID}" "PASS_KUBE=1: ~/.kube shows the real kubeconfig"
+assert_not_contains "${out}" "kind-cred-${RUN_ID}" "PASS_KUBE=1: kind_dot_kube does not shadow ~/.kube"
+assert_contains "${out}" "DENIED:kube-write" "PASS_KUBE=1: ~/.kube stays read-only"
+assert_contains "${out}" "DENIED:kind-visible" "PASS_KUBE=1: ~/.kind still absent"
 
 # Relaxed modes: legitimate writes persist on the host.
 mkdir -p "${H}/Android"
@@ -298,26 +300,26 @@ probe skills-create sh -c 'echo edited >${H}/ai-wrapper/.agents/skills/${canary}
 probe android-create sh -c 'echo sdk >${H}/Android/${canary}'
 echo PROBES_DONE" AI_SANDBOX_ALLOW_BIN_RW=1 AI_SANDBOX_ALLOW_AGENTS_SKILLS_RW=1 AI_SANDBOX_ALLOW_ANDROID=1)"
 for p in bin-create skills-create android-create; do assert_contains "${out}" "OK:${p}" "relaxed: ${p} works"; done
-assert_eq "$(cat "${H}/bin/${canary}" 2>/dev/null)" "built" "relaxed: ${H}/bin write persists on host"
+assert_eq "$(cat "${H}/bin/${canary}" 2>/dev/null)" "built" "relaxed: ~/bin write persists on host"
 assert_eq "$(cat "${H}/ai-wrapper/.agents/skills/${canary}" 2>/dev/null)" "edited" "relaxed: skills write persists on host"
-assert_eq "$(cat "${H}/Android/${canary}" 2>/dev/null)" "sdk" "relaxed: ${H}/Android write persists on host"
+assert_eq "$(cat "${H}/Android/${canary}" 2>/dev/null)" "sdk" "relaxed: ~/Android write persists on host"
 rm -rf "${H:?}/Android" "${H:?}/bin/${canary}" "${H}/ai-wrapper/.agents/skills/${canary}"
 
-# Explicit overlapping grants keep working: RW extra on ${H}/bin, WORKDIR
-# under ${H}/bin, WORKDIR above the skills dir.
+# Explicit overlapping grants keep working: RW extra on ~/bin, WORKDIR
+# under ~/bin, WORKDIR above the skills dir.
 out="$(_native "${PROBE_LIB}
 probe bin-create sh -c 'echo x >${H}/bin/${canary}'
 echo PROBES_DONE" AI_SANDBOX_EXTRA_RW_DIRS="${H}/bin")"
-assert_contains "${out}" "OK:bin-create" "explicit RW extra on ${H}/bin is writable"
+assert_contains "${out}" "OK:bin-create" "explicit RW extra on ~/bin is writable"
 rm -f "${H}/bin/${canary}"
 mkdir -p "${H}/bin/tool-${RUN_ID}"
 out="$( cd "${H}/bin/tool-${RUN_ID}" && _load_linux && _run_sandboxed_agent_linux /bin/bash -- -- -c "${PROBE_LIB}
 probe wd-write sh -c 'echo x >./${canary}'
 probe bin-sibling sh -c 'echo x >${H}/bin/${canary}'
 echo PROBES_DONE" 2>&1 )"
-assert_contains "${out}" "OK:wd-write" "WORKDIR inside ${H}/bin stays writable"
-assert_contains "${out}" "DENIED:bin-sibling" "rest of ${H}/bin stays RO with WORKDIR inside it"
-assert_eq "$(_yes test -f "${H}/bin/tool-${RUN_ID}/${canary}")" yes "WORKDIR-inside-${H}/bin write persists"
+assert_contains "${out}" "OK:wd-write" "WORKDIR inside ~/bin stays writable"
+assert_contains "${out}" "DENIED:bin-sibling" "rest of ~/bin stays RO with WORKDIR inside it"
+assert_eq "$(_yes test -f "${H}/bin/tool-${RUN_ID}/${canary}")" yes "WORKDIR-inside-~/bin write persists"
 rm -rf "${H}/bin/tool-${RUN_ID}"
 out="$( cd "${H}/ai-wrapper" && _load_linux && _run_sandboxed_agent_linux /bin/bash -- -- -c "${PROBE_LIB}
 probe skills-create sh -c 'echo x >${H}/ai-wrapper/.agents/skills/${canary}'
