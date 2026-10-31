@@ -68,6 +68,10 @@ done
 # Kind support was removed (#62): no Kind-specific setting or wording.
 assert_not_contains "${linux_catalog}" "ALLOW_KIND" "no Kind setting on Linux"
 assert_not_contains "${linux_catalog}" "kind_dot_kube" "no kind_dot_kube wording on Linux"
+# The combined kind + kubectl installer is gone too, with its README row.
+assert_eq "$([[ -e "${REPO_ROOT}/bin/executable_setup_kind.bash" ]] && echo present || echo absent)" absent \
+    "Kind installer source removed"
+assert_not_contains "$(cat "${REPO_ROOT}/README.md")" "setup_kind" "README does not list the Kind installer"
 assert_contains "${linux_catalog}" "AI_SANDBOX_PASS_TAILSCALE|bool|0|red|" "Tailscale control is red severity"
 tailscale_row="$(grep '^AI_SANDBOX_PASS_TAILSCALE|' <<<"${linux_catalog}")"
 assert_contains "${tailscale_row}" "does not make the Tailscale API read-only" "Tailscale help disclaims a read-only API"

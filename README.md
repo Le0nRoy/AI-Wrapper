@@ -16,7 +16,6 @@ Paths assume the chezmoi destination `~/ai-wrapper` that the scripts expect (`ru
 | `bin/executable_cursor_agent_wrapper.bash` | `~/ai-wrapper/bin/cursor_agent_wrapper.bash` | Sandboxed Cursor Agent launcher |
 | `bin/executable_copilot_wrapper.bash` | `~/ai-wrapper/bin/copilot_wrapper.bash` | Sandboxed GitHub Copilot CLI launcher |
 | `bin/executable_setup_ai_kube_access.bash` | `~/ai-wrapper/bin/setup_ai_kube_access.bash` | Kubernetes RBAC setup for AI agents |
-| `bin/executable_setup_kind.bash` | `~/ai-wrapper/bin/setup_kind.bash` | kind + kubectl installer into `~/bin` (the sandbox no longer mounts `~/.kind`; Kind is unsupported inside it) |
 | `bin/ai_agent_universal_wrapper.bash` | `~/ai-wrapper/bin/ai_agent_universal_wrapper.bash` | Bubblewrap sandbox library (sourced by wrappers) |
 | `bin/ai_wrapper_data/` | `~/ai-wrapper/bin/ai_wrapper_data/` | Prompt templates and per-agent wrapper libs |
 | `dot_agents/skills/` | `~/ai-wrapper/.agents/skills/` | Agent skills (synced to every wrapped client's native skill directory via `setup_skills.bash`) |
