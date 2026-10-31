@@ -98,6 +98,7 @@ jobs:
       - run: bash tests/test_extra_bind_dirs.bash
       - run: bash tests/test_codex_wrapper.bash
       - run: bash tests/test_bind_hardening.bash
+      - run: bash tests/test_sensitive_path_parity.bash
       - run: bash tests/test_external_worktree.bash
       - run: bash tests/test_workdir_git_protection.bash
       - run: bash tests/test_macos_ro_overlays.bash
@@ -121,6 +122,7 @@ jobs:
       - run: bash tests/test_sandbox_macos_only.bash
       - run: bash tests/test_extra_bind_dirs.bash
       - run: bash tests/test_bind_hardening.bash
+      - run: bash tests/test_sensitive_path_parity.bash
       - run: bash tests/test_external_worktree.bash
       - run: bash tests/test_workdir_git_protection.bash
       - run: bash tests/test_macos_ro_overlays.bash

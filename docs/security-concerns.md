@@ -437,8 +437,8 @@ moved to `ai_wrapper_lib.bash`.
 
 **Resolution.** `_wrapper_git_common_dir_ok` validates the resolved
 path first: a real directory strictly under `$HOME`; not sensitive per
-`_sandbox_sensitive_dir_kind` (the classifier the Linux backend now uses
-for WORKDIR / `AI_SANDBOX_EXTRA_*_DIRS`); basename `.git` or
+`_sandbox_sensitive_dir_kind` (the classifier both backends use for
+WORKDIR / `AI_SANDBOX_EXTRA_*_DIRS`, see B-ξ); basename `.git` or
 `<name>.git` with `HEAD`, `objects/`, `refs/`; and WORKDIR's own gitdir
 must resolve to `<common>/worktrees/<name>` (an attacker who can only
 write inside WORKDIR cannot create that back-link). Failure WARNs and
@@ -597,7 +597,7 @@ B-λ). The WARN points to the opt-in; the grant is not refused.
   indirection, content written by earlier sessions, the existing creation
   of a missing top-level `hooks/` and `config.worktree` in the validated
   common dir, and the check-to-mount window (#14). The location guard is
-  separate from `_sandbox_sensitive_dir_kind` / the macOS lists (#15).
+  separate from `_sandbox_sensitive_dir_kind` (B-ξ).
 
 Coverage: `tests/test_external_worktree.bash` (CI `smoke-linux` and
 `smoke-macos`): location guard, opt-in off/on, HOME regression, prefix
@@ -734,6 +734,43 @@ and renaming a branch checked out in another worktree fail.
   `modules/` are covered at any depth (#12).
 - *Plugins.* `_extra_sandbox_setup` binds are applied last and can
   re-grant RW (trusted code, S-β).
+
+### B-ξ — macOS backend duplicated the sensitive-path lists (RESOLVED, 2026-10, #15)
+
+**Problem.** `macos_sandbox_exec.bash` kept its own inline system-root,
+`$HOME` and dotfile/`~/Library` checks for WORKDIR and
+`AI_SANDBOX_EXTRA_*_DIRS` instead of `_sandbox_sensitive_dir_kind`, so
+the lists could drift. They had: neither knew `/private/etc`, so
+launching from `/etc` (which `pwd -P` resolves to `/private/etc`) was
+accepted on macOS; and an extra dir of `/` was accepted on macOS
+(trailing-slash stripping left an empty string the inline list did not
+match) while Linux refused it.
+
+**Resolution.** The macOS backend classifies with
+`_sandbox_sensitive_dir_kind` and fails closed (`ERROR`, no launch) if
+the function is not loaded. `/private/etc` joins the Darwin system list.
+System entries stay exact roots: children (`/private/etc/x`,
+`/Volumes/<disk>/<project>`) and sibling prefixes (`/etcx`) are not
+refused; `/Volumes` is unchanged (accepted). Each backend keeps its own
+enforcement:
+
+| Kind | Linux | macOS |
+|------|-------|-------|
+| WORKDIR system root | refused; `AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1` overrides | refused; **not** overridable |
+| WORKDIR `$HOME` / dotfile dir (macOS also `~/Library`) | refused; overridable | refused; overridable |
+| extra dir: system / `$HOME` / dotfile | refused; overridable | refused; overridable |
+
+Platform lists differ by design (Linux `/home`, `/root`, `/mnt`, `/media`,
+`/srv`, `/opt`, `/proc`, …; macOS `/Users`, `/System`, `/Applications`,
+`/Library`, the `/private/...` canonical forms of `/tmp`, `/var`, `/etc`).
+The #13 external-worktree location guard stays separate and stricter.
+
+Coverage: `tests/test_sensitive_path_parity.bash` (CI `smoke-linux` and
+`smoke-macos`): classifier tables for both OS rule sets (shadowed
+`uname`), macOS backend refusals and overrides (native on macOS; mocked
+`uname`/`getconf`/`sandbox-exec` elsewhere), classifier-missing
+fail-closed, and native refusals through `run_sandboxed_agent` on the
+host backend with a stub client that must not run.
 
 ### B-κ — symlinked account paths (RESOLVED, 2026-10)
 
