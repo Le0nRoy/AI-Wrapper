@@ -46,7 +46,8 @@ jobs:
   # Pure-logic tests: settings-catalog OS-scope filtering and the
   # wrapper-help.md OS-conditional doc filter, skill deployment/retirement
   # into a fake HOME, agy host-side path confinement, per-workdir preset
-  # identity (sha256sum/shasum, fail-closed), and the Tortuga gh helper. No real sandbox launch, so
+  # identity (sha256sum/shasum, fail-closed), agy trust-analysis grants for
+  # Linux host dirs, and the Tortuga gh helper. No real sandbox launch, so
   # these need no setup — but still run on both OSes since they exercise
   # real bash string/array handling, not just the app logic.
   logic-tests:
@@ -62,6 +63,7 @@ jobs:
       - run: bash tests/test_setup_skills.bash
       - run: bash tests/test_live_client_isolation.bash
       - run: bash tests/test_agy_host_boundary.bash
+      - run: bash tests/test_linux_host_binds.bash
       - run: bash tests/test_preset_identity.bash
       - run: python3 -B dot_agents/skills/tortuga/scripts/test_gh.py
 
@@ -104,6 +106,7 @@ jobs:
       - run: bash tests/test_macos_ro_overlays.bash
       - run: bash tests/test_agy_wrapper.bash
       - run: bash tests/test_copilot_wrapper.bash
+      - run: bash tests/test_linux_host_binds.bash
 
   # macOS's built-in sandbox-exec needs no install step. Runs the same
   # cross-platform smoke tests as Linux (run_sandboxed_agent dispatches on

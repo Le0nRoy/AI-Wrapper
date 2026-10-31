@@ -18,6 +18,14 @@ DARWIN_ONLY_KEYS=(
     AI_SANDBOX_ALLOW_RO_HOMEDIR
     AI_SANDBOX_BLOCK_LOCALHOST
 )
+# Linux bubblewrap host-path gates (#62); the macOS backend never binds
+# these paths, so the controls are hidden there.
+LINUX_ONLY_KEYS=(
+    AI_SANDBOX_ALLOW_BIN_RW
+    AI_SANDBOX_ALLOW_AGENTS_SKILLS_RW
+    AI_SANDBOX_ALLOW_ANDROID
+    AI_SANDBOX_PASS_TAILSCALE
+)
 # A representative sample of settings implemented on both backends.
 CROSS_PLATFORM_KEYS=(
     AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR
@@ -51,6 +59,18 @@ for key in "${DARWIN_ONLY_KEYS[@]}"; do
     assert_not_contains "${linux_catalog}" "${key}|" "${key} hidden on Linux (no backend there)"
     assert_contains "${darwin_catalog}" "${key}|" "${key} shown on macOS"
 done
+
+for key in "${LINUX_ONLY_KEYS[@]}"; do
+    assert_contains "${linux_catalog}" "${key}|bool|0|" "${key} shown on Linux, default 0"
+    assert_not_contains "${darwin_catalog}" "${key}|" "${key} hidden on macOS (no backend there)"
+done
+
+# Kind support was removed (#62): no Kind-specific setting or wording.
+assert_not_contains "${linux_catalog}" "ALLOW_KIND" "no Kind setting on Linux"
+assert_not_contains "${linux_catalog}" "kind_dot_kube" "no kind_dot_kube wording on Linux"
+assert_contains "${linux_catalog}" "AI_SANDBOX_PASS_TAILSCALE|bool|0|red|" "Tailscale control is red severity"
+tailscale_row="$(grep '^AI_SANDBOX_PASS_TAILSCALE|' <<<"${linux_catalog}")"
+assert_contains "${tailscale_row}" "does not make the Tailscale API read-only" "Tailscale help disclaims a read-only API"
 
 for key in "${CROSS_PLATFORM_KEYS[@]}"; do
     assert_contains "${linux_catalog}" "${key}|" "${key} shown on Linux"

@@ -121,6 +121,10 @@ run_sandboxed_agent() {
     esac
 }
 
+# Host tailscaled socket bound by AI_SANDBOX_PASS_TAILSCALE=1. Assigned at
+# source time, so the caller's environment cannot redirect the bind source.
+_AI_SANDBOX_TAILSCALE_SOCKET=/run/tailscale/tailscaled.sock
+
 _run_sandboxed_agent_linux() {
     local agent_name="${1}"
     local command="${1}"
@@ -183,6 +187,12 @@ _run_sandboxed_agent_linux() {
     local pass_openai="${AI_SANDBOX_PASS_OPENAI:-0}"; [[ "${pass_openai}" == "1" ]] || pass_openai=0
     local allow_sensitive_workdir="${AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR:-0}"; [[ "${allow_sensitive_workdir}" == "1" ]] || allow_sensitive_workdir=0
     local allow_ro_credentials="${AI_SANDBOX_ALLOW_RO_CREDENTIALS:-0}"; [[ "${allow_ro_credentials}" == "1" ]] || allow_ro_credentials=0
+    # Linux-only host-path gates (catalog OS_SCOPE "linux"; the macOS
+    # backend never binds these paths).
+    local allow_bin_rw="${AI_SANDBOX_ALLOW_BIN_RW:-0}"; [[ "${allow_bin_rw}" == "1" ]] || allow_bin_rw=0
+    local allow_skills_rw="${AI_SANDBOX_ALLOW_AGENTS_SKILLS_RW:-0}"; [[ "${allow_skills_rw}" == "1" ]] || allow_skills_rw=0
+    local allow_android="${AI_SANDBOX_ALLOW_ANDROID:-0}"; [[ "${allow_android}" == "1" ]] || allow_android=0
+    local pass_tailscale="${AI_SANDBOX_PASS_TAILSCALE:-0}"; [[ "${pass_tailscale}" == "1" ]] || pass_tailscale=0
     # AI_SANDBOX_PASS_ENV is a str (comma-separated var-name list), not a
     # bool — no 0/1 normalization, empty is the meaningful default.
     local pass_env_list="${AI_SANDBOX_PASS_ENV:-}"
@@ -381,6 +391,31 @@ _run_sandboxed_agent_linux() {
         exit 1
     fi
 
+    # ~/bin (on the sandbox PATH, and run by the host user outside the
+    # sandbox) and the shared agent-skill source (copied into every client's
+    # skill dir by setup_skills) are read-only unless explicitly relaxed:
+    # a writable copy lets the agent plant binaries or poison skills that
+    # later run unsandboxed. Mounted before WORKDIR and the extra binds so
+    # an explicit grant at or above them (WORKDIR, AI_SANDBOX_EXTRA_RW_DIRS)
+    # still wins — bwrap's later mount covers the earlier one. Missing
+    # paths are skipped, never created.
+    local -a protected_home_binds=()
+    local _p_dir _p_rw _p_var
+    for _p_dir in bin ai-wrapper/.agents; do
+        if [[ "${_p_dir}" == "bin" ]]; then
+            _p_rw="${allow_bin_rw}"; _p_var=AI_SANDBOX_ALLOW_BIN_RW
+        else
+            _p_rw="${allow_skills_rw}"; _p_var=AI_SANDBOX_ALLOW_AGENTS_SKILLS_RW
+        fi
+        [[ -d "${HOME_DIR}/${_p_dir}" ]] || continue
+        if [[ "${_p_rw}" == "1" ]]; then
+            echo_log "WARNING" "[$agent_name] ${_p_var}=1: ~/${_p_dir} is writable inside the sandbox; the agent can change files the host runs or loads outside it."
+            protected_home_binds+=(--bind "${HOME_DIR}/${_p_dir}" "${HOME_DIR}/${_p_dir}")
+        else
+            protected_home_binds+=(--ro-bind "${HOME_DIR}/${_p_dir}" "${HOME_DIR}/${_p_dir}")
+        fi
+    done
+
     # Build bwrap arguments
     local -a bwrap_args=(
         --die-with-parent
@@ -405,12 +440,13 @@ _run_sandboxed_agent_linux() {
         --tmpfs /var
         --proc /proc
         --dev /dev
+        "${protected_home_binds[@]+"${protected_home_binds[@]}"}"
         # Working directory (read-write)
         --bind "${WORKDIR}" "${WORKDIR}"
     )
 
-    # Add default Android directory if it exists
-    if [[ -d "${HOME_DIR}/Android" ]]; then
+    # Android SDK/AVD dir (RW, includes debug keystores) only when opted in.
+    if [[ "${allow_android}" == "1" && -d "${HOME_DIR}/Android" ]]; then
         bwrap_args+=(--bind "${HOME_DIR}/Android" "${HOME_DIR}/Android")
     fi
 
@@ -453,10 +489,14 @@ _run_sandboxed_agent_linux() {
             fi
         fi
 
-        # Bind Tailscale socket for read-only query access (status, ip, peers)
-        # Note: write/modify permissions are enforced by the Tailscale daemon itself
-        if [[ -S /run/tailscale/tailscaled.sock ]]; then
-            bwrap_args+=(--bind /run/tailscale/tailscaled.sock /run/tailscale/tailscaled.sock)
+        # Tailscale daemon socket only when opted in. --ro-bind only stops
+        # the socket inode being replaced or removed; connecting and talking
+        # to the LocalAPI still works, and tailscaled authorises each
+        # request by the caller's UID (the sandbox runs as the host user),
+        # so what the agent can do is whatever tailscaled allows that user.
+        if [[ "${pass_tailscale}" == "1" && -S "${_AI_SANDBOX_TAILSCALE_SOCKET}" ]]; then
+            echo_log "WARNING" "[$agent_name] AI_SANDBOX_PASS_TAILSCALE=1: the Tailscale LocalAPI is reachable with your user's tailscaled permissions; the read-only socket bind does not make the API read-only."
+            bwrap_args+=(--ro-bind "${_AI_SANDBOX_TAILSCALE_SOCKET}" /run/tailscale/tailscaled.sock)
         fi
 
         # Bind user runtime directory if it exists. XDG_RUNTIME_DIR is
@@ -481,26 +521,6 @@ _run_sandboxed_agent_linux() {
         # Need to create parent directory structure since /var is tmpfs
         bwrap_args+=(--dir /var/lib)
         bwrap_args+=(--bind /var/lib/docker /var/lib/docker)
-    fi
-
-    # Add kind configuration directory if it exists
-    if [[ -d "${HOME_DIR}/.kind" ]]; then
-        bwrap_args+=(--bind "${HOME_DIR}/.kind" "${HOME_DIR}/.kind")
-    fi
-
-    # Add kubectl configuration directory if it exists
-    if [[ -d "${HOME_DIR}/kind_dot_kube" ]]; then
-        bwrap_args+=(--bind "${HOME_DIR}/kind_dot_kube" "${HOME_DIR}/.kube")
-    fi
-
-    # Add ~/bin directory if it exists (for kind, kubectl, and other user binaries)
-    if [[ -d "${HOME_DIR}/bin" ]]; then
-        bwrap_args+=(--bind "${HOME_DIR}/bin" "${HOME_DIR}/bin")
-    fi
-
-    # Add ~/ai-wrapper/.agents directory if it exists (agent skills content)
-    if [[ -d "${HOME_DIR}/ai-wrapper/.agents" ]]; then
-        bwrap_args+=(--bind "${HOME_DIR}/ai-wrapper/.agents" "${HOME_DIR}/ai-wrapper/.agents")
     fi
 
 
@@ -529,9 +549,6 @@ _run_sandboxed_agent_linux() {
         [[ -n "${DOCKER_CERT_PATH:-}" ]] && bwrap_args+=(--setenv DOCKER_CERT_PATH "${DOCKER_CERT_PATH}")
         [[ -d "${HOME_DIR}/.docker" ]]   && bwrap_args+=(--ro-bind "${HOME_DIR}/.docker" "${HOME_DIR}/.docker")
     fi
-
-    # Pass through kind environment variable if set (kind itself is unconditional, see .kind/kind_dot_kube binds above)
-    [[ -n "${KIND_EXPERIMENTAL_PROVIDER:-}" ]] && bwrap_args+=(--setenv KIND_EXPERIMENTAL_PROVIDER "${KIND_EXPERIMENTAL_PROVIDER}")
 
     # Pass through KUBECONFIG and bind ~/.kube if opted in
     if [[ "${pass_kube}" == "1" ]]; then
