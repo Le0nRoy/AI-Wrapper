@@ -79,6 +79,28 @@ _sandbox_sensitive_dir_kind() {
     return 1
 }
 
+# Warn when an accepted AI_SANDBOX_EXTRA_RW_DIRS entry DIR is a git dir or
+# a work tree with a .git dir: the raw grant gets none of the read-only
+# config / hooks/ overlays the wrapper puts on git metadata it binds
+# itself. Silent for the metadata that does get them (WORKDIR's own .git,
+# the validated worktree common dir in _WRAPPER_GIT_COMMON_PROTECTED, set
+# by _wrapper_bind_git_common_dir). A warning only — the grant stays.
+# Args: AGENT_TAG DIR
+_sandbox_warn_extra_rw_git() {
+    local tag="${1}" dir="${2}" resolved gd="" wd IFS=$' \t\n'
+    resolved="$(cd "${dir}" 2>/dev/null && pwd -P)" || return 0
+    if [[ -f "${resolved}/HEAD" && -d "${resolved}/objects" && -d "${resolved}/refs" ]]; then
+        gd="${resolved}"
+    elif [[ -d "${resolved}/.git" ]]; then
+        gd="$(cd "${resolved}/.git" 2>/dev/null && pwd -P)" || return 0
+    fi
+    [[ -n "${gd}" ]] || return 0
+    [[ -n "${_WRAPPER_GIT_COMMON_PROTECTED:-}" && "${gd}" == "${_WRAPPER_GIT_COMMON_PROTECTED}" ]] && return 0
+    wd="$(pwd -P)"
+    [[ "${gd}" == "${wd%/}/.git" ]] && return 0
+    echo_log "WARNING" "[${tag}] AI_SANDBOX_EXTRA_RW_DIRS: '${dir}' exposes git metadata ${gd} read-write without the read-only config / hooks/ overlays: the agent can plant hooks or config (core.hooksPath, core.fsmonitor, aliases) that run on the host the next time you use git there. For a linked worktree, launch from the worktree instead (with AI_SANDBOX_ALLOW_EXTERNAL_WORKTREES=1 if the repository is outside \$HOME): its shared .git is then bound after link validation with config and hooks/ read-only."
+}
+
 run_sandboxed_agent() {
     case "$(uname -s)" in
         Linux)
@@ -208,6 +230,7 @@ _run_sandboxed_agent_linux() {
             if [[ -d "${_d}" ]]; then
                 _user_extra_bwrap_flags+=(--bind "${_d}" "${_d}")
                 _user_extra_bind_dirs+=("${_d}")
+                _sandbox_warn_extra_rw_git "${agent_name}" "${_d}"
             else
                 echo_log "WARNING" "[$agent_name] AI_SANDBOX_EXTRA_RW_DIRS: skipping '${_d}' (not a directory)"
             fi

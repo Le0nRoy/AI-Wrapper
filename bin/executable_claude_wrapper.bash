@@ -183,10 +183,9 @@ _bind_claude_account() {
 }
 
 # Git worktree common-dir bind (shared .git outside WORKDIR) and the
-# post-menu glab bind (_apply_post_menu_binds, called below) live in the
-# shared ai_wrapper_data/ai_wrapper_lib.bash so the Codex wrapper gets the
-# same behavior. See the comments there.
-_wrapper_bind_git_common_dir || exit 1
+# glab bind run after the menu in _apply_post_menu_binds (called below),
+# shared with the other wrappers via ai_wrapper_data/ai_wrapper_lib.bash.
+# See the comments there.
 
 # Claude CLI flags — full autonomy *within the sandbox boundary*.
 # The sandbox (bwrap args / SBPL profile) is the permission fence here:
