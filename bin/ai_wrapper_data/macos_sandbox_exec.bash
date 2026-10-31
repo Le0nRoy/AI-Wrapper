@@ -144,6 +144,7 @@ _run_sandboxed_agent_impl() {
             if [[ -d "${_d}" ]]; then
                 binds_rw+=("${_d}")
                 _user_extra_bind_dirs+=("${_d}")
+                _sandbox_warn_extra_rw_git "${tag}" "${_d}"
             else
                 echo_log "WARN" "[${tag}] AI_SANDBOX_EXTRA_RW_DIRS: skipping '${_d}' (not a directory)"
             fi

@@ -230,6 +230,13 @@ _check_workdir_breadth() {
 # candidate is WARNed and skipped (the launch continues, git just won't
 # work in that worktree).
 #
+# A common dir outside $HOME (e.g. a repo under /Data) is eligible only
+# when the session opts in with AI_SANDBOX_ALLOW_EXTERNAL_WORKTREES=1 (host
+# launch environment or s) Settings; never from a saved preset). The
+# opt-in admits exactly the validated common dir — same link, shape and
+# read-only rules as under $HOME — not its parent tree. Runs after the
+# menu (_apply_post_menu_binds) so the toggle applies.
+#
 # Even for a genuine worktree, RW on the shared .git would let the agent
 # plant host code execution for the user's next git command (hooks/,
 # config: core.hooksPath / core.fsmonitor / aliases / filter drivers,
@@ -261,6 +268,9 @@ _wrapper_bind_git_common_dir() {
     # This worktree's own submodule git dirs, protected after the menu by
     # _wrapper_protect_worktree_modules (AI_SANDBOX_ALLOW_GIT_CONFIG).
     _WRAPPER_WT_MODULE_PINS=(); _WRAPPER_WT_MODULE_DIRS=()
+    # The common dir bound with read-only overlays, if any; read by the
+    # backends' AI_SANDBOX_EXTRA_RW_DIRS git warning.
+    _WRAPPER_GIT_COMMON_PROTECTED=""
     git_common_dir="$(git -C "$(pwd -P)" rev-parse --git-common-dir 2>/dev/null)" || return 0
     [[ -n "${git_common_dir}" ]] || return 0
     # `git rev-parse --git-common-dir` returns either an absolute path or a
@@ -282,9 +292,14 @@ _wrapper_bind_git_common_dir() {
     [[ "${git_common_resolved}" != "${wd_resolved}"/* \
         && "${git_common_resolved}" != "${wd_resolved}" ]] || return 0
 
-    local reason
+    local reason external=0
+    [[ -n "${home_resolved}" && "${git_common_resolved}" == "${home_resolved}"/* ]] || external=1
     if ! reason="$(_wrapper_git_common_dir_ok "${git_common_resolved}" "${home_resolved}" "${wd_resolved}")"; then
-        echo_log "WARN" "[${AI_AGENT_COMMAND:-ai-wrapper}] Not binding git common dir ${git_common_resolved}: ${reason}. git will not work in this worktree; bind it via AI_SANDBOX_EXTRA_RW_DIRS if it is trusted."
+        if (( external )) && [[ "${AI_SANDBOX_ALLOW_EXTERNAL_WORKTREES:-0}" != "1" ]]; then
+            echo_log "WARN" "[${AI_AGENT_COMMAND:-ai-wrapper}] Not binding git common dir ${git_common_resolved}: ${reason}. git will not work in this worktree. If this is your repository, set AI_SANDBOX_ALLOW_EXTERNAL_WORKTREES=1 at launch or toggle it in s) Settings for this session: the shared .git is then bound after the same link checks, with config, hooks/ and other worktrees read-only."
+        else
+            echo_log "WARN" "[${AI_AGENT_COMMAND:-ai-wrapper}] Not binding git common dir ${git_common_resolved}: ${reason}. git will not work in this worktree."
+        fi
         return 0
     fi
     # _wrapper_git_common_dir_ok printed the validated worktree entry dir.
@@ -374,6 +389,19 @@ _wrapper_bind_git_common_dir() {
         _wrapper_add_meta_bind "${wt_parent}"
         wt_parent="${wt_parent%/*}"
     done
+    # The backends walk WORKDIR's parents only up to $HOME; an external
+    # worktree outside $HOME needs the same stat()-only grants up to /.
+    if (( external )) && [[ -z "${home_resolved}" || "${wd_resolved}" != "${home_resolved}"/* ]]; then
+        wt_parent="${wd_resolved%/*}"
+        while [[ -n "${wt_parent}" && "${wt_parent}" != "/" ]]; do
+            _wrapper_add_meta_bind "${wt_parent}"
+            wt_parent="${wt_parent%/*}"
+        done
+    fi
+    _WRAPPER_GIT_COMMON_PROTECTED="${git_common_resolved}"
+    if (( external )); then
+        echo_log "WARN" "[${AI_AGENT_COMMAND:-ai-wrapper}] AI_SANDBOX_ALLOW_EXTERNAL_WORKTREES=1: binding git common dir ${git_common_resolved} (outside \$HOME). Its objects, refs and logs and this worktree's entry are writable; config, hooks/, other worktrees and submodule metadata stay read-only."
+    fi
     return 0
 }
 
@@ -381,7 +409,9 @@ _wrapper_bind_git_common_dir() {
 # RESOLVED_COMMON_DIR RESOLVED_HOME RESOLVED_WORKDIR. On success prints the
 # resolved worktree entry dir (<common>/worktrees/<name>) and returns 0;
 # otherwise prints the rejection reason and returns 1. Rules:
-#   (a) a real directory (not a symlink) strictly under $HOME;
+#   (a) a real directory (not a symlink) strictly under $HOME, or — only
+#       with AI_SANDBOX_ALLOW_EXTERNAL_WORKTREES=1 — outside $HOME in a
+#       location _wrapper_git_external_location_ok accepts;
 #   (b) not a sensitive location per _sandbox_sensitive_dir_kind (the same
 #       classifier the sandbox applies to WORKDIR / AI_SANDBOX_EXTRA_*_DIRS:
 #       system dirs, $HOME, anything under a $HOME dotfile dir), unless it
@@ -404,8 +434,9 @@ _wrapper_bind_git_common_dir() {
 #       borrow any existing worktree entry of any repo by pointing its
 #       .git file at it.
 # Both sides of every comparison are realpath-resolved.
-# AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR does NOT relax these — trusted repos
-# outside the rules can be granted explicitly via AI_SANDBOX_EXTRA_RW_DIRS.
+# AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR does NOT relax these. (A raw
+# AI_SANDBOX_EXTRA_RW_DIRS grant bypasses them and gets no read-only
+# overlays; the backends warn about it.)
 _wrapper_git_common_dir_ok() {
     local dir="${1%/}" home="${2%/}" wd="${3%/}" kind base git_dir name top back
     local parent_git_dir repo_name module_name submodule
@@ -417,8 +448,16 @@ _wrapper_git_common_dir_ok() {
     if [[ -L "${dir}" || ! -d "${dir}" ]]; then
         echo "not a resolved directory"; return 1
     fi
-    if [[ -z "${home}" || "${dir}" != "${home}"/* ]]; then
+    if [[ -z "${home}" || "${dir}" == "${home}" ]]; then
         echo "not strictly under \$HOME"; return 1
+    fi
+    if [[ "${dir}" != "${home}"/* ]]; then
+        if [[ "${AI_SANDBOX_ALLOW_EXTERNAL_WORKTREES:-0}" != "1" ]]; then
+            echo "outside \$HOME and AI_SANDBOX_ALLOW_EXTERNAL_WORKTREES is off"; return 1
+        fi
+        if ! kind="$(_wrapper_git_external_location_ok "${dir}" "${home}")"; then
+            echo "outside \$HOME in a refused location (${kind})"; return 1
+        fi
     fi
     # A submodule worktree's common dir is <superproject>/.git/modules/<name>:
     # it carries the submodule's name instead of a .git suffix and, for
@@ -488,6 +527,41 @@ _wrapper_git_common_dir_ok() {
         echo "worktree entry ${git_dir} belongs to ${back:-unknown}, not this checkout (${top:-unknown}/.git)"; return 1
     fi
     printf '%s' "${git_dir}"
+    return 0
+}
+
+# Directory trees an external (outside $HOME) git common dir may not sit
+# in: OS, package-manager and runtime state, root's home, and the shared
+# world-writable temp / macOS /Users/Shared areas. Both OSes' lists in one
+# (a path absent on this OS cannot match). Mount points such as /mnt,
+# /media, /srv, /Volumes and other users' /home or /Users dirs stay
+# eligible. Space-separated; no entry contains a space.
+_WRAPPER_GIT_EXTERNAL_REFUSED_ROOTS="/bin /boot /dev /etc /lib /lib32 /lib64 /libx32 /nix /opt /proc /root /run /sbin /snap /sys /tmp /usr /var /Applications /Library /System /Users/Shared /cores /private"
+
+# Location guard for a resolved common dir outside $HOME (only consulted
+# with AI_SANDBOX_ALLOW_EXTERNAL_WORKTREES=1). Args: RESOLVED_DIR
+# RESOLVED_HOME. Returns 0 when DIR is an absolute path outside every
+# refused root (matched per path component: /etcx is not /etc), does not
+# contain $HOME, and has no dot-prefixed directory above it (hidden trees,
+# e.g. another user's ~/.config, hold credentials). Otherwise prints the
+# reason and returns 1. Pure string check: callers pass realpath-resolved
+# paths so /tmp -> /private/tmp style aliases are already canonical.
+_wrapper_git_external_location_ok() {
+    local dir="${1%/}" home="${2%/}" root
+    if [[ "${dir}" != /?* ]]; then
+        echo "not an absolute path"; return 1
+    fi
+    if [[ "${home}" == "${dir}" || "${home}" == "${dir}"/* ]]; then
+        echo "contains \$HOME"; return 1
+    fi
+    for root in ${_WRAPPER_GIT_EXTERNAL_REFUSED_ROOTS}; do
+        if [[ "${dir}" == "${root}" || "${dir}" == "${root}"/* ]]; then
+            echo "under ${root}"; return 1
+        fi
+    done
+    case "${dir%/*}/" in
+        */.*) echo "below a hidden directory"; return 1 ;;
+    esac
     return 0
 }
 
@@ -959,8 +1033,10 @@ _wrapper_check_config_symlink() {
 # at exec time, so those keep working; this function covers only the
 # bind-list side. Returns 1 when the launch must be refused (callers exit).
 _apply_post_menu_binds() {
-    # WORKDIR git metadata and a linked worktree's own submodule git dirs
-    # (AI_SANDBOX_ALLOW_GIT_CONFIG is a menu setting).
+    # A linked worktree's shared .git (AI_SANDBOX_ALLOW_EXTERNAL_WORKTREES
+    # is a menu setting), then WORKDIR git metadata and the worktree's own
+    # submodule git dirs (AI_SANDBOX_ALLOW_GIT_CONFIG is a menu setting).
+    _wrapper_bind_git_common_dir || return 1
     _wrapper_protect_workdir_git || return 1
     _wrapper_protect_worktree_modules
 
@@ -1046,6 +1122,7 @@ _AI_SETTINGS_LIST=(
     # Sensitive directories
     "AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR|bool|0|red|Allow launch from sensitive dirs|Permits launching from \$HOME itself, a dotfile dir directly under \$HOME${_ai_sensitive_workdir_extra}, or a top-level system directory — the write fence then grants RW there, which likely exposes credentials|sensitive"
     "AI_SANDBOX_ALLOW_GIT_CONFIG|bool|0|red|Allow editing git config and hooks|Leaves WORKDIR's .git/config, hooks/, config.worktree and submodule config/hooks (also a linked worktree's own submodules) writable so git config, remote add and push -u work. The agent can then make host git run any command. Off: those edits and tracking-branch setup fail; commits, local branches and checkouts still work.|sensitive"
+    "AI_SANDBOX_ALLOW_EXTERNAL_WORKTREES|bool|0|yellow|Allow git in worktrees of repos outside \$HOME|For a linked worktree whose repository's shared .git lies outside \$HOME (e.g. /Data/...), binds exactly that .git after the same link and path checks as \$HOME repos; its config, hooks/ and other worktrees stay read-only. System, temp and hidden locations are refused. This session only: never saved to or restored from the per-workdir preset.|sensitive"
     "AI_SANDBOX_ALLOW_RO_HOMEDIR|bool|0|yellow|Share home directory (read-only)|Agent can read everything in \$HOME except credentials|sensitive|darwin"
 
     # Credentials
@@ -1097,6 +1174,20 @@ unset _ai_n _ai_t _ai_d _ai_sev _ai_hl _ai_det _ai_cat
 # debugging; not consulted on load (older presets load with a WARN
 # on unrecognised keys, not a hard error).
 _AI_WRAPPER_PRESET_FORMAT_VERSION="2026-05-28"
+
+# Authorization controls that only the host launch environment or this
+# session's s) Settings may set. _preset_autosave never writes them and
+# _preset_autoload ignores them (with a WARN), so a saved, edited or
+# injected preset cannot grant access. Space-separated.
+_AI_SESSION_ONLY_SETTINGS="AI_SANDBOX_ALLOW_EXTERNAL_WORKTREES"
+
+# Returns 0 when NAME is in _AI_SESSION_ONLY_SETTINGS.
+_setting_is_session_only() {
+    case " ${_AI_SESSION_ONLY_SETTINGS} " in
+        *" ${1} "*) return 0 ;;
+    esac
+    return 1
+}
 
 # AI_SANDBOX_ALLOW_GIT_CONFIG given explicitly at launch (even =0) wins
 # over the per-workdir preset, so a one-off `AI_SANDBOX_ALLOW_GIT_CONFIG=0`
@@ -1322,7 +1413,8 @@ _render_settings_table() {
 # Public functions:
 #   _preset_autosave_path  — compute (but do not create) the file path
 #   _preset_legacy_path    — compute the pre-per-agent shared file path
-#   _preset_autosave       — write every catalog key verbatim
+#   _preset_autosave       — write every catalog key verbatim except
+#                            _AI_SESSION_ONLY_SETTINGS
 #   _preset_autoload       — apply saved settings (no-op silently if no file)
 #   _preset_clear          — rm -f the files + unset AUTOLOADED_FROM
 
@@ -1393,7 +1485,8 @@ _preset_mark_unavailable() {
 # Write every catalog key to this agent's per-workdir preset file. Saves
 # ALL keys verbatim (including bool=0 and empty str/path) so a user who
 # explicitly disabled a previously-enabled setting sees that persist.
-# Uses temp-rename to avoid partial-write corruption.
+# Session-only authorization controls (_AI_SESSION_ONLY_SETTINGS) are
+# never written. Uses temp-rename to avoid partial-write corruption.
 _preset_autosave() {
     local path dir entry cur
     path="$(_preset_autosave_path)" || { _preset_mark_unavailable; return 1; }
@@ -1413,6 +1506,7 @@ _preset_autosave() {
         printf '# wrapper-version: %s\n' "${_AI_WRAPPER_PRESET_FORMAT_VERSION}"
         for entry in "${_AI_SETTINGS_LIST[@]}"; do
             _parse_setting_entry "${entry}"
+            _setting_is_session_only "${_set_name}" && continue
             cur="$(_setting_current_value "${_set_name}" "${_set_type}" "${_set_default}")"
             printf '%s=%s\n' "${_set_name}" "${cur}"
         done
@@ -1462,6 +1556,11 @@ _preset_autoload() {
         # Validate key format.
         if [[ ! "${key}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
             echo "  WARN: _preset_autoload: invalid key name: ${key}" >/dev/tty
+            continue
+        fi
+        if _setting_is_session_only "${key}"; then
+            # stderr, not /dev/tty: scripted launches must see it too.
+            echo "  WARN: [${AI_AGENT_COMMAND:-ai-wrapper}] Ignoring ${key} in the saved preset ${path}: it is a session-only authorization (set it at launch or in s) Settings)." >&2
             continue
         fi
         # Reject keys not in the catalog — a corrupt file must not set
