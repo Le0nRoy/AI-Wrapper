@@ -742,9 +742,12 @@ and renaming a branch checked out in another worktree fail.
 `AI_SANDBOX_EXTRA_*_DIRS` instead of `_sandbox_sensitive_dir_kind`, so
 the lists could drift. They had: neither knew `/private/etc`, so
 launching from `/etc` (which `pwd -P` resolves to `/private/etc`) was
-accepted on macOS; and an extra dir of `/` was accepted on macOS
-(trailing-slash stripping left an empty string the inline list did not
-match) while Linux refused it.
+accepted on macOS. An extra dir of `/` also slipped past the macOS
+inline list (trailing-slash stripping left an empty string it did not
+match), but it never reached a client: `_resolve_bind_target` refuses
+an empty subpath before launch. The shared classifier now refuses it
+earlier, with the same system-location message as Linux; effective
+access is unchanged.
 
 **Resolution.** The macOS backend classifies with
 `_sandbox_sensitive_dir_kind` and fails closed (`ERROR`, no launch) if
@@ -770,7 +773,8 @@ Coverage: `tests/test_sensitive_path_parity.bash` (CI `smoke-linux` and
 `uname`), macOS backend refusals and overrides (native on macOS; mocked
 `uname`/`getconf`/`sandbox-exec` elsewhere), classifier-missing
 fail-closed, and native refusals through `run_sandboxed_agent` on the
-host backend with a stub client that must not run.
+host backend: a stub client prints a marker on stdout, which must be
+absent for refusals and present for the project / override launches.
 
 ### B-κ — symlinked account paths (RESOLVED, 2026-10)
 

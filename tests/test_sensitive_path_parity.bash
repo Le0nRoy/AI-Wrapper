@@ -15,7 +15,8 @@
 #      macOS; off macOS uname reports Darwin and getconf / sandbox-exec are
 #      stubbed, so it checks refusal logic and dry-run rendering only;
 #   3. native refusals through run_sandboxed_agent on the host's own
-#      backend, client a stub that must never run when refused.
+#      backend; the stub client prints a stdout marker that must be
+#      absent when refused and present for the positive controls.
 # Fixtures live under a fake HOME; real system roots are only used for
 # refusals (or macOS dry runs), never granted to a launched client.
 set -uo pipefail
@@ -175,41 +176,52 @@ _expect_refused "macOS: classifier unavailable" "sensitive-path classifier _sand
 
 # ---------------------------------------------------------------------------
 echo "-- native refusals via run_sandboxed_agent (${OS} backend)"
+# The native client prints CLIENT_RAN_MARKER on stdout: a host-side marker
+# file is no proof here (macOS confines writes to WORKDIR, bwrap gives the
+# client a private HOME). The marker is assembled by printf at run time, so
+# argv echoed by a log line can never contain it.
+CLIENT_RAN_ID="$(basename "${FAKE_HOME}")"
+CLIENT_RAN_MARKER="client-ran-${CLIENT_RAN_ID}"
 _native() { ( cd "${1}" && source "${REPO_ROOT}/bin/ai_agent_universal_wrapper.bash" \
-    && run_sandboxed_agent /usr/bin/touch -- -- "${MARKER}" ) 2>&1; }
-rm -f "${MARKER}"
+    && run_sandboxed_agent /usr/bin/printf -- -- 'client-ran-%s\n' "${CLIENT_RAN_ID}" ) 2>&1; }
+# $1: description, $2: expected message fragment; reads the last launch.
+_expect_native_refused() {
+    _expect_refused "${1}" "${2}"
+    assert_not_contains "${out}" "${CLIENT_RAN_MARKER}" "${1}: client printed nothing"
+}
+# $1: description; reads the last launch.
+_expect_native_ran() {
+    assert_eq "${rc}" "0" "${1}"
+    assert_contains "${out}" "${CLIENT_RAN_MARKER}" "${1}: the client ran"
+}
 out="$(_native /etc)"; rc=$?
-_expect_refused "${OS}: WORKDIR=/etc" "${SYSTEM_MSG}"
+_expect_native_refused "${OS}: WORKDIR=/etc" "${SYSTEM_MSG}"
 out="$(_native "${FAKE_HOME}")"; rc=$?
-_expect_refused "${OS}: WORKDIR=\$HOME" "WORKDIR=\$HOME"
+_expect_native_refused "${OS}: WORKDIR=\$HOME" "WORKDIR=\$HOME"
 out="$(_native "${FAKE_HOME}/.cfg")"; rc=$?
-_expect_refused "${OS}: dotfile WORKDIR" "dotfile dir"
+_expect_native_refused "${OS}: dotfile WORKDIR" "dotfile dir"
 out="$(AI_SANDBOX_EXTRA_RW_DIRS="${FAKE_HOME}/.cfg" _native "${FAKE_HOME}/project")"; rc=$?
-_expect_refused "${OS}: extra RW dotfile dir" "Refusing extra bind '${FAKE_HOME}/.cfg' (under HOME dotfile dir"
+_expect_native_refused "${OS}: extra RW dotfile dir" "Refusing extra bind '${FAKE_HOME}/.cfg' (under HOME dotfile dir"
 out="$(AI_SANDBOX_EXTRA_RO_DIRS=/etc _native "${FAKE_HOME}/project")"; rc=$?
-_expect_refused "${OS}: extra RO /etc" "Refusing extra bind '/etc' (${SYSTEM_MSG})"
+_expect_native_refused "${OS}: extra RO /etc" "Refusing extra bind '/etc' (${SYSTEM_MSG})"
 if [[ "${OS}" == "Darwin" ]]; then
     out="$(_native /private/etc)"; rc=$?
-    _expect_refused "Darwin: WORKDIR=/private/etc" "${SYSTEM_MSG}"
+    _expect_native_refused "Darwin: WORKDIR=/private/etc" "${SYSTEM_MSG}"
     out="$(AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 _native /etc)"; rc=$?
-    _expect_refused "Darwin: WORKDIR=/etc with the override" "${SYSTEM_MSG}"
+    _expect_native_refused "Darwin: WORKDIR=/etc with the override" "${SYSTEM_MSG}"
     out="$(_native "${FAKE_HOME}/Library")"; rc=$?
-    _expect_refused "Darwin: ~/Library WORKDIR" "dotfile dir or ~/Library"
+    _expect_native_refused "Darwin: ~/Library WORKDIR" "dotfile dir or ~/Library"
 fi
 # Positive controls: a project and the existing overrides still launch
 # the stub client (empty synthetic HOME / dotfile fixtures only).
 out="$(_native "${FAKE_HOME}/project")"; rc=$?
 echo "  (project launch output: ${out})"
-assert_eq "${rc}" "0" "${OS}: project WORKDIR launches"
-ran=0; [[ -e "${MARKER}" ]] && ran=1
-assert_eq "${ran}" "1" "${OS}: ... and the client ran"
-rm -f "${MARKER}"
+_expect_native_ran "${OS}: project WORKDIR launches"
 out="$(AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 _native "${FAKE_HOME}/.cfg")"; rc=$?
 echo "  (dotfile override launch output: ${out})"
-assert_eq "${rc}" "0" "${OS}: AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 overrides a dotfile WORKDIR"
+_expect_native_ran "${OS}: AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 overrides a dotfile WORKDIR"
 out="$(AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 AI_SANDBOX_EXTRA_RW_DIRS="${FAKE_HOME}/.cfg" _native "${FAKE_HOME}/project")"; rc=$?
 echo "  (extra-dir override launch output: ${out})"
-assert_eq "${rc}" "0" "${OS}: AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 overrides an extra dotfile dir"
-rm -f "${MARKER}"
+_expect_native_ran "${OS}: AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 overrides an extra dotfile dir"
 
 tests_summary_and_exit
