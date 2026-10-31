@@ -488,7 +488,69 @@ the over-mount targets are checked for symlinks immediately before the
 flags are built. A residual window remains between this check and
 bwrap's mount for a *concurrent* host process that can write the
 victim repo; sandboxed sessions can no longer rename the RO mount
-points.
+points. The owner accepted this window without a code change (#14,
+below).
+
+**Check-to-mount window (#14, ACCEPTED RESIDUAL, 2026-10).** Not fixed;
+the current behaviour is kept and documented. All Git-metadata
+validation (common-dir eligibility, back-links, root and submodule
+symlink/type checks) runs in the wrapper's shell before the kernel
+mounts (bwrap) or enforces rules (Seatbelt). Nothing re-checks the
+paths at launch, and the check, the mount and the exec are not atomic.
+
+- *Who.* A process other than the sandboxed agent that can replace a
+  selected source or one of its ancestors after validation: another host
+  process of the user, a concurrent session whose grants cover the
+  repository (an older wrapper, `AI_SANDBOX_ALLOW_GIT_CONFIG=1`, or a raw
+  `AI_SANDBOX_EXTRA_RW_DIRS` grant on it), or another local user who
+  can write a shared repository. A default-protected session cannot
+  rename the RO mount points it sees. Write access to one repository is
+  not, by itself, the right to run code as the user or read the user's
+  other files, so these actors are not assumed to own everything the
+  launching session can reach.
+- *Source selection.* bwrap and the Seatbelt rule generator select
+  sources by pathname. A source or ancestor swapped for a symlink or a
+  different directory after validation is resolved at mount / rule
+  time, so the bind or grant can name something other than what was
+  validated (on macOS `_resolve_bind_target` realpaths each path when
+  the SBPL rules are rendered). Which grant changes depends on the
+  swapped entry: the common dir and this worktree's entry are RW, the
+  over-mounts RO.
+- *Vanished protection entries (Linux).* The generic bind loop in
+  `_run_sandboxed_agent_linux` only tests that a source exists and, with
+  the default `BWRAP_STRICT=0`, skips a missing one with a WARN. An RO
+  over-mount present at discovery but removed before that loop is
+  therefore skipped, leaving that path under the RW common-dir bind.
+  This is a validation/protection gap; no end-to-end host execution has
+  been demonstrated natively. Entries absent at discovery are a
+  separate, already accepted residual (B-ν).
+- *Evidence.* A native synthetic bwrap probe (bwrap 0.13.1, synthetic
+  directories only — no real credentials, user repositories or
+  host-sensitive paths): a `--ro-bind` of the original path read the
+  original content; after a rename + symlink swap the same path bind
+  read a synthetic sibling outside the selected scope; a `--ro-bind-fd`
+  of a descriptor opened before the swap still read the original. This
+  shows pathname source selection and descriptor identity for that one
+  directory, not descendant/destination safety or a full wrapper exploit.
+  On macOS only source inspection and simulated SBPL generation exist —
+  no native race probe and no evidence about kernel enforcement or
+  broader rule interactions. Existing native CI (`smoke-linux`,
+  `smoke-macos`) covers the current access rules, not this race.
+- *Not adopted.* Descriptor binding (`--bind-fd` / `--ro-bind-fd`,
+  supported by bwrap 0.13.1) could pin selected source identity on Linux
+  only; Seatbelt has no equivalent, and it would not remove every
+  pathname race. A pre-exec re-check would narrow the window but cannot
+  close it atomically. Neither is implemented.
+- *Operational boundary.* While a wrapper launches, coordinate with (or
+  trust) every writer of the selected Git metadata: the common dir, its
+  `config`, `hooks/`, `worktrees/`, this worktree's entry and submodule
+  git dirs, and their ancestors. Protection after launch, B-ο's opt-in
+  and exact-scope checks and the #12 limits do not make the pre-launch
+  window atomic. Deliberate raw grants (`AI_SANDBOX_EXTRA_RW_DIRS`) are a
+  separate, user-chosen exposure. All existing checks, WARNs and
+  overrides (#10/#12 `AI_SANDBOX_ALLOW_GIT_CONFIG` handling, #13
+  external worktrees default off and session-only, #15 classifier and
+  `/Volumes` behaviour) are unchanged.
 
 **macOS (#11).** Seatbelt has no mounts, so the backend renders every
 `--ro-bind` as a read allow plus a `(deny file-write* file-link …)`
@@ -596,7 +658,8 @@ B-λ). The WARN points to the opt-in; the grant is not refused.
 - *Unchanged B-λ / B-ν residuals:* metadata absent at launch, config
   indirection, content written by earlier sessions, the existing creation
   of a missing top-level `hooks/` and `config.worktree` in the validated
-  common dir, and the check-to-mount window (#14). The location guard is
+  common dir, and the check-to-mount window (#14, accepted residual,
+  see B-λ). The location guard is
   separate from `_sandbox_sensitive_dir_kind` (B-ξ).
 
 Coverage: `tests/test_external_worktree.bash` (CI `smoke-linux` and
