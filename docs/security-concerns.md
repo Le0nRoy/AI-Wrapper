@@ -501,6 +501,92 @@ path), except on Linux with the override; WORKDIR, extra RW and
   servers standing in for the bus, `systemd`, Docker, Podman and SSH
   agents.
 
+### S-κ — Linux process isolation: nested user namespaces, TIOCSTI, sysctl preflight (RESOLVED, 2026-11, #64)
+
+Three gaps in the bwrap backend:
+
+- **L3.** `--unshare-all` only *tries* a user namespace and leaves the
+  sandboxed process free to create more. Each nested user namespace
+  gives it namespace-root capabilities and reaches kernel code
+  (filesystem mounts, netfilter, ...) an unprivileged process cannot.
+- **L5.** The sandbox shared the caller's controlling terminal with no
+  filter, so on kernels that still allow `ioctl(TIOCSTI)`
+  (`dev.tty.legacy_tiocsti=1`, or older than 6.2) the agent could push
+  keystrokes into the terminal's input queue for the shell to run after
+  the session (CVE-2017-5226 class). `TIOCLINUX` offers a similar
+  console-selection paste path.
+- **L7.** Preflight required the `sysctl` binary and failed when
+  `kernel.unprivileged_userns_clone` did not exist; it never checked that
+  a namespace could actually be created.
+
+**Resolution.**
+
+| Control | Default | Opt-out |
+|---------|---------|---------|
+| Nested user namespaces | `--unshare-user --disable-userns --assert-userns-disabled` | `AI_SANDBOX_ALLOW_NESTED_USERNS=1` (red, Linux) omits them, launch `WARNING` |
+| Terminal injection | seccomp filter: `ioctl(TIOCSTI)` and `ioctl(TIOCLINUX)` fail with `EPERM`; everything else allowed | `AI_SANDBOX_ALLOW_TIOCSTI=1` (yellow, Linux) omits it, launch `WARNING` |
+| Knob check | `/proc/sys/kernel/unprivileged_userns_clone`, `/proc/sys/user/max_user_namespaces` read directly | none |
+| Launch probe | real bwrap run of the external `true` with the launch's isolation options | none |
+
+- *Filter.* `bin/ai_wrapper_data/linux_tty_seccomp.py`, run as
+  `python3 -I` on the host, loads libseccomp through ctypes, resolves
+  the native `ioctl` syscall through it, adds the 32-bit compat ABIs
+  (`x86`/`x32` on `x86_64`, `arm` on `aarch64`; any other arch hits
+  libseccomp's bad-arch kill), and matches the request on its low 32
+  bits (the kernel truncates the command, so `1<<32 | TIOCSTI` is the
+  same ioctl). Request values come from Python's `termios`. Before it
+  prints the filter it loads the exported BPF in a forked child that
+  owns a private pty and checks that `TIOCSTI` (plain and high-bit) and
+  `TIOCLINUX` turn from non-`EPERM` into `EPERM` while `TIOCGWINSZ` still
+  works. The wrapper accepts only whole 8-byte instructions, feeds the
+  filter through a pipe to `--add-seccomp-fd` (one fresh descriptor for
+  the probe, one for the launch, both closed afterwards) and never reads
+  a filter from a file. A missing interpreter, library, symbol or
+  architecture match, a failed self-test or a filter bwrap cannot load
+  refuses the launch and names `AI_SANDBOX_ALLOW_TIOCSTI=1`. Python 3
+  and the libseccomp runtime (`libseccomp2`) are Linux prerequisites.
+- *Terminal behaviour.* No `--new-session`, no PTY proxy, no signal
+  forwarding: the client keeps the controlling terminal, `/dev/tty`,
+  raw input, window size and `SIGWINCH`, and Ctrl+C reaches it as
+  `SIGINT` (the wrapper and bwrap receive it too, as before; bwrap
+  exiting on it ends the session, so a clean exit 0 is not promised).
+- *Caller filters.* A `--seccomp FD` added by a hook is switched to the
+  equivalent `--add-seccomp-fd FD` (bwrap refuses to mix them); the
+  kernel applies every filter and the strictest result wins, so ours
+  never replaces or weakens it. With `AI_SANDBOX_ALLOW_TIOCSTI=1` the
+  caller's flags are left as given.
+- *Preflight.* An absent knob is inconclusive. One that is `0`, cannot
+  be read or holds a non-number refuses the launch (no privileged fix is
+  prescribed). The probe binds `/usr`, `/bin`, `/lib`, `/lib64` where they
+  exist and runs `type -P true`; its output is captured in memory. The
+  refusal says whether bwrap lacks an option (names the opt-out), could
+  not disable nested namespaces, could not load the filter, hit a setup
+  problem (`execvp`, missing path — not a namespace denial), or was
+  denied a user namespace (kernel, LSM such as AppArmor, container
+  runtime). The probe source paths are assigned at source time; the
+  caller's environment cannot redirect or skip them.
+
+**Residual / tradeoffs.**
+- With nested user namespaces denied: nested bubblewrap / Flatpak,
+  Chromium, Playwright or Puppeteer using their namespace sandbox
+  (instead of `--no-sandbox`), and rootless container engines run
+  *inside* the sandbox fail. Docker / Podman clients talking to a host
+  daemon through a shared socket (#63) are unaffected; that daemon
+  creates the namespaces outside the sandbox.
+- bwrap without `--disable-userns` / `--add-seccomp-fd` support refuses
+  the protected launch; there is no warn-and-skip path.
+- `TIOCSTI` is often already blocked by the kernel (`legacy_tiocsti=0`,
+  `EIO`); the tests credit only `EPERM` against an unfiltered control to
+  the filter. The filter is only as complete as libseccomp's arch
+  support and the compat list above.
+- Native coverage: `tests/test_linux_process_isolation.bash` (CI
+  `smoke-linux`): nested `unshare` denial and relaxed success, ioctl
+  `EPERM` versus the unfiltered control, descriptor leaks, a caller filter
+  combined with ours, real knob and probe denial in a child user
+  namespace, and a private PTY driving a real launch (`/dev/tty`, raw
+  input, resize, Ctrl+C, cleanup). Results from one kernel/arch are not
+  claims about others.
+
 ## Local bugs / brittleness
 
 ### B-α — `mkdir -p ~/.claude` follows symlinks (RESOLVED, 2026-05-24, WS3)
