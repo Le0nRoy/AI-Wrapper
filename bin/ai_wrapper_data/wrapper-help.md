@@ -102,6 +102,91 @@ The sandbox bounds *writes* — it does not bound *reads* or *network*. Be aware
   restored from the per-workdir preset (a preset entry is ignored with a
   WARN). The worktree links are ordinary files, not proof that you own
   the repository; turn it on only for your own repositories.
+<!-- os:linux -->
+- `AI_SANDBOX_ALLOW_BIN_RW=1` — bind `~/bin` read-write. Off by default:
+  `~/bin` is read-only, so its programs still run (it is first on the
+  sandbox PATH) but cannot be added, replaced or deleted. On, the agent
+  can plant programs you later run outside the sandbox. Red banner.
+- `AI_SANDBOX_ALLOW_AGENTS_SKILLS_RW=1` — bind the shared skill source
+  `~/ai-wrapper/.agents` read-write. Off by default (read-only):
+  `setup_skills.bash` copies it into every client's skill directory, so a
+  writable copy lets the agent rewrite skills other sessions load. Red
+  banner.
+- `AI_SANDBOX_ALLOW_ANDROID=1` — bind `~/Android` (SDK, emulator images,
+  debug keystores) read-write. Off by default: not visible in the sandbox.
+- `AI_SANDBOX_PASS_TAILSCALE=1` — bind `/run/tailscale/tailscaled.sock`
+  read-only. Off by default: no socket in the sandbox. The read-only bind
+  only stops the socket file being replaced or removed; it does **not**
+  make the Tailscale API read-only. `tailscaled` authorises each LocalAPI
+  request by the caller's user ID, and the sandbox runs as your user, so
+  the agent can do whatever `tailscaled` allows your user (with
+  `tailscale set --operator=$USER`, that includes changing settings).
+  Red banner.
+- User runtime dir: the host `$XDG_RUNTIME_DIR` (`/run/user/UID`) is
+  **not** shared. The sandbox gets its own empty runtime dir (mode
+  `0700`), exported as `XDG_RUNTIME_DIR` — the host path when it lies
+  under `/run` or `/tmp` and nothing else is mounted there, otherwise
+  `/run/user/UID`; also when the host value is unset or invalid. Files
+  and sockets created there vanish with the sandbox. Only named sockets
+  are shared: the SSH agent socket at its own path
+  (`AI_SANDBOX_PASS_SSH_AGENT=1`) and the rootless Docker
+  (`$XDG_RUNTIME_DIR/docker.sock`) and Podman
+  (`$XDG_RUNTIME_DIR/podman/podman.sock`) sockets
+  (`AI_SANDBOX_ALLOW_DOCKER=1`; a `DOCKER_HOST` passed by
+  `AI_SANDBOX_PASS_DOCKER=1` that names the rootless socket is pointed at
+  where it is mounted). The D-Bus session bus, `systemd --user`,
+  keyring, display and audio servers are not reachable.
+- `AI_SANDBOX_ALLOW_XDG_RUNTIME_RW=1` — bind the host `$XDG_RUNTIME_DIR`
+  read-write (the behaviour before this setting existed). It must exist,
+  be yours, and not be a system directory, `$HOME`, a dotfile directory,
+  a parent of `$HOME`, or writable by others; otherwise the launch stops
+  with the reason. Every socket in it becomes reachable with your user ID,
+  whatever the SSH-agent and Docker settings say. What the agent can then
+  do depends on each service (through the session bus or
+  `systemd --user` this may include starting programs outside the
+  sandbox). Red banner and a launch `WARNING`.
+
+- Nested user namespaces: the sandbox runs with `--unshare-user
+  --disable-userns --assert-userns-disabled`, so the agent cannot create
+  user namespaces of its own. Ordinary tools, git and Docker/Podman
+  clients using a shared host socket are unaffected; nested bubblewrap
+  or Flatpak, Chromium/Playwright without `--no-sandbox` and container
+  engines run inside the sandbox fail. If bubblewrap cannot enforce this
+  (no `--disable-userns` support), the launch stops with the reason.
+- `AI_SANDBOX_ALLOW_NESTED_USERNS=1` — launch without that restriction.
+  Each nested namespace gives the agent namespace-root capabilities and
+  more kernel attack surface. Red banner and a launch `WARNING`.
+- Terminal injection: a seccomp filter makes `ioctl(TIOCSTI)` and
+  `ioctl(TIOCLINUX)` fail with `EPERM`, so the agent cannot type
+  commands into your terminal that run after the session. Nothing else
+  changes: `/dev/tty`, raw input, window resize and Ctrl+C work as
+  usual. The filter is built on the host with `python3 -I` and the
+  libseccomp runtime library (`libseccomp2`); if either is missing or
+  the filter fails its self-test, the launch stops with the reason.
+- `AI_SANDBOX_ALLOW_TIOCSTI=1` — launch without the terminal filter. On
+  kernels that still allow `TIOCSTI` the agent can then inject input.
+  Yellow banner and a launch `WARNING`.
+- Preflight: reads `/proc/sys/kernel/unprivileged_userns_clone` and
+  `/proc/sys/user/max_user_namespaces` directly (no `sysctl` binary). A
+  knob your kernel does not have is fine; one set to `0` stops the
+  launch. Before the client starts, a minimal bubblewrap sandbox with the
+  same isolation options runs `true`; if it fails, the launch stops and
+  says whether user namespaces are denied (kernel, AppArmor, container),
+  bubblewrap lacks an option, the filter could not load, or it is a
+  setup problem.
+
+These seven controls are Linux-only and ordinary settings: saved to and
+restored from the per-workdir preset like the other toggles. A path
+missing on the host is skipped, never created. An explicit wider grant
+still applies: launching from (or `AI_SANDBOX_EXTRA_RW_DIRS` on) a
+directory at or above `~/bin` or `~/ai-wrapper/.agents` makes that tree
+writable whatever these toggles say; likewise a WORKDIR or
+`AI_SANDBOX_EXTRA_RW_DIRS` entry that contains the host runtime dir
+exposes it and its sockets whatever the runtime settings say. Kind
+support was removed: `~/.kind` and `~/kind_dot_kube` are never mounted
+and `KIND_EXPERIMENTAL_PROVIDER` is not passed; Kubernetes access is `AI_SANDBOX_PASS_KUBE` (`~/.kube`,
+`KUBECONFIG`).
+<!-- os:end -->
 <!-- os:darwin -->
 - `AI_SANDBOX_PROFILE=<path>` — point at an alternative SBPL profile (absolute
   path, or relative to the universal wrapper's directory). Replaces the base

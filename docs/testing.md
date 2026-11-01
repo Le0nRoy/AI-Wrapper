@@ -31,7 +31,9 @@ Every test that sources wrapper code or launches a wrapper calls
   in `tests/test_sandbox_common.bash`); it is removed on exit.
 - Inherited wrapper settings (`AI_SANDBOX_*`, `AI_WRAPPER_*`, `*_ACCOUNT`),
   client state and credential variables (`CODEX_*`, `CLAUDE_*`, `GH_*`,
-  `GITHUB_*`, `*TOKEN*`, `*API_KEY*`, ...), `GIT_DIR`-style redirections,
+  `GITHUB_*`, `*TOKEN*`, `*API_KEY*`, ...), the host session's
+  `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS` and `CONTAINER_HOST`,
+  `GIT_DIR`-style redirections,
   `BASH_ENV`/`ENV` and exported shell functions are cleared.
 - `PATH` becomes `FAKE_HOME/bin` plus the host `PATH` without empty,
   relative, or real-`$HOME` entries. Toolchains in `/usr/local`, Homebrew,
@@ -62,11 +64,14 @@ that launch a real sandbox.
 | `test_preset_identity.bash` | fake home under `$HOME`, stub `sha256sum`/`shasum` dirs, preset files | bash, python3 | full | full |
 | `test_setup_skills.bash` | fake home under `$TMPDIR` | bash, coreutils | full | full |
 | `dot_agents/skills/tortuga/scripts/test_gh.py` | none (mocked `subprocess`) | python3 | full | full |
-| `test_sandbox_common.bash`, `test_extra_bind_dirs.bash` | launches the real sandbox, fake home | bwrap + userns / sandbox-exec | fails without bwrap/sysctl | full |
+| `test_sandbox_common.bash`, `test_extra_bind_dirs.bash` | launches the real sandbox, fake home | bwrap + userns, python3 + libseccomp / sandbox-exec | fails without bwrap, user namespaces or the filter prerequisites | full |
 | `test_sandbox_macos_only.bash` | sandbox-exec dry-run | sandbox-exec | exits 0 with a skip line | full |
 | `test_macos_ro_overlays.bash` | git repos in fake home; stub `getconf`/`sandbox-exec` off macOS | git; sandbox-exec for native checks | rule rendering + mocked dry-run; native part skipped | full, native write denial (missing sandbox-exec fails) |
 | `test_codex_wrapper.bash`, `test_agy_wrapper.bash`, `test_copilot_wrapper.bash` | git repos, sqlite db, stub clients in fake home; bwrap e2e | git, python3 (sqlite3, tomllib optional), bwrap for e2e | full with bwrap; e2e skipped without | argv/unit parts; bwrap e2e skipped |
 | `test_bind_hardening.bash` | git repos (incl. a worktree with nested submodules via local file:// clones), stub codex in fake home, temp alias dir under `/tmp` (macOS) | git, perl; bwrap or sandbox-exec for e2e | full with bwrap; e2e skipped without | full: native worktree write-denial e2e (missing sandbox-exec fails) |
+| `test_linux_host_binds.bash` | fake home under `$HOME` (synthetic `~/bin`, skills, Android, Kind and kube dirs), stub `bwrap`/`sysctl` dir, a synthetic UNIX socket served by python3 | bash, python3; bwrap for native probes | full: argv gates, agy trust grants, native denial/persistence (missing bwrap fails) | agy trust grants only; Linux parts skipped |
+| `test_linux_runtime_dir.bash` | fake home under `$HOME`, synthetic runtime dirs under `/tmp`, stub `bwrap`/`sysctl` dir, synthetic UNIX socket servers (bus, systemd, Docker, Podman, SSH agent) served by python3 | bash, python3; bwrap for native probes | full: argv, agy trust, native socket denial/grants, private dir mode/owner, broad-override persistence (missing bwrap fails) | agy trust only; Linux parts skipped |
+| `test_linux_process_isolation.bash` | fake home under `$HOME`, fake `/proc/sys` knobs, stub `bwrap`/`sysctl` and helper scripts in a temp dir, a private pty (never the caller's terminal), one child user namespace for the denial check | bash, python3 + libseccomp; bwrap, `unshare` for native probes | full: filter helper unit tests (real filters in forked children), knob/probe/filter failure handling and argv, native nested-userns denial and relaxed success, ioctl EPERM vs unfiltered control, filter-descriptor leaks (by pipe identity, caller-held descriptors pass through), combined caller filter, real knob/probe denial, PTY launch (/dev/tty, raw input, resize, Ctrl+C, cleanup) (missing bwrap fails) | skipped (Linux-only) |
 | `test_sensitive_path_parity.bash` | fake home under `$HOME`; stub `getconf`/`sandbox-exec` off macOS; refusals from `/etc` (never granted to a client) | bash; bwrap or sandbox-exec for native refusals | classifier tables + mocked macOS backend; native Linux refusals need bwrap (missing bwrap fails) | full, native refusals incl. `/private/etc` |
 | `test_external_worktree.bash` | git repos in fake home and in a sibling dir outside it (real `$HOME` or the checkout's `tests/`), one in the system temp dir, preset files, stub codex; drives the interactive menu through a pty | git, perl, python3; bwrap or sandbox-exec for e2e | full with bwrap; e2e skipped without | full: native external-worktree write/read denial (missing sandbox-exec fails) |
 | `test_workdir_git_protection.bash` | git repos (normal, worktree, bare, scaffold, nested submodules via local file:// clones) and stub clients in fake home | git, perl, python3; bwrap or sandbox-exec for e2e | full with bwrap; missing bwrap fails | full: native WORKDIR git metadata write denial (missing sandbox-exec fails) |
@@ -83,16 +88,22 @@ is the local equivalent. Keep both in sync when adding a test file.
   identity.
 - `smoke-linux`: bubblewrap installed; sandbox, extra-binds, isolation
   canaries (with e2e), codex, bind-hardening, external worktrees,
-  WORKDIR git metadata, macOS RO-overlay rendering, agy, copilot.
+  WORKDIR git metadata, macOS RO-overlay rendering, agy, copilot, Linux
+  host-path gates (native ~/bin / skills / Android / Tailscale / Kind probes),
+  user runtime dir (native socket denial and named grants), process
+  isolation (nested user namespaces, terminal-injection filter, launch
+  preflight; installs `python3` and `libseccomp2`).
 - `smoke-macos`: sandbox, macOS-only, extra-binds, bind-hardening,
-  external worktrees, WORKDIR git metadata and RO overlays (native write denial), preset
+  external worktrees, WORKDIR git metadata and RO overlays (native write denial),
+  agy trust grants for the Linux host-path gates and runtime dir, preset
   suite.
 
 ## Reading results
 
 - A `skip - ...` line is not a pass. It names what was not checked and why.
-- A failing sandbox test on a host without bwrap/sysctl or sandbox-exec is
-  environmental; it fails the same way on `main`. Report it as such.
+- A failing sandbox test on a host without bwrap or user namespaces
+  (Linux; python3 + libseccomp too since #64) or without sandbox-exec
+  (macOS) is environmental. Report it as such.
 - Real-CLI flag acceptance (does an installed `codex`/`agy`/`copilot`
   accept the argv the wrapper builds?) is a manual gate. Tests check argv
   construction against stubs only and never launch an installed client.

@@ -40,10 +40,12 @@ this section records the disposition.
   and any `npm_config_*authToken*` / `*authtoken*` / `*_auth` name).
 - **3.I → `AI_SANDBOX_ALLOW_DOCKER` env knob.** New **S-η** entry in
   the threat model. SBPL Docker / Colima / `~/.docker` rules are now
-  wrapped in `(when (equal? (param "ALLOW_DOCKER") "1") …)`. Default
-  remains `1` (preserves the working-out-of-the-box `docker` CLI);
-  set `0` to omit the rules and close the host-root escape path when
-  the daemon is up.
+  wrapped in `(when (equal? (param "ALLOW_DOCKER") "1") …)`. The
+  default is now `0` on both backends (settings catalog, the Linux
+  bwrap wrapper and the SBPL param), which omits the rules and closes
+  the host-root escape path; set `1` only when the session needs the
+  `docker` CLI. (This entry originally said the default stayed `1`;
+  corrected by #62.)
 - **3.J → BLOCK_LOCALHOST scope clarified.** README now states
   explicitly that the flag is IP-only — it does not cover Unix-domain
   sockets or link-local addresses (AWS IMDS at `169.254.169.254`).
@@ -398,6 +400,194 @@ causes operational pain; a real per-process fork limit on macOS would
 need launchd integration, which remains out of scope. OS-level OOM
 kills can still happen but the wrapper no longer claims to interpret
 them as rlimit-induced.
+
+### S-θ — Linux host dirs and the Tailscale socket bound unconditionally (RESOLVED, 2026-10, #62)
+
+The bwrap backend bound, whenever they existed and with no setting:
+`~/bin` RW (first on the sandbox PATH and on the host user's), the
+shared skill source `~/ai-wrapper/.agents` RW (copied into every
+client's skill dir by `setup_skills.bash`), `~/Android` RW, `~/.kind`
+RW, `~/kind_dot_kube` RW *onto `~/.kube`* (a kubeconfig even with
+`AI_SANDBOX_PASS_KUBE=0`), and `/run/tailscale/tailscaled.sock` RW. An
+agent could plant a program or rewrite a skill that later runs outside
+the sandbox, or use Kubernetes / Tailscale access nobody granted.
+
+**Resolution.** Linux-only catalog settings (default `0`, shown only on
+Linux, saved in the per-workdir preset like other toggles):
+
+| Resource | Default | Opt-in |
+|----------|---------|--------|
+| `~/bin` | `--ro-bind` (runs, not writable) | `AI_SANDBOX_ALLOW_BIN_RW=1` → `--bind` |
+| `~/ai-wrapper/.agents` | `--ro-bind` | `AI_SANDBOX_ALLOW_AGENTS_SKILLS_RW=1` → `--bind` |
+| `~/Android` | absent | `AI_SANDBOX_ALLOW_ANDROID=1` → `--bind` |
+| `/run/tailscale/tailscaled.sock` | absent | `AI_SANDBOX_PASS_TAILSCALE=1` → `--ro-bind` |
+| `~/.kind`, `~/kind_dot_kube`, `KIND_EXPERIMENTAL_PROVIDER` | removed (Kind support dropped) | none |
+
+`~/.kube` / `KUBECONFIG` stay behind `AI_SANDBOX_PASS_KUBE` (RO).
+Relaxed modes log a `WARNING` at launch. Missing host paths are
+skipped, never created; host Kind files are left in place. The
+protected binds mount before WORKDIR and the extra binds, so an
+explicit grant at or above them still wins (bwrap's later mount
+covers the earlier one): launching from `~/ai-wrapper`, or
+`AI_SANDBOX_EXTRA_RW_DIRS=~/bin`, makes that tree writable whatever
+the toggles say, and a WORKDIR inside `~/bin` stays writable while
+the rest of `~/bin` stays read-only. `_agy_path_sandbox_writable`
+follows the same rules (Linux + opt-in, or a covering grant).
+
+**Residual.**
+- A read-only bind of a UNIX socket stops the socket file being
+  removed or replaced, not `connect()`/`send()`. With
+  `AI_SANDBOX_PASS_TAILSCALE=1` the agent talks to the LocalAPI with
+  the host user's UID (`SO_PEERCRED`), so it can do whatever
+  `tailscaled` allows that user — read-only for a plain user,
+  settings changes for `--operator=$USER`. There is no read-only
+  Tailscale API mode.
+- `/run/user/$UID` (`XDG_RUNTIME_DIR`) was still bound RW; resolved
+  by #63 (S-ι).
+- macOS binds none of these paths; unchanged.
+- Native enforcement is tested by `tests/test_linux_host_binds.bash`
+  under real bubblewrap (CI `smoke-linux`), with a synthetic socket
+  standing in for `tailscaled`.
+
+### S-ι — Linux user runtime dir bound wholesale; XDG_RUNTIME_DIR lost (RESOLVED, 2026-11, #63)
+
+The bwrap backend bound the host `$XDG_RUNTIME_DIR` (normally
+`/run/user/$UID`) read-write whenever it existed. It holds the
+session's sockets: D-Bus session bus, `systemd --user`, keyring / Secret
+Service, Wayland / X / PipeWire / PulseAudio, SSH and GPG agents,
+rootless Docker / Podman. The sandbox runs as the host UID, and these
+daemons authorise callers by UID (`SO_PEERCRED`) — a read-only bind
+would not have changed that. So `AI_SANDBOX_PASS_SSH_AGENT=0` and
+`AI_SANDBOX_ALLOW_DOCKER=0` did not stop an agent that found the
+sockets. What each socket allowed depends on that daemon. Separately,
+`--setenv XDG_RUNTIME_DIR` came before `--clearenv`, so the client never
+saw the variable.
+
+**Resolution.**
+
+| Resource | Default | Opt-in |
+|----------|---------|--------|
+| Runtime dir | private, empty, `--perms 0700 --dir`; host path if it lies below `/run` or `/tmp` and no other mount overlaps it, else `/run/user/UID` (also when unset/invalid) | `AI_SANDBOX_ALLOW_XDG_RUNTIME_RW=1` → `--bind` of the validated host dir |
+| `XDG_RUNTIME_DIR` | set after `--clearenv` to the sandbox dir | same |
+| SSH agent socket | absent | `AI_SANDBOX_PASS_SSH_AGENT=1` → `--bind` at `SSH_AUTH_SOCK`'s exact path |
+| Rootless `docker.sock`, `podman/podman.sock` | absent | `AI_SANDBOX_ALLOW_DOCKER=1` → `--bind` into the sandbox runtime dir (socket, not a symlink, owned by you) |
+| Session bus, `systemd/`, keyring, display, audio, other sockets | absent | broad override only |
+
+`AI_SANDBOX_ALLOW_XDG_RUNTIME_RW` is a Linux-only red catalog setting
+(saved in the per-workdir preset). It requires an existing directory,
+resolved through symlinks, owned by the user, not a system root,
+`$HOME`, a dotfile dir, a parent of `$HOME`, or group/world-writable;
+otherwise the launch fails with the reason instead of falling back. The
+permission check fails closed: if it cannot run, the launch is refused.
+`AI_SANDBOX_PASS_DOCKER` still alone controls `DOCKER_HOST` and
+`~/.docker`; a `DOCKER_HOST` that names the shared rootless socket via a
+host spelling the sandbox does not reuse is rewritten to the mounted
+path. `_agy_path_sandbox_writable` no longer treats the runtime dir as a
+writable root (the private dir is a sandbox tmpfs even at the host
+path), except on Linux with the override; WORKDIR, extra RW and
+`--bind` grants that cover it still count.
+
+**Residual.**
+- A wider explicit grant wins: a WORKDIR, `AI_SANDBOX_EXTRA_RW_DIRS`
+  entry or plugin `--bind` that contains the host runtime dir exposes it
+  and its sockets regardless of these settings. In that overlap the
+  sandbox uses `/run/user/UID` so its private dir setup never touches
+  the host-backed path.
+- Shared sockets are full API access to that daemon for the host UID;
+  bind flags do not restrict the API.
+- `--perms` needs bubblewrap 0.5 or newer.
+- Native enforcement is tested by `tests/test_linux_runtime_dir.bash`
+  under real bubblewrap (CI `smoke-linux`), with synthetic socket
+  servers standing in for the bus, `systemd`, Docker, Podman and SSH
+  agents.
+
+### S-κ — Linux process isolation: nested user namespaces, TIOCSTI, sysctl preflight (RESOLVED, 2026-11, #64)
+
+Three gaps in the bwrap backend:
+
+- **L3.** `--unshare-all` only *tries* a user namespace and leaves the
+  sandboxed process free to create more. Each nested user namespace
+  gives it namespace-root capabilities and reaches kernel code
+  (filesystem mounts, netfilter, ...) an unprivileged process cannot.
+- **L5.** The sandbox shared the caller's controlling terminal with no
+  filter, so on kernels that still allow `ioctl(TIOCSTI)`
+  (`dev.tty.legacy_tiocsti=1`, or older than 6.2) the agent could push
+  keystrokes into the terminal's input queue for the shell to run after
+  the session (CVE-2017-5226 class). `TIOCLINUX` offers a similar
+  console-selection paste path.
+- **L7.** Preflight required the `sysctl` binary and failed when
+  `kernel.unprivileged_userns_clone` did not exist; it never checked that
+  a namespace could actually be created.
+
+**Resolution.**
+
+| Control | Default | Opt-out |
+|---------|---------|---------|
+| Nested user namespaces | `--unshare-user --disable-userns --assert-userns-disabled` | `AI_SANDBOX_ALLOW_NESTED_USERNS=1` (red, Linux) omits them, launch `WARNING` |
+| Terminal injection | seccomp filter: `ioctl(TIOCSTI)` and `ioctl(TIOCLINUX)` fail with `EPERM`; everything else allowed | `AI_SANDBOX_ALLOW_TIOCSTI=1` (yellow, Linux) omits it, launch `WARNING` |
+| Knob check | `/proc/sys/kernel/unprivileged_userns_clone`, `/proc/sys/user/max_user_namespaces` read directly | none |
+| Launch probe | real bwrap run of the external `true` that must create a user namespace (`--unshare-user`), with the launch's isolation options | none |
+
+- *Filter.* `bin/ai_wrapper_data/linux_tty_seccomp.py`, run as
+  `python3 -I` on the host, loads libseccomp through ctypes, resolves
+  the native `ioctl` syscall through it, adds the 32-bit compat ABIs
+  (`x86`/`x32` on `x86_64`, `arm` on `aarch64`; any other arch hits
+  libseccomp's bad-arch kill), and matches the request on its low 32
+  bits (the kernel truncates the command, so `1<<32 | TIOCSTI` is the
+  same ioctl). Request values come from Python's `termios`. Before it
+  prints the filter it loads the exported BPF in a forked child that
+  owns a private pty and checks that `TIOCSTI` (plain and high-bit) and
+  `TIOCLINUX` turn from non-`EPERM` into `EPERM` while `TIOCGWINSZ` still
+  works. The wrapper accepts only whole 8-byte instructions, feeds the
+  filter through a pipe to `--add-seccomp-fd` (one fresh descriptor for
+  the probe, one for the launch, both closed afterwards) and never reads
+  a filter from a file. A missing interpreter, library, symbol or
+  architecture match, a failed self-test or a filter bwrap cannot load
+  refuses the launch and names `AI_SANDBOX_ALLOW_TIOCSTI=1`. Python 3
+  and the libseccomp runtime (`libseccomp2`) are Linux prerequisites.
+- *Terminal behaviour.* No `--new-session`, no PTY proxy, no signal
+  forwarding: the client keeps the controlling terminal, `/dev/tty`,
+  raw input, window size and `SIGWINCH`, and Ctrl+C reaches it as
+  `SIGINT` (the wrapper and bwrap receive it too, as before; bwrap
+  exiting on it ends the session, so a clean exit 0 is not promised).
+- *Caller filters.* A `--seccomp FD` added by a hook is switched to the
+  equivalent `--add-seccomp-fd FD` (bwrap refuses to mix them); the
+  kernel applies every filter and the strictest result wins, so ours
+  never replaces or weakens it. With `AI_SANDBOX_ALLOW_TIOCSTI=1` the
+  caller's flags are left as given.
+- *Preflight.* An absent knob is inconclusive. One that is `0`, cannot
+  be read or holds a non-number refuses the launch (no privileged fix is
+  prescribed). The probe binds `/usr`, `/bin`, `/lib`, `/lib64` where they
+  exist and runs `type -P true`; its output is captured in memory. The
+  refusal says whether bwrap lacks an option (names the opt-out), could
+  not disable nested namespaces, could not load the filter, hit a setup
+  problem (`execvp`, missing path — not a namespace denial), or was
+  denied a user namespace (kernel, LSM such as AppArmor, container
+  runtime). The probe source paths are assigned at source time; the
+  caller's environment cannot redirect or skip them.
+
+**Residual / tradeoffs.**
+- With nested user namespaces denied: nested bubblewrap / Flatpak,
+  Chromium, Playwright or Puppeteer using their namespace sandbox
+  (instead of `--no-sandbox`), and rootless container engines run
+  *inside* the sandbox fail. Docker / Podman clients talking to a host
+  daemon through a shared socket (#63) are unaffected; that daemon
+  creates the namespaces outside the sandbox. A client's own
+  bubblewrap-based command sandbox would also need the opt-out; the
+  wrappers launch clients with their built-in sandboxes turned off.
+- bwrap without `--disable-userns` / `--add-seccomp-fd` support refuses
+  the protected launch; there is no warn-and-skip path.
+- `TIOCSTI` is often already blocked by the kernel (`legacy_tiocsti=0`,
+  `EIO`); the tests credit only `EPERM` against an unfiltered control to
+  the filter. The filter is only as complete as libseccomp's arch
+  support and the compat list above.
+- Native coverage: `tests/test_linux_process_isolation.bash` (CI
+  `smoke-linux`): nested `unshare` denial and relaxed success, ioctl
+  `EPERM` versus the unfiltered control, descriptor leaks, a caller filter
+  combined with ours, real knob and probe denial in a child user
+  namespace, and a private PTY driving a real launch (`/dev/tty`, raw
+  input, resize, Ctrl+C, cleanup). Results from one kernel/arch are not
+  claims about others.
 
 ## Local bugs / brittleness
 
@@ -928,8 +1118,10 @@ are gone.
   than enforced by the helper. On macOS the probe dir is in `$TMPDIR`,
   which the sandbox can write; a running agent could make the probe fail
   (a refusal) but cannot change how the library behaves.
-- `~/bin` (which holds the deployed wrapper itself) is bound RW into the
-  sandbox. That shared-sandbox gap is tracked separately (#17).
+- `~/bin` was bound RW into the sandbox on Linux. Since #62 it is
+  read-only unless `AI_SANDBOX_ALLOW_BIN_RW=1` (S-θ); the trust check
+  counts it as writable only then, or when a wider grant (WORKDIR,
+  `AI_SANDBOX_EXTRA_RW_DIRS`, a `--bind` in `WRAPPER_FLAGS`) covers it.
 
 ### B-β — `_realpath` fallback chain has multiple silent branches (RESOLVED, 2026-05-24, WS6)
 
@@ -953,8 +1145,9 @@ Each `--bind` / `--ro-bind` appends to the profile string passed to
 
 **Disposition.** Deferred. The bind-array growth pattern this
 concerned was largely a Linux-side artifact (the upstream bwrap
-wrapper auto-binds `~/.kube`, `~/.kind`, `~/Android`, `~/bin`,
-`~/.agents`, etc., growing the array fast). Post-WS1 the macOS flag
+wrapper auto-bound `~/.kube`, `~/.kind`, `~/Android`, `~/bin`,
+`~/.agents`, etc., growing the array fast; since #62 only `~/bin` and
+`~/ai-wrapper/.agents` are bound by default, read-only, see S-θ). Post-WS1 the macOS flag
 surface is single-arg and the wrapper only adds three to four binds
 in practice. Revisit if a future caller ever needs hundreds of binds
 or if the auto-bind set grows substantially.
@@ -1088,10 +1281,12 @@ does not re-open the question.
   Re-evaluate if a second account is required. (Was tracked as R2 in
   the README "Linux merge" section; both the env-var row and the R2
   paragraph have been removed; this entry is the breadcrumb.)
-- **Tailscale integration** — not needed. No reachability to
-  Tailscale-bound services required from the sandbox. Upstream
-  `cb4aaa5` (unconditional Tailscale socket bind) explicitly NOT
-  pulled. Historical references to Tailscale inside
+- **Tailscale integration** — the Linux wrapper did carry an
+  unconditional `--bind` of `/run/tailscale/tailscaled.sock` (from
+  upstream `cb4aaa5`) despite this entry saying it was not pulled.
+  Since #62 it is off by default and only `AI_SANDBOX_PASS_TAILSCALE=1`
+  RO-binds the socket (S-θ); macOS has no Tailscale grant. Historical
+  references to Tailscale inside
   `docs/plans/2026-05-23-sandbox-migration.md` and
   `docs/plans/2026-05-23-sandbox-hardening-context.md` stay as
   upstream-example context — they are not active grants.

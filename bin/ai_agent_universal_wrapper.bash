@@ -121,6 +121,174 @@ run_sandboxed_agent() {
     esac
 }
 
+# Host tailscaled socket bound by AI_SANDBOX_PASS_TAILSCALE=1. Assigned at
+# source time, so the caller's environment cannot redirect the bind source.
+_AI_SANDBOX_TAILSCALE_SOCKET=/run/tailscale/tailscaled.sock
+
+# Rootless container daemon sockets, relative to the user runtime dir,
+# shared by AI_SANDBOX_ALLOW_DOCKER=1: rootless dockerd's default
+# DOCKER_HOST and the podman.socket user unit's endpoint (the default of
+# `podman --remote` / CONTAINER_HOST).
+_AI_SANDBOX_ROOTLESS_DOCKER_SOCKET=docker.sock
+_AI_SANDBOX_ROOTLESS_PODMAN_SOCKET=podman/podman.sock
+
+# Mode of the sandbox's private runtime directory (XDG Base Directory spec).
+_AI_SANDBOX_RUNTIME_DIR_PERMS=0700
+
+# Linux process isolation inputs: the procfs sysctl root read by the user
+# namespace knob check, and the interpreter and host helper that build the
+# terminal-injection seccomp filter. Assigned at source time, so the
+# caller's environment cannot redirect them.
+_AI_SANDBOX_PROC_SYS=/proc/sys
+_AI_SANDBOX_PYTHON=python3
+_AI_SANDBOX_TTY_FILTER_HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/ai_wrapper_data/linux_tty_seccomp.py"
+# Options that stop the sandboxed process creating user namespaces of its
+# own (AI_SANDBOX_ALLOW_NESTED_USERNS=0). --disable-userns needs an
+# explicit --unshare-user: --unshare-all only tries one.
+_AI_SANDBOX_NO_NESTED_USERNS_ARGS=(--unshare-user --disable-userns --assert-userns-disabled)
+
+# Kernel knobs that can switch unprivileged user namespaces off; bubblewrap
+# needs them. A knob this kernel does not have is inconclusive (the launch
+# probe decides). One that exists refuses the launch when it is 0, cannot
+# be read, or does not hold a number. Prints the reason and returns 1.
+_sandbox_userns_knobs_check() {
+    local knob path value
+    for knob in kernel/unprivileged_userns_clone user/max_user_namespaces; do
+        path="${_AI_SANDBOX_PROC_SYS}/${knob}"
+        [[ -e "${path}" ]] || continue
+        if ! value="$(cat -- "${path}" 2>/dev/null)"; then
+            echo "cannot read ${path}"; return 1
+        fi
+        if [[ ! "${value}" =~ ^[0-9]+$ ]]; then
+            echo "${path} holds '${value}', not a number"; return 1
+        fi
+        if (( value == 0 )); then
+            echo "${knob//\//.} is 0: unprivileged user namespaces are disabled on this host, and bubblewrap needs them"; return 1
+        fi
+    done
+    return 0
+}
+
+# Builds the terminal-injection seccomp filter with the host helper (python3
+# -I + libseccomp; see linux_tty_seccomp.py). Prints the filter as printf
+# %b escapes, or the reason with return 1: a missing interpreter, a helper
+# failure (missing library, symbol or architecture support, a filter that
+# fails its self-test) or output that is not a whole BPF program.
+_sandbox_tty_filter() {
+    local python_bin out rc=0
+    local -r escape_len=4 bpf_insn_bytes=8
+    python_bin="$(type -P "${_AI_SANDBOX_PYTHON}")" || { echo "${_AI_SANDBOX_PYTHON} not found on PATH"; return 1; }
+    [[ -r "${_AI_SANDBOX_TTY_FILTER_HELPER}" ]] || { echo "helper ${_AI_SANDBOX_TTY_FILTER_HELPER} is missing"; return 1; }
+    out="$("${python_bin}" -I "${_AI_SANDBOX_TTY_FILTER_HELPER}" 2>&1 </dev/null)" || rc=$?
+    if (( rc != 0 )); then
+        echo "${out:-helper exited ${rc}}"; return 1
+    fi
+    if [[ ! "${out}" =~ ^(\\x[0-9a-f]{2})+$ ]] || (( ${#out} % (escape_len * bpf_insn_bytes) != 0 )); then
+        echo "helper output is not a BPF program"; return 1
+    fi
+    printf '%s\n' "${out}"
+}
+
+# Launch probe: runs the external `true` in a minimal bubblewrap sandbox with
+# the launch's isolation options OPTION... (nested user namespace
+# restriction, a fresh terminal-filter descriptor), so that a host that
+# cannot create user namespaces, a bubblewrap without a required option or
+# a filter bubblewrap cannot load is refused, with the reason, before the
+# client starts. Mirrors the launch's system binds that exist here. Always
+# requires a new user namespace (--unshare-user): --unshare-all alone only
+# tries one, so a caller holding namespace capabilities (e.g. root in a
+# parent user namespace) would pass without one being created. Prints the
+# reason and returns 1 on failure.
+_sandbox_linux_probe() {
+    local true_bin out rc=0 dir
+    true_bin="$(type -P true)" || { echo "setup problem: no external 'true' executable on PATH for the probe"; return 1; }
+    local -a probe_args=(--die-with-parent --unshare-all --unshare-user "$@")
+    for dir in /usr /bin /lib /lib64; do
+        [[ -e "${dir}" ]] && probe_args+=(--ro-bind "${dir}" "${dir}")
+    done
+    out="$(bwrap "${probe_args[@]}" "${true_bin}" 2>&1 </dev/null)" || rc=$?
+    (( rc == 0 )) && return 0
+    out="${out:-no output}"
+    case "${out}" in
+        *"Unknown option"*)
+            echo "this bubblewrap lacks an option the sandbox needs (${out}). Upgrade bubblewrap, or turn the protection that needs it off: AI_SANDBOX_ALLOW_NESTED_USERNS=1 (--disable-userns, --assert-userns-disabled) or AI_SANDBOX_ALLOW_TIOCSTI=1 (--add-seccomp-fd)." ;;
+        *"not disabled"*|*"disable-userns"*|*"max_user_namespaces"*)
+            echo "bubblewrap could not stop nested user namespaces (${out}). Set AI_SANDBOX_ALLOW_NESTED_USERNS=1 to launch without that restriction." ;;
+        *seccomp*|*SECCOMP*)
+            echo "bubblewrap could not load the terminal-injection filter (${out}). Set AI_SANDBOX_ALLOW_TIOCSTI=1 to launch without it." ;;
+        *execvp*|*"No such file or directory"*)
+            echo "setup problem, not a user namespace denial: the probe could not run ${true_bin} in a minimal sandbox (${out})." ;;
+        *namespace*|*"uid map"*|*"Operation not permitted"*|*"Permission denied"*)
+            echo "user namespaces cannot be created here; the kernel, a security module (e.g. AppArmor) or a container runtime denies them (${out})." ;;
+        *)
+            echo "bubblewrap probe exited ${rc} (${out})." ;;
+    esac
+    return 1
+}
+
+# Canonical path of the host user runtime dir DIR (normally $XDG_RUNTIME_DIR).
+# Prints the resolved path and returns 0 when DIR is set, absolute, an
+# existing directory, and owned by the current user; otherwise prints the
+# reason and returns 1. Symlinked spellings resolve to their target.
+_sandbox_runtime_dir_canonical() {
+    local dir="${1}" canon
+    [[ -n "${dir}" ]] || { echo "XDG_RUNTIME_DIR is not set"; return 1; }
+    [[ "${dir}" == /* ]] || { echo "'${dir}' is not an absolute path"; return 1; }
+    [[ -d "${dir}" ]] || { echo "'${dir}' is not an existing directory"; return 1; }
+    canon="$(cd "${dir}" 2>/dev/null && pwd -P)" || { echo "'${dir}' cannot be resolved"; return 1; }
+    [[ -O "${canon}" ]] || { echo "${canon} is not owned by you"; return 1; }
+    printf '%s\n' "${canon}"
+}
+
+# Validation for AI_SANDBOX_ALLOW_XDG_RUNTIME_RW=1, which binds the host
+# runtime dir RW. On top of _sandbox_runtime_dir_canonical, refuses system
+# roots, $HOME, dotfile dirs under it, a dir containing $HOME, and a dir
+# writable by group or others. Prints the canonical path, or the reason
+# with return 1. Args: DIR HOME
+_sandbox_broad_runtime_dir() {
+    local dir="${1}" home="${2%/}" canon home_canon perm_out perm_rc=0
+    canon="$(_sandbox_runtime_dir_canonical "${dir}")" || { echo "${canon}"; return 1; }
+    home_canon="$(cd "${home}" 2>/dev/null && pwd -P)" || home_canon="${home}"
+    if _sandbox_sensitive_dir_kind "${canon}" "${home}" >/dev/null \
+            || _sandbox_sensitive_dir_kind "${canon}" "${home_canon}" >/dev/null; then
+        echo "${canon} is a system location, \$HOME or a dotfile directory under \$HOME"; return 1
+    fi
+    case "${home_canon}/" in
+        "${canon}"/*) echo "${canon} contains \$HOME"; return 1 ;;
+    esac
+    # Fail closed: a checker that exits nonzero refuses, whatever it printed.
+    perm_out="$(find "${canon}" -maxdepth 0 \( -perm -020 -o -perm -002 \) -print 2>&1)" || perm_rc=$?
+    if (( perm_rc != 0 )); then
+        echo "cannot check permissions of ${canon}: ${perm_out:-find exited ${perm_rc}}"; return 1
+    fi
+    if [[ -n "${perm_out}" ]]; then
+        echo "${canon} is writable by other users"; return 1
+    fi
+    printf '%s\n' "${canon}"
+}
+
+# Succeeds when the private runtime dir can use the host runtime dir's own
+# canonical path CANON inside the sandbox, so paths the host session hands
+# out ($XDG_RUNTIME_DIR/..., DOCKER_HOST, SSH_AUTH_SOCK) stay valid. CANON
+# must lie below /run or /tmp (fresh tmpfs in the sandbox), and no path
+# already in the bwrap argv (ARGS: host binds such as WORKDIR) may equal,
+# contain or lie inside it: --dir there could create or reuse a
+# host-backed directory instead of a private one. Args: CANON ARGS...
+_sandbox_runtime_dir_mirrorable() {
+    local canon="${1}" arg
+    shift
+    case "${canon}" in
+        /run/?*|/tmp/?*) ;;
+        *) return 1 ;;
+    esac
+    for arg in "$@"; do
+        [[ "${arg}" == /* ]] || continue
+        case "${arg}" in /run|/tmp) continue ;; esac
+        [[ "${arg}" == "${canon}" || "${canon}" == "${arg%/}/"* || "${arg}" == "${canon}/"* ]] && return 1
+    done
+    return 0
+}
+
 _run_sandboxed_agent_linux() {
     local agent_name="${1}"
     local command="${1}"
@@ -129,29 +297,18 @@ _run_sandboxed_agent_linux() {
     # ===== PRE-FLIGHT VALIDATION =====
 
     # Check required commands exist
-    local missing_commands=()
-    for cmd in bwrap sysctl; do
-        if ! command -v "${cmd}" &>/dev/null; then
-            missing_commands+=("${cmd}")
-        fi
-    done
-
-    if [[ ${#missing_commands[@]} -gt 0 ]]; then
-        echo_log "ERROR" "[$agent_name] Required commands not found: ${missing_commands[*]}"
-        echo_log "ERROR" "Please install: bubblewrap, util-linux (or equivalent)"
+    if ! command -v bwrap &>/dev/null; then
+        echo_log "ERROR" "[$agent_name] Required commands not found: bwrap"
+        echo_log "ERROR" "Please install: bubblewrap"
         exit 127
     fi
 
-    # Check if user namespaces are enabled
-    UNPRIVILEGED_USERNS_CLONE="$(sysctl kernel.unprivileged_userns_clone 2>/dev/null | awk -F ' = ' '{print $2}')"
-    if [[ -z "${UNPRIVILEGED_USERNS_CLONE}" ]]; then
-        echo_log "ERROR" "[$agent_name] Failed to check user namespace support."
-        echo_log "ERROR" "Cannot read 'sysctl kernel.unprivileged_userns_clone'."
-        exit 1
-    elif [[ "${UNPRIVILEGED_USERNS_CLONE}" -ne 1 ]]; then
-        echo_log "ERROR" "[$agent_name] User namespaces are not enabled."
-        echo_log "ERROR" "Please set 'kernel.unprivileged_userns_clone = 1' in '/etc/sysctl.d/00-unpriv-ns.conf'"
-        echo_log "ERROR" "and run 'sudo sysctl --system' to fix it."
+    # User namespace knobs, read from procfs (no sysctl binary needed). An
+    # absent knob is not a failure: the launch probe below runs a real
+    # bubblewrap sandbox before the client starts.
+    local userns_reason
+    if ! userns_reason="$(_sandbox_userns_knobs_check)"; then
+        echo_log "ERROR" "[$agent_name] User namespaces are not available: ${userns_reason}"
         exit 1
     fi
 
@@ -183,6 +340,15 @@ _run_sandboxed_agent_linux() {
     local pass_openai="${AI_SANDBOX_PASS_OPENAI:-0}"; [[ "${pass_openai}" == "1" ]] || pass_openai=0
     local allow_sensitive_workdir="${AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR:-0}"; [[ "${allow_sensitive_workdir}" == "1" ]] || allow_sensitive_workdir=0
     local allow_ro_credentials="${AI_SANDBOX_ALLOW_RO_CREDENTIALS:-0}"; [[ "${allow_ro_credentials}" == "1" ]] || allow_ro_credentials=0
+    # Linux-only host-path gates (catalog OS_SCOPE "linux"; the macOS
+    # backend never binds these paths).
+    local allow_bin_rw="${AI_SANDBOX_ALLOW_BIN_RW:-0}"; [[ "${allow_bin_rw}" == "1" ]] || allow_bin_rw=0
+    local allow_skills_rw="${AI_SANDBOX_ALLOW_AGENTS_SKILLS_RW:-0}"; [[ "${allow_skills_rw}" == "1" ]] || allow_skills_rw=0
+    local allow_android="${AI_SANDBOX_ALLOW_ANDROID:-0}"; [[ "${allow_android}" == "1" ]] || allow_android=0
+    local pass_tailscale="${AI_SANDBOX_PASS_TAILSCALE:-0}"; [[ "${pass_tailscale}" == "1" ]] || pass_tailscale=0
+    local allow_xdg_runtime_rw="${AI_SANDBOX_ALLOW_XDG_RUNTIME_RW:-0}"; [[ "${allow_xdg_runtime_rw}" == "1" ]] || allow_xdg_runtime_rw=0
+    local allow_nested_userns="${AI_SANDBOX_ALLOW_NESTED_USERNS:-0}"; [[ "${allow_nested_userns}" == "1" ]] || allow_nested_userns=0
+    local allow_tiocsti="${AI_SANDBOX_ALLOW_TIOCSTI:-0}"; [[ "${allow_tiocsti}" == "1" ]] || allow_tiocsti=0
     # AI_SANDBOX_PASS_ENV is a str (comma-separated var-name list), not a
     # bool — no 0/1 normalization, empty is the meaningful default.
     local pass_env_list="${AI_SANDBOX_PASS_ENV:-}"
@@ -381,6 +547,31 @@ _run_sandboxed_agent_linux() {
         exit 1
     fi
 
+    # ~/bin (on the sandbox PATH, and run by the host user outside the
+    # sandbox) and the shared agent-skill source (copied into every client's
+    # skill dir by setup_skills) are read-only unless explicitly relaxed:
+    # a writable copy lets the agent plant binaries or poison skills that
+    # later run unsandboxed. Mounted before WORKDIR and the extra binds so
+    # an explicit grant at or above them (WORKDIR, AI_SANDBOX_EXTRA_RW_DIRS)
+    # still wins — bwrap's later mount covers the earlier one. Missing
+    # paths are skipped, never created.
+    local -a protected_home_binds=()
+    local _p_dir _p_rw _p_var
+    for _p_dir in bin ai-wrapper/.agents; do
+        if [[ "${_p_dir}" == "bin" ]]; then
+            _p_rw="${allow_bin_rw}"; _p_var=AI_SANDBOX_ALLOW_BIN_RW
+        else
+            _p_rw="${allow_skills_rw}"; _p_var=AI_SANDBOX_ALLOW_AGENTS_SKILLS_RW
+        fi
+        [[ -d "${HOME_DIR}/${_p_dir}" ]] || continue
+        if [[ "${_p_rw}" == "1" ]]; then
+            echo_log "WARNING" "[$agent_name] ${_p_var}=1: ~/${_p_dir} is writable inside the sandbox; the agent can change files the host runs or loads outside it."
+            protected_home_binds+=(--bind "${HOME_DIR}/${_p_dir}" "${HOME_DIR}/${_p_dir}")
+        else
+            protected_home_binds+=(--ro-bind "${HOME_DIR}/${_p_dir}" "${HOME_DIR}/${_p_dir}")
+        fi
+    done
+
     # Build bwrap arguments
     local -a bwrap_args=(
         --die-with-parent
@@ -405,12 +596,26 @@ _run_sandboxed_agent_linux() {
         --tmpfs /var
         --proc /proc
         --dev /dev
+        "${protected_home_binds[@]+"${protected_home_binds[@]}"}"
         # Working directory (read-write)
         --bind "${WORKDIR}" "${WORKDIR}"
     )
 
-    # Add default Android directory if it exists
-    if [[ -d "${HOME_DIR}/Android" ]]; then
+    # Nested user namespaces: by default the agent cannot create its own
+    # (each one is fresh kernel attack surface and a way to gain namespace
+    # capabilities). Clients reaching Docker/Podman through a host socket
+    # are unaffected; nested bubblewrap, Chromium's namespace sandbox and
+    # daemons that build their own namespaces need the opt-out.
+    local -a isolation_args=()
+    if [[ "${allow_nested_userns}" == "1" ]]; then
+        echo_log "WARNING" "[$agent_name] AI_SANDBOX_ALLOW_NESTED_USERNS=1: the agent can create its own user namespaces inside the sandbox, which exposes more kernel attack surface."
+    else
+        isolation_args+=("${_AI_SANDBOX_NO_NESTED_USERNS_ARGS[@]}")
+    fi
+    bwrap_args+=("${isolation_args[@]+"${isolation_args[@]}"}")
+
+    # Android SDK/AVD dir (RW, includes debug keystores) only when opted in.
+    if [[ "${allow_android}" == "1" && -d "${HOME_DIR}/Android" ]]; then
         bwrap_args+=(--bind "${HOME_DIR}/Android" "${HOME_DIR}/Android")
     fi
 
@@ -453,20 +658,16 @@ _run_sandboxed_agent_linux() {
             fi
         fi
 
-        # Bind Tailscale socket for read-only query access (status, ip, peers)
-        # Note: write/modify permissions are enforced by the Tailscale daemon itself
-        if [[ -S /run/tailscale/tailscaled.sock ]]; then
-            bwrap_args+=(--bind /run/tailscale/tailscaled.sock /run/tailscale/tailscaled.sock)
+        # Tailscale daemon socket only when opted in. --ro-bind only stops
+        # the socket inode being replaced or removed; connecting and talking
+        # to the LocalAPI still works, and tailscaled authorises each
+        # request by the caller's UID (the sandbox runs as the host user),
+        # so what the agent can do is whatever tailscaled allows that user.
+        if [[ "${pass_tailscale}" == "1" && -S "${_AI_SANDBOX_TAILSCALE_SOCKET}" ]]; then
+            echo_log "WARNING" "[$agent_name] AI_SANDBOX_PASS_TAILSCALE=1: the Tailscale LocalAPI is reachable with your user's tailscaled permissions; the read-only socket bind does not make the API read-only."
+            bwrap_args+=(--ro-bind "${_AI_SANDBOX_TAILSCALE_SOCKET}" /run/tailscale/tailscaled.sock)
         fi
 
-        # Bind user runtime directory if it exists. XDG_RUNTIME_DIR is
-        # usually set by systemd-logind on desktop sessions but isn't
-        # guaranteed (CI runners, containers, non-desktop sessions) — guard
-        # with :- so a caller running under `set -u` doesn't crash here.
-        if [[ -n "${XDG_RUNTIME_DIR:-}" && -d "${XDG_RUNTIME_DIR}" ]]; then
-            bwrap_args+=(--bind "${XDG_RUNTIME_DIR}" "${XDG_RUNTIME_DIR}")
-            bwrap_args+=(--setenv XDG_RUNTIME_DIR "${XDG_RUNTIME_DIR}")
-        fi
     elif [[ -d /var/run ]]; then
         bwrap_args+=(--tmpfs /var/run)
 
@@ -483,26 +684,50 @@ _run_sandboxed_agent_linux() {
         bwrap_args+=(--bind /var/lib/docker /var/lib/docker)
     fi
 
-    # Add kind configuration directory if it exists
-    if [[ -d "${HOME_DIR}/.kind" ]]; then
-        bwrap_args+=(--bind "${HOME_DIR}/.kind" "${HOME_DIR}/.kind")
+    # User runtime directory (XDG_RUNTIME_DIR). The host one holds the
+    # session's sockets — D-Bus session bus, systemd --user, keyring,
+    # display and audio servers, SSH/GPG agents, rootless container
+    # daemons — and those daemons authorise callers by UID, which the
+    # sandbox shares; a read-only bind would not change that. So by
+    # default the sandbox gets its own empty, private (0700) runtime dir
+    # and only named sockets are shared: rootless Docker / Podman below
+    # (AI_SANDBOX_ALLOW_DOCKER) and the SSH agent further down
+    # (AI_SANDBOX_PASS_SSH_AGENT). The private dir keeps the host path
+    # when that is safe (_sandbox_runtime_dir_mirrorable), else
+    # /run/user/UID. XDG_RUNTIME_DIR is optional on the host (CI runners,
+    # containers, non-desktop sessions): an unset or unusable value gets
+    # the private dir too, never a host grant.
+    # AI_SANDBOX_ALLOW_XDG_RUNTIME_RW=1 restores the old wholesale RW bind
+    # of the validated host dir; an invalid host dir then fails the launch.
+    local raw_runtime_dir="${XDG_RUNTIME_DIR:-}" host_runtime_dir="" sandbox_runtime_dir="" runtime_reason=""
+    local rootless_docker_shared=0 _rt_sock
+    if [[ "${allow_xdg_runtime_rw}" == "1" ]]; then
+        if ! host_runtime_dir="$(_sandbox_broad_runtime_dir "${raw_runtime_dir}" "${HOME_DIR}")"; then
+            echo_log "ERROR" "[$agent_name] AI_SANDBOX_ALLOW_XDG_RUNTIME_RW=1 but the host runtime directory cannot be shared: ${host_runtime_dir}. Point XDG_RUNTIME_DIR at your own session runtime dir (usually /run/user/$(id -u)), or turn the setting off to give the sandbox a private runtime dir."
+            exit 1
+        fi
+        echo_log "WARNING" "[$agent_name] AI_SANDBOX_ALLOW_XDG_RUNTIME_RW=1: ${host_runtime_dir} is bound read-write. Every socket in it is reachable with your user ID (D-Bus session bus, systemd --user, keyring, display/audio, SSH/GPG agents, rootless Docker/Podman), whatever the other sandbox settings say; what the agent can do depends on each service and may include running programs outside the sandbox. Turn it off unless a tool in the session needs these services."
+        sandbox_runtime_dir="${host_runtime_dir}"
+        bwrap_args+=(--bind "${host_runtime_dir}" "${host_runtime_dir}")
+        [[ -S "${host_runtime_dir}/${_AI_SANDBOX_ROOTLESS_DOCKER_SOCKET}" ]] && rootless_docker_shared=1
+    else
+        host_runtime_dir="$(_sandbox_runtime_dir_canonical "${raw_runtime_dir}")" || { runtime_reason="${host_runtime_dir}"; host_runtime_dir=""; }
+        if [[ -n "${host_runtime_dir}" ]] && _sandbox_runtime_dir_mirrorable "${host_runtime_dir}" "${bwrap_args[@]}"; then
+            sandbox_runtime_dir="${host_runtime_dir}"
+        else
+            sandbox_runtime_dir="/run/user/$(id -u)"
+            [[ -n "${raw_runtime_dir}" ]] && echo_log "INFO" "[$agent_name] XDG_RUNTIME_DIR=${raw_runtime_dir}: ${runtime_reason:-path cannot be reused inside the sandbox}; the sandbox uses a private ${sandbox_runtime_dir} instead."
+        fi
+        bwrap_args+=(--perms "${_AI_SANDBOX_RUNTIME_DIR_PERMS}" --dir "${sandbox_runtime_dir}")
+        if [[ "${allow_docker}" == "1" && -n "${host_runtime_dir}" ]]; then
+            for _rt_sock in "${_AI_SANDBOX_ROOTLESS_DOCKER_SOCKET}" "${_AI_SANDBOX_ROOTLESS_PODMAN_SOCKET}"; do
+                [[ -S "${host_runtime_dir}/${_rt_sock}" && ! -L "${host_runtime_dir}/${_rt_sock}" \
+                    && -O "${host_runtime_dir}/${_rt_sock}" ]] || continue
+                bwrap_args+=(--bind "${host_runtime_dir}/${_rt_sock}" "${sandbox_runtime_dir}/${_rt_sock}")
+                [[ "${_rt_sock}" == "${_AI_SANDBOX_ROOTLESS_DOCKER_SOCKET}" ]] && rootless_docker_shared=1
+            done
+        fi
     fi
-
-    # Add kubectl configuration directory if it exists
-    if [[ -d "${HOME_DIR}/kind_dot_kube" ]]; then
-        bwrap_args+=(--bind "${HOME_DIR}/kind_dot_kube" "${HOME_DIR}/.kube")
-    fi
-
-    # Add ~/bin directory if it exists (for kind, kubectl, and other user binaries)
-    if [[ -d "${HOME_DIR}/bin" ]]; then
-        bwrap_args+=(--bind "${HOME_DIR}/bin" "${HOME_DIR}/bin")
-    fi
-
-    # Add ~/ai-wrapper/.agents directory if it exists (agent skills content)
-    if [[ -d "${HOME_DIR}/ai-wrapper/.agents" ]]; then
-        bwrap_args+=(--bind "${HOME_DIR}/ai-wrapper/.agents" "${HOME_DIR}/ai-wrapper/.agents")
-    fi
-
 
     # Add extra bwrap flags (user-specified binds, etc.) - using validated flags
     bwrap_args+=("${validated_bwrap_flags[@]}")
@@ -516,6 +741,7 @@ _run_sandboxed_agent_linux() {
         --setenv LANG "${LANG:-en_US.UTF-8}"
         --setenv TERM "${TERM:-xterm-256color}"
         --chdir "${WORKDIR}"
+        --setenv XDG_RUNTIME_DIR "${sandbox_runtime_dir}"
     )
 
     # Pass through additional terminal-related variables if set (for better terminal support)
@@ -524,14 +750,21 @@ _run_sandboxed_agent_linux() {
 
     # Pass through Docker environment variables and ~/.docker config if opted in
     if [[ "${pass_docker}" == "1" ]]; then
-        [[ -n "${DOCKER_HOST:-}" ]]      && bwrap_args+=(--setenv DOCKER_HOST "${DOCKER_HOST}")
+        # A DOCKER_HOST naming the shared rootless socket under a host
+        # runtime dir spelling the sandbox does not reuse (symlink alias,
+        # synthetic /run/user/UID) is pointed at where the socket is bound.
+        local docker_host="${DOCKER_HOST:-}" _rt_prefix
+        if [[ "${rootless_docker_shared}" == "1" ]]; then
+            for _rt_prefix in "${raw_runtime_dir%/}" "${host_runtime_dir}"; do
+                [[ -n "${_rt_prefix}" && "${docker_host}" == "unix://${_rt_prefix}/${_AI_SANDBOX_ROOTLESS_DOCKER_SOCKET}" ]] \
+                    && docker_host="unix://${sandbox_runtime_dir}/${_AI_SANDBOX_ROOTLESS_DOCKER_SOCKET}"
+            done
+        fi
+        [[ -n "${docker_host}" ]]        && bwrap_args+=(--setenv DOCKER_HOST "${docker_host}")
         [[ -n "${DOCKER_CONFIG:-}" ]]    && bwrap_args+=(--setenv DOCKER_CONFIG "${DOCKER_CONFIG}")
         [[ -n "${DOCKER_CERT_PATH:-}" ]] && bwrap_args+=(--setenv DOCKER_CERT_PATH "${DOCKER_CERT_PATH}")
         [[ -d "${HOME_DIR}/.docker" ]]   && bwrap_args+=(--ro-bind "${HOME_DIR}/.docker" "${HOME_DIR}/.docker")
     fi
-
-    # Pass through kind environment variable if set (kind itself is unconditional, see .kind/kind_dot_kube binds above)
-    [[ -n "${KIND_EXPERIMENTAL_PROVIDER:-}" ]] && bwrap_args+=(--setenv KIND_EXPERIMENTAL_PROVIDER "${KIND_EXPERIMENTAL_PROVIDER}")
 
     # Pass through KUBECONFIG and bind ~/.kube if opted in
     if [[ "${pass_kube}" == "1" ]]; then
@@ -649,11 +882,54 @@ _run_sandboxed_agent_linux() {
         _extra_sandbox_setup
     fi
 
+    # Terminal injection: a seccomp filter fails ioctl(TIOCSTI) and
+    # ioctl(TIOCLINUX) with EPERM, so the agent cannot push keystrokes into
+    # the terminal's input queue for the shell to run after it exits. Other
+    # syscalls and terminal ioctls are untouched: the controlling terminal,
+    # /dev/tty, raw input, resize (SIGWINCH) and Ctrl+C keep working. The
+    # filter rides alongside any the caller or hook added (bwrap applies
+    # every --add-seccomp-fd program; a --seccomp FD is switched to
+    # --add-seccomp-fd, its equivalent, since bwrap refuses to mix the two).
+    local tty_filter="" _a
+    if [[ "${allow_tiocsti}" == "1" ]]; then
+        echo_log "WARNING" "[$agent_name] AI_SANDBOX_ALLOW_TIOCSTI=1: no terminal-injection filter; on kernels that still allow TIOCSTI the agent can type commands into your terminal that run after the session ends."
+    else
+        if ! tty_filter="$(_sandbox_tty_filter)"; then
+            echo_log "ERROR" "[$agent_name] Cannot build the terminal-injection filter: ${tty_filter}"
+            echo_log "ERROR" "It needs python3 and the libseccomp runtime library (e.g. libseccomp2) on the host. Install them, or set AI_SANDBOX_ALLOW_TIOCSTI=1 to launch without this protection."
+            exit 1
+        fi
+        for _a in "${!bwrap_args[@]}"; do
+            [[ "${bwrap_args[_a]}" == "--seccomp" ]] && bwrap_args[_a]="--add-seccomp-fd"
+        done
+    fi
+
+    # Launch probe with the same isolation options (its own filter copy:
+    # bubblewrap consumes the descriptor it reads).
+    local probe_reason probe_filter_fd="" tty_filter_fd="" probe_rc=0
+    local -a probe_args=("${isolation_args[@]+"${isolation_args[@]}"}")
+    if [[ -n "${tty_filter}" ]]; then
+        exec {probe_filter_fd}< <(printf '%b' "${tty_filter}")
+        probe_args+=(--add-seccomp-fd "${probe_filter_fd}")
+    fi
+    probe_reason="$(_sandbox_linux_probe "${probe_args[@]+"${probe_args[@]}"}")" || probe_rc=$?
+    [[ -n "${probe_filter_fd}" ]] && exec {probe_filter_fd}<&-
+    if (( probe_rc != 0 )); then
+        echo_log "ERROR" "[$agent_name] Sandbox launch probe failed: ${probe_reason}"
+        exit 1
+    fi
+
+    if [[ -n "${tty_filter}" ]]; then
+        exec {tty_filter_fd}< <(printf '%b' "${tty_filter}")
+        bwrap_args+=(--add-seccomp-fd "${tty_filter_fd}")
+    fi
+
     # ===== EXECUTE — no more setpriv/prlimit wrapper =====
 
     bwrap "${bwrap_args[@]}" "${command}" "${cmd_args[@]}"
 
     local exit_code=$?
+    [[ -n "${tty_filter_fd}" ]] && exec {tty_filter_fd}<&-
 
     # ===== EXIT CODE TRANSLATION & FEEDBACK =====
 

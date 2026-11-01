@@ -1100,10 +1100,12 @@ if [[ "${_wrapper_os}" == "Darwin" ]]; then
     _ai_sensitive_workdir_extra=", ~/Library"
     _ai_sensitive_workdir_system=", and binding those or a top-level system directory as extra RW/RO dirs; launching from a system directory stays refused on macOS"
     _ai_gitlab_bind_note="RO-binds ~/Library/Application Support/glab-cli"
+    _ai_docker_rootless_note=""
 else
     _ai_sensitive_workdir_extra=""
     _ai_sensitive_workdir_system=", or a top-level system directory, and binding such dirs as extra RW/RO dirs"
     _ai_gitlab_bind_note="RO-binds the XDG glab-cli config paths (~/.config/glab-cli, ~/.local/share/glab-cli)"
+    _ai_docker_rootless_note=" Also shares the rootless Docker and Podman sockets (\$XDG_RUNTIME_DIR/docker.sock, \$XDG_RUNTIME_DIR/podman/podman.sock) when they exist."
 fi
 
 # Order here is the display order in both views; categories are
@@ -1118,6 +1120,7 @@ _AI_SETTINGS_LIST=(
     "AI_SANDBOX_PASS_ENV|str||red|Pass extra env vars by name|Comma-separated list of variable names to share (advanced)|additional"
     "AI_SANDBOX_EXTRA_RW_DIRS|str||yellow|Extra read-write bind directories|Comma-separated absolute paths granted RW inside the sandbox (in addition to WORKDIR). Missing entries WARN and are skipped.|additional"
     "AI_SANDBOX_EXTRA_RO_DIRS|str||yellow|Extra read-only bind directories|Comma-separated absolute paths granted RO inside the sandbox. Missing entries WARN and are skipped.|additional"
+    "AI_SANDBOX_ALLOW_ANDROID|bool|0|yellow|Share ~/Android (read-write)|Binds ~/Android RW (Android SDK, emulator images, debug keystores). The agent can change SDK tools the host runs later. Off: ~/Android is not visible inside the sandbox.|additional|linux"
     "AI_SANDBOX_PROFILE|path||red|Custom sandbox profile override|Path to a custom SBPL file. Default: ai_wrapper_data/claude_wrapper.sb. Set only if you have a custom restrictions file.|additional|darwin"
     "AI_SANDBOX_PROFILE_TRUST_ME|bool|0|red|Skip safety check on custom profile|Bypasses the (version 1) + (deny default) validation. Set only if your profile intentionally relaxes the sandbox.|additional|darwin"
 
@@ -1125,6 +1128,11 @@ _AI_SETTINGS_LIST=(
     "AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR|bool|0|red|Allow launch from sensitive dirs|Permits launching from \$HOME itself, a dotfile dir directly under \$HOME${_ai_sensitive_workdir_extra}${_ai_sensitive_workdir_system} — the write fence then grants RW there, which likely exposes credentials|sensitive"
     "AI_SANDBOX_ALLOW_GIT_CONFIG|bool|0|red|Allow editing git config and hooks|Leaves WORKDIR's .git/config, hooks/, config.worktree and submodule config/hooks (also a linked worktree's own submodules) writable so git config, remote add and push -u work. The agent can then make host git run any command. Off: those edits and tracking-branch setup fail; commits, local branches and checkouts still work.|sensitive"
     "AI_SANDBOX_ALLOW_EXTERNAL_WORKTREES|bool|0|yellow|Allow git in worktrees of repos outside \$HOME|For a linked worktree whose repository's shared .git lies outside \$HOME (e.g. /Data/...), binds exactly that .git after the same link and path checks as \$HOME repos; its config, hooks/ and other worktrees stay read-only. System, temp and hidden locations are refused. This session only: never saved to or restored from the per-workdir preset.|sensitive"
+    "AI_SANDBOX_ALLOW_BIN_RW|bool|0|red|Allow writing ~/bin|Binds ~/bin RW instead of read-only. ~/bin is first on the sandbox PATH and on yours, so the agent can plant or replace programs you later run outside the sandbox. Off: ~/bin stays usable (read and run) but not writable.|sensitive|linux"
+    "AI_SANDBOX_ALLOW_AGENTS_SKILLS_RW|bool|0|red|Allow editing the shared agent-skill source|Binds ~/ai-wrapper/.agents RW instead of read-only. setup_skills copies it into every client's skill dir, so the agent can rewrite skills other clients and sessions load. Off: skills stay readable but not writable.|sensitive|linux"
+    "AI_SANDBOX_ALLOW_XDG_RUNTIME_RW|bool|0|red|Share the whole user runtime dir (read-write)|Binds your \$XDG_RUNTIME_DIR (usually /run/user/UID) RW after checking it is your own, non-shared directory. Every socket in it becomes reachable with your user ID — D-Bus session bus, systemd --user, keyring, display and audio servers, SSH/GPG agents, rootless Docker/Podman — whatever the SSH-agent and Docker settings say; what the agent can do depends on each service and may include running programs outside the sandbox. Off: the sandbox gets a private, empty runtime dir with only the sockets you enable.|sensitive|linux"
+    "AI_SANDBOX_ALLOW_NESTED_USERNS|bool|0|red|Allow nested user namespaces|Lets the agent create its own user namespaces inside the sandbox (needed by nested bubblewrap/Flatpak, Chromium or Playwright without --no-sandbox, and rootless container engines run inside the sandbox; Docker/Podman through a shared host socket work without it). Each namespace gives the agent namespace-root capabilities and more kernel attack surface. Off: creating a user namespace fails; the launch is refused if bubblewrap cannot enforce that.|sensitive|linux"
+    "AI_SANDBOX_ALLOW_TIOCSTI|bool|0|yellow|Allow terminal input injection (TIOCSTI)|Launches without the seccomp filter that blocks ioctl(TIOCSTI) and ioctl(TIOCLINUX). On kernels that still allow TIOCSTI the agent can then type commands into your terminal that run after the session ends. Off: the filter is built with python3 + libseccomp and the launch is refused if it cannot be; the terminal, /dev/tty, resize and Ctrl+C work as usual.|sensitive|linux"
     "AI_SANDBOX_ALLOW_RO_HOMEDIR|bool|0|yellow|Share home directory (read-only)|Agent can read everything in \$HOME except credentials|sensitive|darwin"
 
     # Credentials
@@ -1138,10 +1146,11 @@ _AI_SETTINGS_LIST=(
 
     # Networking (localhost, local docker)
     "AI_SANDBOX_BLOCK_LOCALHOST|bool|0|info|Block localhost network access|Denies network access to services running on your own machine|networking|darwin"
-    "AI_SANDBOX_ALLOW_DOCKER|bool|0|red|Mount Docker / Colima socket|RW on /var/run/docker.sock, ~/.colima, ~/.docker. With the daemon running this is a full sandbox escape: agent can launch privileged containers and obtain host root. Off by default — opt in only when the session needs docker.|networking"
+    "AI_SANDBOX_ALLOW_DOCKER|bool|0|red|Mount Docker / Colima socket|RW on /var/run/docker.sock, ~/.colima, ~/.docker. With the daemon running this is a full sandbox escape: agent can launch privileged containers and obtain host root. Off by default — opt in only when the session needs docker.${_ai_docker_rootless_note}|networking"
+    "AI_SANDBOX_PASS_TAILSCALE|bool|0|red|Share Tailscale daemon socket|RO-binds /run/tailscale/tailscaled.sock. The read-only bind only stops the socket file being replaced; it does not make the Tailscale API read-only. tailscaled authorises requests by your user ID, so the agent can do whatever tailscaled lets your user do (e.g. change settings or connect to peers, if you are the operator). Off: no socket in the sandbox.|networking|linux"
     "AI_SANDBOX_PASS_DOCKER|bool|0|red|Share Docker client env vars + ~/.docker|Passes DOCKER_HOST, DOCKER_CONFIG, DOCKER_CERT_PATH, DOCKER_BUILDKIT and RO-grants ~/.docker (registry auth tokens). Pair with 'Mount Docker / Colima socket' to actually talk to the daemon.|networking"
 )
-unset _ai_sensitive_workdir_extra _ai_sensitive_workdir_system _ai_gitlab_bind_note
+unset _ai_sensitive_workdir_extra _ai_sensitive_workdir_system _ai_gitlab_bind_note _ai_docker_rootless_note
 
 # OS-scope filtering: drop catalog rows whose trailing OS_SCOPE field
 # doesn't match the current OS, so a setting with no backend on this OS
