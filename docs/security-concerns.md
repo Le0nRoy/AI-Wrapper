@@ -477,7 +477,8 @@ saw the variable.
 (saved in the per-workdir preset). It requires an existing directory,
 resolved through symlinks, owned by the user, not a system root,
 `$HOME`, a dotfile dir, a parent of `$HOME`, or group/world-writable;
-otherwise the launch fails with the reason instead of falling back.
+otherwise the launch fails with the reason instead of falling back. The
+permission check fails closed: if it cannot run, the launch is refused.
 `AI_SANDBOX_PASS_DOCKER` still alone controls `DOCKER_HOST` and
 `~/.docker`; a `DOCKER_HOST` that names the shared rootless socket via a
 host spelling the sandbox does not reuse is rewritten to the mounted

@@ -155,7 +155,7 @@ _sandbox_runtime_dir_canonical() {
 # writable by group or others. Prints the canonical path, or the reason
 # with return 1. Args: DIR HOME
 _sandbox_broad_runtime_dir() {
-    local dir="${1}" home="${2%/}" canon home_canon
+    local dir="${1}" home="${2%/}" canon home_canon perm_out perm_rc=0
     canon="$(_sandbox_runtime_dir_canonical "${dir}")" || { echo "${canon}"; return 1; }
     home_canon="$(cd "${home}" 2>/dev/null && pwd -P)" || home_canon="${home}"
     if _sandbox_sensitive_dir_kind "${canon}" "${home}" >/dev/null \
@@ -165,7 +165,12 @@ _sandbox_broad_runtime_dir() {
     case "${home_canon}/" in
         "${canon}"/*) echo "${canon} contains \$HOME"; return 1 ;;
     esac
-    if [[ -n "$(find "${canon}" -maxdepth 0 \( -perm -020 -o -perm -002 \) -print 2>/dev/null)" ]]; then
+    # Fail closed: a checker that exits nonzero refuses, whatever it printed.
+    perm_out="$(find "${canon}" -maxdepth 0 \( -perm -020 -o -perm -002 \) -print 2>&1)" || perm_rc=$?
+    if (( perm_rc != 0 )); then
+        echo "cannot check permissions of ${canon}: ${perm_out:-find exited ${perm_rc}}"; return 1
+    fi
+    if [[ -n "${perm_out}" ]]; then
         echo "${canon} is writable by other users"; return 1
     fi
     printf '%s\n' "${canon}"

@@ -301,6 +301,42 @@ done
 assert_eq "$(_yes test -e "${H}/missing-rt-${RUN_ID}")" no "broad: missing runtime dir not created"
 rm -rf "${WRITABLE_RT}" "${H}/.cfg-${RUN_ID}"
 
+echo "-- _sandbox_broad_runtime_dir: permission check fails closed"
+_broad() {
+    # $1: dir, $2: optional shell snippet run after sourcing (e.g. a find stub).
+    # Prints the helper's output, then RC=<status>.
+    (
+        { cd "${WORK}" && _load_linux; } >/dev/null 2>&1 || { echo LOAD_FAILED; exit 0; }
+        eval "${2:-}"
+        local out rc=0
+        out="$(_sandbox_broad_runtime_dir "${1}" "${H}" 2>&1)" || rc=$?
+        printf '%s\nRC=%s\n' "${out}" "${rc}"
+    )
+}
+PERM_RT="$(mktemp -d /tmp/ai-wrapper-rt.XXXXXX)"
+PERM_RT="$(cd "${PERM_RT}" && pwd -P)"
+res="$(_broad "${PERM_RT}")"
+assert_contains "${res}" "RC=0" "broad helper: valid 0700 dir accepted"
+assert_contains "${res}" "${PERM_RT}" "broad helper: valid dir prints canonical path"
+for mode in 0720 0702 0777; do
+    chmod "${mode}" "${PERM_RT}"
+    res="$(_broad "${PERM_RT}")"
+    assert_contains "${res}" "RC=1" "broad helper: mode ${mode} refused"
+    assert_contains "${res}" "writable by other users" "broad helper: mode ${mode} reason given"
+done
+chmod 0700 "${PERM_RT}"
+# A failing checker must refuse, whether it prints nothing or something.
+res="$(_broad "${PERM_RT}" 'find() { return 127; }')"
+assert_contains "${res}" "RC=1" "broad helper: failing checker with no output refused"
+assert_contains "${res}" "cannot check permissions of ${PERM_RT}" "broad helper: no-output failure is actionable"
+res="$(_broad "${PERM_RT}" 'find() { echo "find: simulated error" >&2; return 1; }')"
+assert_contains "${res}" "RC=1" "broad helper: failing checker with stderr refused"
+assert_contains "${res}" "find: simulated error" "broad helper: checker diagnostic reported"
+res="$(_broad "${PERM_RT}" 'find() { printf "%s\n" "${@:1:1}"; return 1; }')"
+assert_contains "${res}" "RC=1" "broad helper: failing checker with plausible output refused"
+assert_contains "${res}" "cannot check permissions of ${PERM_RT}" "broad helper: plausible-output failure is actionable"
+rm -rf "${PERM_RT}"
+
 # ---------------------------------------------------------------------------
 echo "-- native bubblewrap probes"
 # Native certification: on Linux a missing bwrap is a failure, not a skip
