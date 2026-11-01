@@ -194,12 +194,15 @@ _sandbox_tty_filter() {
 # restriction, a fresh terminal-filter descriptor), so that a host that
 # cannot create user namespaces, a bubblewrap without a required option or
 # a filter bubblewrap cannot load is refused, with the reason, before the
-# client starts. Mirrors the launch's system binds that exist here. Prints
-# the reason and returns 1 on failure.
+# client starts. Mirrors the launch's system binds that exist here. Always
+# requires a new user namespace (--unshare-user): --unshare-all alone only
+# tries one, so a caller holding namespace capabilities (e.g. root in a
+# parent user namespace) would pass without one being created. Prints the
+# reason and returns 1 on failure.
 _sandbox_linux_probe() {
     local true_bin out rc=0 dir
     true_bin="$(type -P true)" || { echo "setup problem: no external 'true' executable on PATH for the probe"; return 1; }
-    local -a probe_args=(--die-with-parent --unshare-all "$@")
+    local -a probe_args=(--die-with-parent --unshare-all --unshare-user "$@")
     for dir in /usr /bin /lib /lib64; do
         [[ -e "${dir}" ]] && probe_args+=(--ro-bind "${dir}" "${dir}")
     done

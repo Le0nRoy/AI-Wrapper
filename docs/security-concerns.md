@@ -526,7 +526,7 @@ Three gaps in the bwrap backend:
 | Nested user namespaces | `--unshare-user --disable-userns --assert-userns-disabled` | `AI_SANDBOX_ALLOW_NESTED_USERNS=1` (red, Linux) omits them, launch `WARNING` |
 | Terminal injection | seccomp filter: `ioctl(TIOCSTI)` and `ioctl(TIOCLINUX)` fail with `EPERM`; everything else allowed | `AI_SANDBOX_ALLOW_TIOCSTI=1` (yellow, Linux) omits it, launch `WARNING` |
 | Knob check | `/proc/sys/kernel/unprivileged_userns_clone`, `/proc/sys/user/max_user_namespaces` read directly | none |
-| Launch probe | real bwrap run of the external `true` with the launch's isolation options | none |
+| Launch probe | real bwrap run of the external `true` that must create a user namespace (`--unshare-user`), with the launch's isolation options | none |
 
 - *Filter.* `bin/ai_wrapper_data/linux_tty_seccomp.py`, run as
   `python3 -I` on the host, loads libseccomp through ctypes, resolves
