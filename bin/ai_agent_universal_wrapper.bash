@@ -135,6 +135,94 @@ _AI_SANDBOX_ROOTLESS_PODMAN_SOCKET=podman/podman.sock
 # Mode of the sandbox's private runtime directory (XDG Base Directory spec).
 _AI_SANDBOX_RUNTIME_DIR_PERMS=0700
 
+# Linux process isolation inputs: the procfs sysctl root read by the user
+# namespace knob check, and the interpreter and host helper that build the
+# terminal-injection seccomp filter. Assigned at source time, so the
+# caller's environment cannot redirect them.
+_AI_SANDBOX_PROC_SYS=/proc/sys
+_AI_SANDBOX_PYTHON=python3
+_AI_SANDBOX_TTY_FILTER_HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/ai_wrapper_data/linux_tty_seccomp.py"
+# Options that stop the sandboxed process creating user namespaces of its
+# own (AI_SANDBOX_ALLOW_NESTED_USERNS=0). --disable-userns needs an
+# explicit --unshare-user: --unshare-all only tries one.
+_AI_SANDBOX_NO_NESTED_USERNS_ARGS=(--unshare-user --disable-userns --assert-userns-disabled)
+
+# Kernel knobs that can switch unprivileged user namespaces off; bubblewrap
+# needs them. A knob this kernel does not have is inconclusive (the launch
+# probe decides). One that exists refuses the launch when it is 0, cannot
+# be read, or does not hold a number. Prints the reason and returns 1.
+_sandbox_userns_knobs_check() {
+    local knob path value
+    for knob in kernel/unprivileged_userns_clone user/max_user_namespaces; do
+        path="${_AI_SANDBOX_PROC_SYS}/${knob}"
+        [[ -e "${path}" ]] || continue
+        if ! value="$(cat -- "${path}" 2>/dev/null)"; then
+            echo "cannot read ${path}"; return 1
+        fi
+        if [[ ! "${value}" =~ ^[0-9]+$ ]]; then
+            echo "${path} holds '${value}', not a number"; return 1
+        fi
+        if (( value == 0 )); then
+            echo "${knob//\//.} is 0: unprivileged user namespaces are disabled on this host, and bubblewrap needs them"; return 1
+        fi
+    done
+    return 0
+}
+
+# Builds the terminal-injection seccomp filter with the host helper (python3
+# -I + libseccomp; see linux_tty_seccomp.py). Prints the filter as printf
+# %b escapes, or the reason with return 1: a missing interpreter, a helper
+# failure (missing library, symbol or architecture support, a filter that
+# fails its self-test) or output that is not a whole BPF program.
+_sandbox_tty_filter() {
+    local python_bin out rc=0
+    local -r escape_len=4 bpf_insn_bytes=8
+    python_bin="$(type -P "${_AI_SANDBOX_PYTHON}")" || { echo "${_AI_SANDBOX_PYTHON} not found on PATH"; return 1; }
+    [[ -r "${_AI_SANDBOX_TTY_FILTER_HELPER}" ]] || { echo "helper ${_AI_SANDBOX_TTY_FILTER_HELPER} is missing"; return 1; }
+    out="$("${python_bin}" -I "${_AI_SANDBOX_TTY_FILTER_HELPER}" 2>&1 </dev/null)" || rc=$?
+    if (( rc != 0 )); then
+        echo "${out:-helper exited ${rc}}"; return 1
+    fi
+    if [[ ! "${out}" =~ ^(\\x[0-9a-f]{2})+$ ]] || (( ${#out} % (escape_len * bpf_insn_bytes) != 0 )); then
+        echo "helper output is not a BPF program"; return 1
+    fi
+    printf '%s\n' "${out}"
+}
+
+# Launch probe: runs the external `true` in a minimal bubblewrap sandbox with
+# the launch's isolation options OPTION... (nested user namespace
+# restriction, a fresh terminal-filter descriptor), so that a host that
+# cannot create user namespaces, a bubblewrap without a required option or
+# a filter bubblewrap cannot load is refused, with the reason, before the
+# client starts. Mirrors the launch's system binds that exist here. Prints
+# the reason and returns 1 on failure.
+_sandbox_linux_probe() {
+    local true_bin out rc=0 dir
+    true_bin="$(type -P true)" || { echo "setup problem: no external 'true' executable on PATH for the probe"; return 1; }
+    local -a probe_args=(--die-with-parent --unshare-all "$@")
+    for dir in /usr /bin /lib /lib64; do
+        [[ -e "${dir}" ]] && probe_args+=(--ro-bind "${dir}" "${dir}")
+    done
+    out="$(bwrap "${probe_args[@]}" "${true_bin}" 2>&1 </dev/null)" || rc=$?
+    (( rc == 0 )) && return 0
+    out="${out:-no output}"
+    case "${out}" in
+        *"Unknown option"*)
+            echo "this bubblewrap lacks an option the sandbox needs (${out}). Upgrade bubblewrap, or turn the protection that needs it off: AI_SANDBOX_ALLOW_NESTED_USERNS=1 (--disable-userns, --assert-userns-disabled) or AI_SANDBOX_ALLOW_TIOCSTI=1 (--add-seccomp-fd)." ;;
+        *"not disabled"*|*"disable-userns"*|*"max_user_namespaces"*)
+            echo "bubblewrap could not stop nested user namespaces (${out}). Set AI_SANDBOX_ALLOW_NESTED_USERNS=1 to launch without that restriction." ;;
+        *seccomp*|*SECCOMP*)
+            echo "bubblewrap could not load the terminal-injection filter (${out}). Set AI_SANDBOX_ALLOW_TIOCSTI=1 to launch without it." ;;
+        *execvp*|*"No such file or directory"*)
+            echo "setup problem, not a user namespace denial: the probe could not run ${true_bin} in a minimal sandbox (${out})." ;;
+        *namespace*|*"uid map"*|*"Operation not permitted"*|*"Permission denied"*)
+            echo "user namespaces cannot be created here; the kernel, a security module (e.g. AppArmor) or a container runtime denies them (${out})." ;;
+        *)
+            echo "bubblewrap probe exited ${rc} (${out})." ;;
+    esac
+    return 1
+}
+
 # Canonical path of the host user runtime dir DIR (normally $XDG_RUNTIME_DIR).
 # Prints the resolved path and returns 0 when DIR is set, absolute, an
 # existing directory, and owned by the current user; otherwise prints the
@@ -206,29 +294,18 @@ _run_sandboxed_agent_linux() {
     # ===== PRE-FLIGHT VALIDATION =====
 
     # Check required commands exist
-    local missing_commands=()
-    for cmd in bwrap sysctl; do
-        if ! command -v "${cmd}" &>/dev/null; then
-            missing_commands+=("${cmd}")
-        fi
-    done
-
-    if [[ ${#missing_commands[@]} -gt 0 ]]; then
-        echo_log "ERROR" "[$agent_name] Required commands not found: ${missing_commands[*]}"
-        echo_log "ERROR" "Please install: bubblewrap, util-linux (or equivalent)"
+    if ! command -v bwrap &>/dev/null; then
+        echo_log "ERROR" "[$agent_name] Required commands not found: bwrap"
+        echo_log "ERROR" "Please install: bubblewrap"
         exit 127
     fi
 
-    # Check if user namespaces are enabled
-    UNPRIVILEGED_USERNS_CLONE="$(sysctl kernel.unprivileged_userns_clone 2>/dev/null | awk -F ' = ' '{print $2}')"
-    if [[ -z "${UNPRIVILEGED_USERNS_CLONE}" ]]; then
-        echo_log "ERROR" "[$agent_name] Failed to check user namespace support."
-        echo_log "ERROR" "Cannot read 'sysctl kernel.unprivileged_userns_clone'."
-        exit 1
-    elif [[ "${UNPRIVILEGED_USERNS_CLONE}" -ne 1 ]]; then
-        echo_log "ERROR" "[$agent_name] User namespaces are not enabled."
-        echo_log "ERROR" "Please set 'kernel.unprivileged_userns_clone = 1' in '/etc/sysctl.d/00-unpriv-ns.conf'"
-        echo_log "ERROR" "and run 'sudo sysctl --system' to fix it."
+    # User namespace knobs, read from procfs (no sysctl binary needed). An
+    # absent knob is not a failure: the launch probe below runs a real
+    # bubblewrap sandbox before the client starts.
+    local userns_reason
+    if ! userns_reason="$(_sandbox_userns_knobs_check)"; then
+        echo_log "ERROR" "[$agent_name] User namespaces are not available: ${userns_reason}"
         exit 1
     fi
 
@@ -267,6 +344,8 @@ _run_sandboxed_agent_linux() {
     local allow_android="${AI_SANDBOX_ALLOW_ANDROID:-0}"; [[ "${allow_android}" == "1" ]] || allow_android=0
     local pass_tailscale="${AI_SANDBOX_PASS_TAILSCALE:-0}"; [[ "${pass_tailscale}" == "1" ]] || pass_tailscale=0
     local allow_xdg_runtime_rw="${AI_SANDBOX_ALLOW_XDG_RUNTIME_RW:-0}"; [[ "${allow_xdg_runtime_rw}" == "1" ]] || allow_xdg_runtime_rw=0
+    local allow_nested_userns="${AI_SANDBOX_ALLOW_NESTED_USERNS:-0}"; [[ "${allow_nested_userns}" == "1" ]] || allow_nested_userns=0
+    local allow_tiocsti="${AI_SANDBOX_ALLOW_TIOCSTI:-0}"; [[ "${allow_tiocsti}" == "1" ]] || allow_tiocsti=0
     # AI_SANDBOX_PASS_ENV is a str (comma-separated var-name list), not a
     # bool — no 0/1 normalization, empty is the meaningful default.
     local pass_env_list="${AI_SANDBOX_PASS_ENV:-}"
@@ -518,6 +597,19 @@ _run_sandboxed_agent_linux() {
         # Working directory (read-write)
         --bind "${WORKDIR}" "${WORKDIR}"
     )
+
+    # Nested user namespaces: by default the agent cannot create its own
+    # (each one is fresh kernel attack surface and a way to gain namespace
+    # capabilities). Clients reaching Docker/Podman through a host socket
+    # are unaffected; nested bubblewrap, Chromium's namespace sandbox and
+    # daemons that build their own namespaces need the opt-out.
+    local -a isolation_args=()
+    if [[ "${allow_nested_userns}" == "1" ]]; then
+        echo_log "WARNING" "[$agent_name] AI_SANDBOX_ALLOW_NESTED_USERNS=1: the agent can create its own user namespaces inside the sandbox, which exposes more kernel attack surface."
+    else
+        isolation_args+=("${_AI_SANDBOX_NO_NESTED_USERNS_ARGS[@]}")
+    fi
+    bwrap_args+=("${isolation_args[@]+"${isolation_args[@]}"}")
 
     # Android SDK/AVD dir (RW, includes debug keystores) only when opted in.
     if [[ "${allow_android}" == "1" && -d "${HOME_DIR}/Android" ]]; then
@@ -787,11 +879,54 @@ _run_sandboxed_agent_linux() {
         _extra_sandbox_setup
     fi
 
+    # Terminal injection: a seccomp filter fails ioctl(TIOCSTI) and
+    # ioctl(TIOCLINUX) with EPERM, so the agent cannot push keystrokes into
+    # the terminal's input queue for the shell to run after it exits. Other
+    # syscalls and terminal ioctls are untouched: the controlling terminal,
+    # /dev/tty, raw input, resize (SIGWINCH) and Ctrl+C keep working. The
+    # filter rides alongside any the caller or hook added (bwrap applies
+    # every --add-seccomp-fd program; a --seccomp FD is switched to
+    # --add-seccomp-fd, its equivalent, since bwrap refuses to mix the two).
+    local tty_filter="" _a
+    if [[ "${allow_tiocsti}" == "1" ]]; then
+        echo_log "WARNING" "[$agent_name] AI_SANDBOX_ALLOW_TIOCSTI=1: no terminal-injection filter; on kernels that still allow TIOCSTI the agent can type commands into your terminal that run after the session ends."
+    else
+        if ! tty_filter="$(_sandbox_tty_filter)"; then
+            echo_log "ERROR" "[$agent_name] Cannot build the terminal-injection filter: ${tty_filter}"
+            echo_log "ERROR" "It needs python3 and the libseccomp runtime library (e.g. libseccomp2) on the host. Install them, or set AI_SANDBOX_ALLOW_TIOCSTI=1 to launch without this protection."
+            exit 1
+        fi
+        for _a in "${!bwrap_args[@]}"; do
+            [[ "${bwrap_args[_a]}" == "--seccomp" ]] && bwrap_args[_a]="--add-seccomp-fd"
+        done
+    fi
+
+    # Launch probe with the same isolation options (its own filter copy:
+    # bubblewrap consumes the descriptor it reads).
+    local probe_reason probe_filter_fd="" tty_filter_fd="" probe_rc=0
+    local -a probe_args=("${isolation_args[@]+"${isolation_args[@]}"}")
+    if [[ -n "${tty_filter}" ]]; then
+        exec {probe_filter_fd}< <(printf '%b' "${tty_filter}")
+        probe_args+=(--add-seccomp-fd "${probe_filter_fd}")
+    fi
+    probe_reason="$(_sandbox_linux_probe "${probe_args[@]+"${probe_args[@]}"}")" || probe_rc=$?
+    [[ -n "${probe_filter_fd}" ]] && exec {probe_filter_fd}<&-
+    if (( probe_rc != 0 )); then
+        echo_log "ERROR" "[$agent_name] Sandbox launch probe failed: ${probe_reason}"
+        exit 1
+    fi
+
+    if [[ -n "${tty_filter}" ]]; then
+        exec {tty_filter_fd}< <(printf '%b' "${tty_filter}")
+        bwrap_args+=(--add-seccomp-fd "${tty_filter_fd}")
+    fi
+
     # ===== EXECUTE — no more setpriv/prlimit wrapper =====
 
     bwrap "${bwrap_args[@]}" "${command}" "${cmd_args[@]}"
 
     local exit_code=$?
+    [[ -n "${tty_filter_fd}" ]] && exec {tty_filter_fd}<&-
 
     # ===== EXIT CODE TRANSLATION & FEEDBACK =====
 
