@@ -1409,17 +1409,23 @@ _agy_canonical_path() {
 _AGY_LATE_BIND_HOOKS=(_extra_post_menu_setup _extra_sandbox_setup)
 
 # Succeeds when PATH (canonicalized) lies inside a location the sandbox
-# exposes read-write: WORKDIR, the profile dir, XDG_RUNTIME_DIR, the Linux
-# host dirs whose RW opt-in is on (~/bin, ~/ai-wrapper/.agents, ~/Android;
-# read-only or absent otherwise), AI_SANDBOX_EXTRA_RW_DIRS, every --bind
+# exposes read-write: WORKDIR, the profile dir, the Linux host dirs whose
+# RW opt-in is on (~/bin, ~/ai-wrapper/.agents, ~/Android; read-only or
+# absent otherwise; the host XDG_RUNTIME_DIR with
+# AI_SANDBOX_ALLOW_XDG_RUNTIME_RW=1), AI_SANDBOX_EXTRA_RW_DIRS, every --bind
 # already in WRAPPER_FLAGS, and the macOS shared temp dirs. A parent grant
-# still covers a protected child. Args: PATH PROFILE_DIR
+# still covers a protected child. By default the sandbox's runtime dir is a
+# private tmpfs directory, even when it reuses the host path, so the host
+# runtime dir is not a root then. Args: PATH PROFILE_DIR
 _agy_path_sandbox_writable() {
     local path profile_dir="${2}" root
     path="$(_agy_canonical_path "${1}")"
-    local -a roots=("$(pwd -P)" "${profile_dir}" "${XDG_RUNTIME_DIR:-}")
+    local -a roots=("$(pwd -P)" "${profile_dir}")
     # shellcheck disable=SC2154  # _wrapper_os is set by ai_wrapper_lib.bash
     if [[ "${_wrapper_os}" == "Linux" ]]; then
+        # Canonicalized below, so this is the dir the launch validates and
+        # binds (or refuses to launch with).
+        [[ "${AI_SANDBOX_ALLOW_XDG_RUNTIME_RW:-0}" == "1" ]] && roots+=("${XDG_RUNTIME_DIR:-}")
         [[ "${AI_SANDBOX_ALLOW_BIN_RW:-0}" == "1" ]] && roots+=("${HOME}/bin")
         [[ "${AI_SANDBOX_ALLOW_AGENTS_SKILLS_RW:-0}" == "1" ]] && roots+=("${HOME}/ai-wrapper/.agents")
         [[ "${AI_SANDBOX_ALLOW_ANDROID:-0}" == "1" ]] && roots+=("${HOME}/Android")

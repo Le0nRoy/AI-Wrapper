@@ -25,6 +25,7 @@ LINUX_ONLY_KEYS=(
     AI_SANDBOX_ALLOW_AGENTS_SKILLS_RW
     AI_SANDBOX_ALLOW_ANDROID
     AI_SANDBOX_PASS_TAILSCALE
+    AI_SANDBOX_ALLOW_XDG_RUNTIME_RW
 )
 # A representative sample of settings implemented on both backends.
 CROSS_PLATFORM_KEYS=(
@@ -75,6 +76,20 @@ assert_not_contains "$(cat "${REPO_ROOT}/README.md")" "setup_kind" "README does 
 assert_contains "${linux_catalog}" "AI_SANDBOX_PASS_TAILSCALE|bool|0|red|" "Tailscale control is red severity"
 tailscale_row="$(grep '^AI_SANDBOX_PASS_TAILSCALE|' <<<"${linux_catalog}")"
 assert_contains "${tailscale_row}" "does not make the Tailscale API read-only" "Tailscale help disclaims a read-only API"
+
+# Broad runtime-dir override (#63): red, and its help names what it exposes.
+assert_contains "${linux_catalog}" "AI_SANDBOX_ALLOW_XDG_RUNTIME_RW|bool|0|red|" "runtime-dir override is red severity"
+runtime_row="$(grep '^AI_SANDBOX_ALLOW_XDG_RUNTIME_RW|' <<<"${linux_catalog}")"
+assert_contains "${runtime_row}" "D-Bus session bus" "runtime-dir help names the session bus"
+assert_contains "${runtime_row}" "Off: the sandbox gets a private, empty runtime dir" "runtime-dir help describes the default"
+runtime_scope="$(source "${REPO_ROOT}/bin/ai_wrapper_data/ai_wrapper_lib.bash" >/dev/null 2>&1
+    if _setting_is_session_only AI_SANDBOX_ALLOW_XDG_RUNTIME_RW; then echo session; else echo preset; fi)"
+assert_eq "${runtime_scope}" preset "runtime-dir override is an ordinary preset setting"
+# Rootless container sockets are a Linux-only part of ALLOW_DOCKER.
+assert_contains "$(grep '^AI_SANDBOX_ALLOW_DOCKER|' <<<"${linux_catalog}")" "podman/podman.sock" \
+    "Linux ALLOW_DOCKER help names the rootless Podman socket"
+assert_not_contains "$(grep '^AI_SANDBOX_ALLOW_DOCKER|' <<<"${darwin_catalog}")" "XDG_RUNTIME_DIR" \
+    "macOS ALLOW_DOCKER help has no Linux runtime-dir wording"
 
 for key in "${CROSS_PLATFORM_KEYS[@]}"; do
     assert_contains "${linux_catalog}" "${key}|" "${key} shown on Linux"

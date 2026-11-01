@@ -79,7 +79,9 @@ SANDBOX_SYSTEM_BIN_DIRS="/usr/bin /usr/sbin /bin /sbin"
 # launching anything. Afterwards:
 #   - HOME and XDG_{CONFIG,DATA,STATE,CACHE}_HOME point into FAKE_HOME;
 #   - inherited wrapper settings, client state/credential variables, git
-#     redirections, BASH_ENV/ENV and exported shell functions are gone, so
+#     redirections, the host session's runtime dir and bus/container
+#     endpoints (XDG_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS, CONTAINER_HOST),
+#     BASH_ENV/ENV and exported shell functions are gone, so
 #     the host environment cannot steer a wrapper or shadow a stub;
 #   - PATH is FAKE_HOME/bin followed by the host PATH minus empty/relative
 #     entries and entries under the real HOME (where per-user client
@@ -121,7 +123,8 @@ isolate_test_env() {
             ANTIGRAVITY_*|COPILOT_*|CURSOR_*|GH_*|GITHUB_*|GITLAB_*|GLAB_*| \
             CI_JOB_TOKEN|AWS_*|KUBECONFIG|DOCKER_*|SSH_AUTH_SOCK|SSH_ASKPASS| \
             GIT_DIR|GIT_WORK_TREE|GIT_INDEX_FILE|GIT_COMMON_DIR|GIT_CONFIG*| \
-            GIT_ASKPASS|*TOKEN*|*API_KEY*|*SECRET*|*PASSWORD*)
+            GIT_ASKPASS|XDG_RUNTIME_DIR|DBUS_SESSION_BUS_ADDRESS|CONTAINER_HOST| \
+            *TOKEN*|*API_KEY*|*SECRET*|*PASSWORD*)
                 unset "${var}" ;;
         esac
     done
