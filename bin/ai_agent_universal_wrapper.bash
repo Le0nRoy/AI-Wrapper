@@ -125,6 +125,74 @@ run_sandboxed_agent() {
 # source time, so the caller's environment cannot redirect the bind source.
 _AI_SANDBOX_TAILSCALE_SOCKET=/run/tailscale/tailscaled.sock
 
+# Rootless container daemon sockets, relative to the user runtime dir,
+# shared by AI_SANDBOX_ALLOW_DOCKER=1: rootless dockerd's default
+# DOCKER_HOST and the podman.socket user unit's endpoint (the default of
+# `podman --remote` / CONTAINER_HOST).
+_AI_SANDBOX_ROOTLESS_DOCKER_SOCKET=docker.sock
+_AI_SANDBOX_ROOTLESS_PODMAN_SOCKET=podman/podman.sock
+
+# Mode of the sandbox's private runtime directory (XDG Base Directory spec).
+_AI_SANDBOX_RUNTIME_DIR_PERMS=0700
+
+# Canonical path of the host user runtime dir DIR (normally $XDG_RUNTIME_DIR).
+# Prints the resolved path and returns 0 when DIR is set, absolute, an
+# existing directory, and owned by the current user; otherwise prints the
+# reason and returns 1. Symlinked spellings resolve to their target.
+_sandbox_runtime_dir_canonical() {
+    local dir="${1}" canon
+    [[ -n "${dir}" ]] || { echo "XDG_RUNTIME_DIR is not set"; return 1; }
+    [[ "${dir}" == /* ]] || { echo "'${dir}' is not an absolute path"; return 1; }
+    [[ -d "${dir}" ]] || { echo "'${dir}' is not an existing directory"; return 1; }
+    canon="$(cd "${dir}" 2>/dev/null && pwd -P)" || { echo "'${dir}' cannot be resolved"; return 1; }
+    [[ -O "${canon}" ]] || { echo "${canon} is not owned by you"; return 1; }
+    printf '%s\n' "${canon}"
+}
+
+# Validation for AI_SANDBOX_ALLOW_XDG_RUNTIME_RW=1, which binds the host
+# runtime dir RW. On top of _sandbox_runtime_dir_canonical, refuses system
+# roots, $HOME, dotfile dirs under it, a dir containing $HOME, and a dir
+# writable by group or others. Prints the canonical path, or the reason
+# with return 1. Args: DIR HOME
+_sandbox_broad_runtime_dir() {
+    local dir="${1}" home="${2%/}" canon home_canon
+    canon="$(_sandbox_runtime_dir_canonical "${dir}")" || { echo "${canon}"; return 1; }
+    home_canon="$(cd "${home}" 2>/dev/null && pwd -P)" || home_canon="${home}"
+    if _sandbox_sensitive_dir_kind "${canon}" "${home}" >/dev/null \
+            || _sandbox_sensitive_dir_kind "${canon}" "${home_canon}" >/dev/null; then
+        echo "${canon} is a system location, \$HOME or a dotfile directory under \$HOME"; return 1
+    fi
+    case "${home_canon}/" in
+        "${canon}"/*) echo "${canon} contains \$HOME"; return 1 ;;
+    esac
+    if [[ -n "$(find "${canon}" -maxdepth 0 \( -perm -020 -o -perm -002 \) -print 2>/dev/null)" ]]; then
+        echo "${canon} is writable by other users"; return 1
+    fi
+    printf '%s\n' "${canon}"
+}
+
+# Succeeds when the private runtime dir can use the host runtime dir's own
+# canonical path CANON inside the sandbox, so paths the host session hands
+# out ($XDG_RUNTIME_DIR/..., DOCKER_HOST, SSH_AUTH_SOCK) stay valid. CANON
+# must lie below /run or /tmp (fresh tmpfs in the sandbox), and no path
+# already in the bwrap argv (ARGS: host binds such as WORKDIR) may equal,
+# contain or lie inside it: --dir there could create or reuse a
+# host-backed directory instead of a private one. Args: CANON ARGS...
+_sandbox_runtime_dir_mirrorable() {
+    local canon="${1}" arg
+    shift
+    case "${canon}" in
+        /run/?*|/tmp/?*) ;;
+        *) return 1 ;;
+    esac
+    for arg in "$@"; do
+        [[ "${arg}" == /* ]] || continue
+        case "${arg}" in /run|/tmp) continue ;; esac
+        [[ "${arg}" == "${canon}" || "${canon}" == "${arg%/}/"* || "${arg}" == "${canon}/"* ]] && return 1
+    done
+    return 0
+}
+
 _run_sandboxed_agent_linux() {
     local agent_name="${1}"
     local command="${1}"
@@ -193,6 +261,7 @@ _run_sandboxed_agent_linux() {
     local allow_skills_rw="${AI_SANDBOX_ALLOW_AGENTS_SKILLS_RW:-0}"; [[ "${allow_skills_rw}" == "1" ]] || allow_skills_rw=0
     local allow_android="${AI_SANDBOX_ALLOW_ANDROID:-0}"; [[ "${allow_android}" == "1" ]] || allow_android=0
     local pass_tailscale="${AI_SANDBOX_PASS_TAILSCALE:-0}"; [[ "${pass_tailscale}" == "1" ]] || pass_tailscale=0
+    local allow_xdg_runtime_rw="${AI_SANDBOX_ALLOW_XDG_RUNTIME_RW:-0}"; [[ "${allow_xdg_runtime_rw}" == "1" ]] || allow_xdg_runtime_rw=0
     # AI_SANDBOX_PASS_ENV is a str (comma-separated var-name list), not a
     # bool — no 0/1 normalization, empty is the meaningful default.
     local pass_env_list="${AI_SANDBOX_PASS_ENV:-}"
@@ -499,14 +568,6 @@ _run_sandboxed_agent_linux() {
             bwrap_args+=(--ro-bind "${_AI_SANDBOX_TAILSCALE_SOCKET}" /run/tailscale/tailscaled.sock)
         fi
 
-        # Bind user runtime directory if it exists. XDG_RUNTIME_DIR is
-        # usually set by systemd-logind on desktop sessions but isn't
-        # guaranteed (CI runners, containers, non-desktop sessions) — guard
-        # with :- so a caller running under `set -u` doesn't crash here.
-        if [[ -n "${XDG_RUNTIME_DIR:-}" && -d "${XDG_RUNTIME_DIR}" ]]; then
-            bwrap_args+=(--bind "${XDG_RUNTIME_DIR}" "${XDG_RUNTIME_DIR}")
-            bwrap_args+=(--setenv XDG_RUNTIME_DIR "${XDG_RUNTIME_DIR}")
-        fi
     elif [[ -d /var/run ]]; then
         bwrap_args+=(--tmpfs /var/run)
 
@@ -523,6 +584,50 @@ _run_sandboxed_agent_linux() {
         bwrap_args+=(--bind /var/lib/docker /var/lib/docker)
     fi
 
+    # User runtime directory (XDG_RUNTIME_DIR). The host one holds the
+    # session's sockets — D-Bus session bus, systemd --user, keyring,
+    # display and audio servers, SSH/GPG agents, rootless container
+    # daemons — and those daemons authorise callers by UID, which the
+    # sandbox shares; a read-only bind would not change that. So by
+    # default the sandbox gets its own empty, private (0700) runtime dir
+    # and only named sockets are shared: rootless Docker / Podman below
+    # (AI_SANDBOX_ALLOW_DOCKER) and the SSH agent further down
+    # (AI_SANDBOX_PASS_SSH_AGENT). The private dir keeps the host path
+    # when that is safe (_sandbox_runtime_dir_mirrorable), else
+    # /run/user/UID. XDG_RUNTIME_DIR is optional on the host (CI runners,
+    # containers, non-desktop sessions): an unset or unusable value gets
+    # the private dir too, never a host grant.
+    # AI_SANDBOX_ALLOW_XDG_RUNTIME_RW=1 restores the old wholesale RW bind
+    # of the validated host dir; an invalid host dir then fails the launch.
+    local raw_runtime_dir="${XDG_RUNTIME_DIR:-}" host_runtime_dir="" sandbox_runtime_dir="" runtime_reason=""
+    local rootless_docker_shared=0 _rt_sock
+    if [[ "${allow_xdg_runtime_rw}" == "1" ]]; then
+        if ! host_runtime_dir="$(_sandbox_broad_runtime_dir "${raw_runtime_dir}" "${HOME_DIR}")"; then
+            echo_log "ERROR" "[$agent_name] AI_SANDBOX_ALLOW_XDG_RUNTIME_RW=1 but the host runtime directory cannot be shared: ${host_runtime_dir}. Point XDG_RUNTIME_DIR at your own session runtime dir (usually /run/user/$(id -u)), or turn the setting off to give the sandbox a private runtime dir."
+            exit 1
+        fi
+        echo_log "WARNING" "[$agent_name] AI_SANDBOX_ALLOW_XDG_RUNTIME_RW=1: ${host_runtime_dir} is bound read-write. Every socket in it is reachable with your user ID (D-Bus session bus, systemd --user, keyring, display/audio, SSH/GPG agents, rootless Docker/Podman), whatever the other sandbox settings say; what the agent can do depends on each service and may include running programs outside the sandbox. Turn it off unless a tool in the session needs these services."
+        sandbox_runtime_dir="${host_runtime_dir}"
+        bwrap_args+=(--bind "${host_runtime_dir}" "${host_runtime_dir}")
+        [[ -S "${host_runtime_dir}/${_AI_SANDBOX_ROOTLESS_DOCKER_SOCKET}" ]] && rootless_docker_shared=1
+    else
+        host_runtime_dir="$(_sandbox_runtime_dir_canonical "${raw_runtime_dir}")" || { runtime_reason="${host_runtime_dir}"; host_runtime_dir=""; }
+        if [[ -n "${host_runtime_dir}" ]] && _sandbox_runtime_dir_mirrorable "${host_runtime_dir}" "${bwrap_args[@]}"; then
+            sandbox_runtime_dir="${host_runtime_dir}"
+        else
+            sandbox_runtime_dir="/run/user/$(id -u)"
+            [[ -n "${raw_runtime_dir}" ]] && echo_log "INFO" "[$agent_name] XDG_RUNTIME_DIR=${raw_runtime_dir}: ${runtime_reason:-path cannot be reused inside the sandbox}; the sandbox uses a private ${sandbox_runtime_dir} instead."
+        fi
+        bwrap_args+=(--perms "${_AI_SANDBOX_RUNTIME_DIR_PERMS}" --dir "${sandbox_runtime_dir}")
+        if [[ "${allow_docker}" == "1" && -n "${host_runtime_dir}" ]]; then
+            for _rt_sock in "${_AI_SANDBOX_ROOTLESS_DOCKER_SOCKET}" "${_AI_SANDBOX_ROOTLESS_PODMAN_SOCKET}"; do
+                [[ -S "${host_runtime_dir}/${_rt_sock}" && ! -L "${host_runtime_dir}/${_rt_sock}" \
+                    && -O "${host_runtime_dir}/${_rt_sock}" ]] || continue
+                bwrap_args+=(--bind "${host_runtime_dir}/${_rt_sock}" "${sandbox_runtime_dir}/${_rt_sock}")
+                [[ "${_rt_sock}" == "${_AI_SANDBOX_ROOTLESS_DOCKER_SOCKET}" ]] && rootless_docker_shared=1
+            done
+        fi
+    fi
 
     # Add extra bwrap flags (user-specified binds, etc.) - using validated flags
     bwrap_args+=("${validated_bwrap_flags[@]}")
@@ -536,6 +641,7 @@ _run_sandboxed_agent_linux() {
         --setenv LANG "${LANG:-en_US.UTF-8}"
         --setenv TERM "${TERM:-xterm-256color}"
         --chdir "${WORKDIR}"
+        --setenv XDG_RUNTIME_DIR "${sandbox_runtime_dir}"
     )
 
     # Pass through additional terminal-related variables if set (for better terminal support)
@@ -544,7 +650,17 @@ _run_sandboxed_agent_linux() {
 
     # Pass through Docker environment variables and ~/.docker config if opted in
     if [[ "${pass_docker}" == "1" ]]; then
-        [[ -n "${DOCKER_HOST:-}" ]]      && bwrap_args+=(--setenv DOCKER_HOST "${DOCKER_HOST}")
+        # A DOCKER_HOST naming the shared rootless socket under a host
+        # runtime dir spelling the sandbox does not reuse (symlink alias,
+        # synthetic /run/user/UID) is pointed at where the socket is bound.
+        local docker_host="${DOCKER_HOST:-}" _rt_prefix
+        if [[ "${rootless_docker_shared}" == "1" ]]; then
+            for _rt_prefix in "${raw_runtime_dir%/}" "${host_runtime_dir}"; do
+                [[ -n "${_rt_prefix}" && "${docker_host}" == "unix://${_rt_prefix}/${_AI_SANDBOX_ROOTLESS_DOCKER_SOCKET}" ]] \
+                    && docker_host="unix://${sandbox_runtime_dir}/${_AI_SANDBOX_ROOTLESS_DOCKER_SOCKET}"
+            done
+        fi
+        [[ -n "${docker_host}" ]]        && bwrap_args+=(--setenv DOCKER_HOST "${docker_host}")
         [[ -n "${DOCKER_CONFIG:-}" ]]    && bwrap_args+=(--setenv DOCKER_CONFIG "${DOCKER_CONFIG}")
         [[ -n "${DOCKER_CERT_PATH:-}" ]] && bwrap_args+=(--setenv DOCKER_CERT_PATH "${DOCKER_CERT_PATH}")
         [[ -d "${HOME_DIR}/.docker" ]]   && bwrap_args+=(--ro-bind "${HOME_DIR}/.docker" "${HOME_DIR}/.docker")
