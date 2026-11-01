@@ -152,6 +152,7 @@ assert_eq "${RC}" 0 "default: launch succeeds"
 assert_eq "${CALLS}" 2 "default: bwrap ran twice (probe, then launch)"
 assert_eq "$(_yes test -e "${STATE}/sysctl-called")" no "default: sysctl binary not used"
 assert_eq "$(tail -n 1 <<<"${PROBE_ARGV}")" "${TRUE_BIN}" "probe runs the absolute external true"
+assert_eq "$(_yes grep -qx -- --unshare-user <<<"${PROBE_ARGV}")" yes "probe requires a new user namespace"
 for argv_name in PROBE_ARGV LAUNCH_ARGV; do
     argv="${!argv_name}"
     assert_eq "$(_yes _has_seq "${argv}" --unshare-user --disable-userns --assert-userns-disabled)" yes \
@@ -230,6 +231,8 @@ done
 assert_contains "${OUT}" "WARNING" "ALLOW_NESTED_USERNS=1: launch warning"
 assert_contains "${OUT}" "AI_SANDBOX_ALLOW_NESTED_USERNS=1" "ALLOW_NESTED_USERNS=1: warning names the setting"
 assert_eq "$(_filter_fds "${LAUNCH_ARGV}" | wc -l | tr -d ' ')" 1 "ALLOW_NESTED_USERNS=1: terminal filter still applied"
+assert_eq "$(_yes grep -qx -- --unshare-user <<<"${PROBE_ARGV}")" yes \
+    "ALLOW_NESTED_USERNS=1: probe still requires a new user namespace"
 _stub "" AI_SANDBOX_ALLOW_NESTED_USERNS=yes
 assert_eq "$(_yes _has_seq "${LAUNCH_ARGV}" --unshare-user --disable-userns --assert-userns-disabled)" yes \
     "ALLOW_NESTED_USERNS=yes (not 1): restriction kept"
@@ -335,7 +338,9 @@ assert_eq "${host_userns}" yes "host baseline: unprivileged user namespaces avai
 
 # ioctl probe (in the sandbox): errno of TIOCSTI, its high-bit alias and
 # TIOCLINUX on /dev/null (ENOTTY without a filter, EPERM with ours), plus
-# any inherited descriptor >= 10 (the wrapper's filter fds would be there).
+# every descriptor above stdio the client holds, with its target. Listing
+# /proc/self/fd opens a transient descriptor that is closed by the time it
+# is read back, so only descriptors still open are reported.
 cat >"${WORK}/ioctl-probe.py" <<'PY'
 import ctypes, os, termios
 libc = ctypes.CDLL(None, use_errno=True)
@@ -349,7 +354,13 @@ print("NULL_TIOCSTI=%d" % err(fd, termios.TIOCSTI))
 print("NULL_TIOCSTI_HIGH=%d" % err(fd, (1 << 32) | termios.TIOCSTI))
 print("NULL_TIOCLINUX=%d" % err(fd, termios.TIOCLINUX))
 os.close(fd)
-print("HIGH_FDS=%s" % sorted(int(f) for f in os.listdir("/proc/self/fd") if int(f) >= 10))
+for name in sorted(os.listdir("/proc/self/fd"), key=int):
+    if int(name) <= 2:
+        continue
+    try:
+        print("CLIENT_FD %s %s" % (name, os.readlink("/proc/self/fd/" + name)))
+    except FileNotFoundError:
+        pass
 PY
 _native() {  # SETUP SCRIPT [NAME=VALUE...]
     local setup="${1}" script="${2}" probe="${WORK}/probe-${RUN_ID}.sh"; shift 2
@@ -370,7 +381,53 @@ assert_contains "${out}" "FILE_OK" "native default: WORKDIR writes work"
 assert_contains "${out}" "NULL_TIOCSTI=${EPERM}${NL}" "native default: TIOCSTI fails with EPERM"
 assert_contains "${out}" "NULL_TIOCSTI_HIGH=${EPERM}${NL}" "native default: high-bit TIOCSTI alias fails with EPERM"
 assert_contains "${out}" "NULL_TIOCLINUX=${EPERM}${NL}" "native default: TIOCLINUX fails with EPERM"
-assert_contains "${out}" "HIGH_FDS=[]" "native default: no filter descriptor leaks into the client"
+
+# Descriptor identity: a bwrap wrapper function logs, for each bubblewrap
+# call, the target of every --add-seccomp-fd descriptor (FILTER) and, for
+# the launch, the caller's whole descriptor table (CALLER); an EXIT trap
+# logs the caller's table after the launch (AFTER). Descriptors the caller
+# or CI runner already held pass through, as they always have. A deliberately
+# inherited caller descriptor (CTRL) is the positive control: caller-owned
+# descriptors must still reach the client, so an empty-handed check cannot
+# pass. External find lists the table, so no shell redirection is active.
+FD_LOG="${STUB_DIR}/fds-${RUN_ID}.log"
+CTRL_FILE="${WORK}/ctrl-${RUN_ID}"
+: >"${CTRL_FILE}"
+FD_HOOK='exec {CTRL_FD}<"'"${CTRL_FILE}"'"
+_fd_table() { find "/proc/${1}/fd" -mindepth 1 -maxdepth 1 -printf "${2} %f %l\n" >>"'"${FD_LOG}"'"; }
+trap '"'"'_fd_table "${BASHPID}" AFTER'"'"' EXIT
+bwrap() {
+    local me="${BASHPID}" i; local -a a=("$@")
+    for i in "${!a[@]}"; do
+        [[ "${a[i]}" == --add-seccomp-fd ]] && printf "FILTER %s %s\n" "${a[i+1]}" "$(readlink "/proc/${me}/fd/${a[i+1]}")" >>"'"${FD_LOG}"'"
+    done
+    [[ " ${a[*]} " == *" --chdir "* ]] && _fd_table "${me}" CALLER
+    command bwrap "$@"
+}'
+_fd_lines() { awk -v kind="${2}" '$1 == kind { print $2 " " $3 }' <<<"${1}" | sort -u; }
+_fd_check() {  # LABEL OUT: no wrapper filter descriptor reaches the client or stays with the caller
+    local label="${1}" out="${2}" log filters client caller after leaked
+    log="$(cat "${FD_LOG}" 2>/dev/null)"
+    filters="$(_fd_lines "${log}" FILTER)"
+    client="$(_fd_lines "${out}" CLIENT_FD)"
+    caller="$(_fd_lines "${log}" CALLER)"
+    after="$(_fd_lines "${log}" AFTER)"
+    assert_eq "$(wc -l <<<"${filters}" | tr -d ' ')" 2 "${label}: probe and launch each got a filter descriptor"
+    assert_eq "$(_yes grep -qvx '[0-9]* pipe:\[[0-9]*\]' <<<"${filters}")" no "${label}: filter descriptors are pipes"
+    assert_contains "${client}" " ${CTRL_FILE}" "${label}: caller-owned descriptor reaches the client (control)"
+    leaked="$(awk 'NR == FNR { t[$2] = 1; next } ($2 in t)' <(printf '%s\n' "${filters}") <(printf '%s\n' "${client}"))"
+    assert_eq "${leaked}" "" "${label}: no wrapper filter descriptor reaches the client"
+    # By number: a path target can read differently inside the sandbox.
+    leaked="$(comm -23 <(cut -d ' ' -f 1 <<<"${client}" | sort) <(cut -d ' ' -f 1 <<<"${caller}" | sort))"
+    assert_eq "${leaked}" "" "${label}: client holds only descriptors the caller passed"
+    leaked="$(awk 'NR == FNR { t[$2] = 1; next } ($2 in t)' <(printf '%s\n' "${filters}") <(printf '%s\n' "${after}"))"
+    assert_eq "${leaked}" "" "${label}: caller holds no filter descriptor after the launch"
+    assert_contains "${after}" " ${CTRL_FILE}" "${label}: caller-owned descriptor kept after the launch (control)"
+}
+rm -f "${FD_LOG}"
+out="$(_native "${FD_HOOK}" 'python3 -I ./ioctl-probe.py')"
+assert_contains "${out}" "NULL_TIOCSTI=${EPERM}${NL}" "native descriptors: terminal filter applied"
+_fd_check "native descriptors" "${out}"
 
 out="$(_native "" "${NATIVE_SCRIPT}" AI_SANDBOX_ALLOW_NESTED_USERNS=1)"
 assert_contains "${out}" "NESTED_OK" "native ALLOW_NESTED_USERNS=1: nested user namespace creation works"
