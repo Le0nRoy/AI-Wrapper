@@ -338,11 +338,22 @@ assert_eq "${host_userns}" yes "host baseline: unprivileged user namespaces avai
 
 # ioctl probe (in the sandbox): errno of TIOCSTI, its high-bit alias and
 # TIOCLINUX on /dev/null (ENOTTY without a filter, EPERM with ours), plus
-# every descriptor above stdio the client holds, with its target. Listing
-# /proc/self/fd opens a transient descriptor that is closed by the time it
-# is read back, so only descriptors still open are reported.
+# every descriptor above stdio the client holds, with its target. The
+# table is read first, before ctypes loads: libffi can keep a descriptor of
+# its own open (seen as fd 3 under newer Python), which is the runtime's,
+# not something the wrapper passed in. Listing /proc/self/fd opens a
+# transient descriptor that is closed by the time it is read back, so only
+# descriptors still open are reported.
 cat >"${WORK}/ioctl-probe.py" <<'PY'
-import ctypes, os, termios
+import os
+for name in sorted(os.listdir("/proc/self/fd"), key=int):
+    if int(name) <= 2:
+        continue
+    try:
+        print("CLIENT_FD %s %s" % (name, os.readlink("/proc/self/fd/" + name)))
+    except FileNotFoundError:
+        pass
+import ctypes, termios
 libc = ctypes.CDLL(None, use_errno=True)
 libc.ioctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_void_p]
 def err(fd, req):
@@ -354,13 +365,6 @@ print("NULL_TIOCSTI=%d" % err(fd, termios.TIOCSTI))
 print("NULL_TIOCSTI_HIGH=%d" % err(fd, (1 << 32) | termios.TIOCSTI))
 print("NULL_TIOCLINUX=%d" % err(fd, termios.TIOCLINUX))
 os.close(fd)
-for name in sorted(os.listdir("/proc/self/fd"), key=int):
-    if int(name) <= 2:
-        continue
-    try:
-        print("CLIENT_FD %s %s" % (name, os.readlink("/proc/self/fd/" + name)))
-    except FileNotFoundError:
-        pass
 PY
 _native() {  # SETUP SCRIPT [NAME=VALUE...]
     local setup="${1}" script="${2}" probe="${WORK}/probe-${RUN_ID}.sh"; shift 2
