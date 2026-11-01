@@ -26,7 +26,7 @@ Paths assume the chezmoi destination `~/ai-wrapper` that the scripts expect (`ru
 
 - Linux (tested on Arch Linux) or macOS
 - [`chezmoi`](https://www.chezmoi.io/) installed
-- Linux: `bubblewrap` (`bwrap`) for sandbox wrappers, `kernel.unprivileged_userns_clone = 1` in sysctl
+- Linux: `bubblewrap` (`bwrap`) with `--disable-userns` and `--add-seccomp-fd` support, unprivileged user namespaces enabled (a launch probe checks), and `python3` plus the libseccomp runtime library (`libseccomp2`) for the terminal-injection filter
 - macOS: `sandbox-exec` (ships with the OS)
 - The target AI CLI tools installed (`claude`, `codex`, `agy`, `cursor-agent`, `copilot` as applicable)
 

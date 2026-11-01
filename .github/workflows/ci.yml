@@ -76,10 +76,14 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4
 
-      - name: Install bubblewrap
+      - name: Install bubblewrap and terminal-filter prerequisites
+        # python3 + the libseccomp runtime build the Linux sandbox's
+        # terminal-injection seccomp filter (#64); without them a protected
+        # launch is refused.
         run: |
           sudo apt-get update
-          sudo apt-get install -y bubblewrap
+          sudo apt-get install -y bubblewrap python3 libseccomp2
+          bwrap --version
 
       - name: Enable unprivileged user namespaces
         # Some Ubuntu point releases restrict unprivileged userns by
@@ -87,7 +91,7 @@ jobs:
         # bubblewrap needs disabled; separately, unprivileged_userns_clone
         # itself must be 1. The wrapper checks both at launch and errors
         # clearly if this step didn't take — see run_sandboxed_agent's
-        # pre-flight validation.
+        # pre-flight validation (procfs knobs plus a real bwrap probe).
         run: |
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
@@ -106,6 +110,7 @@ jobs:
       - run: bash tests/test_copilot_wrapper.bash
       - run: bash tests/test_linux_host_binds.bash
       - run: bash tests/test_linux_runtime_dir.bash
+      - run: bash tests/test_linux_process_isolation.bash
 
   # macOS's built-in sandbox-exec needs no install step. Runs the same
   # cross-platform smoke tests as Linux (run_sandboxed_agent dispatches on

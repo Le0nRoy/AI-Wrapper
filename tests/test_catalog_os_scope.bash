@@ -26,6 +26,8 @@ LINUX_ONLY_KEYS=(
     AI_SANDBOX_ALLOW_ANDROID
     AI_SANDBOX_PASS_TAILSCALE
     AI_SANDBOX_ALLOW_XDG_RUNTIME_RW
+    AI_SANDBOX_ALLOW_NESTED_USERNS
+    AI_SANDBOX_ALLOW_TIOCSTI
 )
 # A representative sample of settings implemented on both backends.
 CROSS_PLATFORM_KEYS=(
@@ -90,6 +92,22 @@ assert_contains "$(grep '^AI_SANDBOX_ALLOW_DOCKER|' <<<"${linux_catalog}")" "pod
     "Linux ALLOW_DOCKER help names the rootless Podman socket"
 assert_not_contains "$(grep '^AI_SANDBOX_ALLOW_DOCKER|' <<<"${darwin_catalog}")" "XDG_RUNTIME_DIR" \
     "macOS ALLOW_DOCKER help has no Linux runtime-dir wording"
+
+# Process isolation opt-outs (#64): nested userns red, TIOCSTI yellow,
+# both ordinary preset settings whose help names what turning them on costs.
+assert_contains "${linux_catalog}" "AI_SANDBOX_ALLOW_NESTED_USERNS|bool|0|red|" "nested-userns opt-out is red severity"
+assert_contains "${linux_catalog}" "AI_SANDBOX_ALLOW_TIOCSTI|bool|0|yellow|" "TIOCSTI opt-out is yellow severity"
+nested_row="$(grep '^AI_SANDBOX_ALLOW_NESTED_USERNS|' <<<"${linux_catalog}")"
+assert_contains "${nested_row}" "Chromium" "nested-userns help names the in-sandbox Chromium need"
+assert_contains "${nested_row}" "shared host socket work without it" "nested-userns help: host-socket Docker/Podman unaffected"
+tiocsti_row="$(grep '^AI_SANDBOX_ALLOW_TIOCSTI|' <<<"${linux_catalog}")"
+assert_contains "${tiocsti_row}" "python3 + libseccomp" "TIOCSTI help names the prerequisite"
+assert_contains "${tiocsti_row}" "launch is refused" "TIOCSTI help: missing support refuses, not skips"
+for key in AI_SANDBOX_ALLOW_NESTED_USERNS AI_SANDBOX_ALLOW_TIOCSTI; do
+    key_scope="$(source "${REPO_ROOT}/bin/ai_wrapper_data/ai_wrapper_lib.bash" >/dev/null 2>&1
+        if _setting_is_session_only "${key}"; then echo session; else echo preset; fi)"
+    assert_eq "${key_scope}" preset "${key} is an ordinary preset setting"
+done
 
 for key in "${CROSS_PLATFORM_KEYS[@]}"; do
     assert_contains "${linux_catalog}" "${key}|" "${key} shown on Linux"

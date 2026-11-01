@@ -146,7 +146,36 @@ The sandbox bounds *writes* — it does not bound *reads* or *network*. Be aware
   `systemd --user` this may include starting programs outside the
   sandbox). Red banner and a launch `WARNING`.
 
-These five controls are Linux-only and ordinary settings: saved to and
+- Nested user namespaces: the sandbox runs with `--unshare-user
+  --disable-userns --assert-userns-disabled`, so the agent cannot create
+  user namespaces of its own. Ordinary tools, git and Docker/Podman
+  clients using a shared host socket are unaffected; nested bubblewrap
+  or Flatpak, Chromium/Playwright without `--no-sandbox` and container
+  engines run inside the sandbox fail. If bubblewrap cannot enforce this
+  (no `--disable-userns` support), the launch stops with the reason.
+- `AI_SANDBOX_ALLOW_NESTED_USERNS=1` — launch without that restriction.
+  Each nested namespace gives the agent namespace-root capabilities and
+  more kernel attack surface. Red banner and a launch `WARNING`.
+- Terminal injection: a seccomp filter makes `ioctl(TIOCSTI)` and
+  `ioctl(TIOCLINUX)` fail with `EPERM`, so the agent cannot type
+  commands into your terminal that run after the session. Nothing else
+  changes: `/dev/tty`, raw input, window resize and Ctrl+C work as
+  usual. The filter is built on the host with `python3 -I` and the
+  libseccomp runtime library (`libseccomp2`); if either is missing or
+  the filter fails its self-test, the launch stops with the reason.
+- `AI_SANDBOX_ALLOW_TIOCSTI=1` — launch without the terminal filter. On
+  kernels that still allow `TIOCSTI` the agent can then inject input.
+  Yellow banner and a launch `WARNING`.
+- Preflight: reads `/proc/sys/kernel/unprivileged_userns_clone` and
+  `/proc/sys/user/max_user_namespaces` directly (no `sysctl` binary). A
+  knob your kernel does not have is fine; one set to `0` stops the
+  launch. Before the client starts, a minimal bubblewrap sandbox with the
+  same isolation options runs `true`; if it fails, the launch stops and
+  says whether user namespaces are denied (kernel, AppArmor, container),
+  bubblewrap lacks an option, the filter could not load, or it is a
+  setup problem.
+
+These seven controls are Linux-only and ordinary settings: saved to and
 restored from the per-workdir preset like the other toggles. A path
 missing on the host is skipped, never created. An explicit wider grant
 still applies: launching from (or `AI_SANDBOX_EXTRA_RW_DIRS` on) a
