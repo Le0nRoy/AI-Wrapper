@@ -442,12 +442,63 @@ follows the same rules (Linux + opt-in, or a covering grant).
   `tailscaled` allows that user — read-only for a plain user,
   settings changes for `--operator=$USER`. There is no read-only
   Tailscale API mode.
-- `/run/user/$UID` (`XDG_RUNTIME_DIR`) is still bound RW; tracked by
-  #63.
+- `/run/user/$UID` (`XDG_RUNTIME_DIR`) was still bound RW; resolved
+  by #63 (S-ι).
 - macOS binds none of these paths; unchanged.
 - Native enforcement is tested by `tests/test_linux_host_binds.bash`
   under real bubblewrap (CI `smoke-linux`), with a synthetic socket
   standing in for `tailscaled`.
+
+### S-ι — Linux user runtime dir bound wholesale; XDG_RUNTIME_DIR lost (RESOLVED, 2026-11, #63)
+
+The bwrap backend bound the host `$XDG_RUNTIME_DIR` (normally
+`/run/user/$UID`) read-write whenever it existed. It holds the
+session's sockets: D-Bus session bus, `systemd --user`, keyring / Secret
+Service, Wayland / X / PipeWire / PulseAudio, SSH and GPG agents,
+rootless Docker / Podman. The sandbox runs as the host UID, and these
+daemons authorise callers by UID (`SO_PEERCRED`) — a read-only bind
+would not have changed that. So `AI_SANDBOX_PASS_SSH_AGENT=0` and
+`AI_SANDBOX_ALLOW_DOCKER=0` did not stop an agent that found the
+sockets. What each socket allowed depends on that daemon. Separately,
+`--setenv XDG_RUNTIME_DIR` came before `--clearenv`, so the client never
+saw the variable.
+
+**Resolution.**
+
+| Resource | Default | Opt-in |
+|----------|---------|--------|
+| Runtime dir | private, empty, `--perms 0700 --dir`; host path if it lies below `/run` or `/tmp` and no other mount overlaps it, else `/run/user/UID` (also when unset/invalid) | `AI_SANDBOX_ALLOW_XDG_RUNTIME_RW=1` → `--bind` of the validated host dir |
+| `XDG_RUNTIME_DIR` | set after `--clearenv` to the sandbox dir | same |
+| SSH agent socket | absent | `AI_SANDBOX_PASS_SSH_AGENT=1` → `--bind` at `SSH_AUTH_SOCK`'s exact path |
+| Rootless `docker.sock`, `podman/podman.sock` | absent | `AI_SANDBOX_ALLOW_DOCKER=1` → `--bind` into the sandbox runtime dir (socket, not a symlink, owned by you) |
+| Session bus, `systemd/`, keyring, display, audio, other sockets | absent | broad override only |
+
+`AI_SANDBOX_ALLOW_XDG_RUNTIME_RW` is a Linux-only red catalog setting
+(saved in the per-workdir preset). It requires an existing directory,
+resolved through symlinks, owned by the user, not a system root,
+`$HOME`, a dotfile dir, a parent of `$HOME`, or group/world-writable;
+otherwise the launch fails with the reason instead of falling back.
+`AI_SANDBOX_PASS_DOCKER` still alone controls `DOCKER_HOST` and
+`~/.docker`; a `DOCKER_HOST` that names the shared rootless socket via a
+host spelling the sandbox does not reuse is rewritten to the mounted
+path. `_agy_path_sandbox_writable` no longer treats the runtime dir as a
+writable root (the private dir is a sandbox tmpfs even at the host
+path), except on Linux with the override; WORKDIR, extra RW and
+`--bind` grants that cover it still count.
+
+**Residual.**
+- A wider explicit grant wins: a WORKDIR, `AI_SANDBOX_EXTRA_RW_DIRS`
+  entry or plugin `--bind` that contains the host runtime dir exposes it
+  and its sockets regardless of these settings. In that overlap the
+  sandbox uses `/run/user/UID` so its private dir setup never touches
+  the host-backed path.
+- Shared sockets are full API access to that daemon for the host UID;
+  bind flags do not restrict the API.
+- `--perms` needs bubblewrap 0.5 or newer.
+- Native enforcement is tested by `tests/test_linux_runtime_dir.bash`
+  under real bubblewrap (CI `smoke-linux`), with synthetic socket
+  servers standing in for the bus, `systemd`, Docker, Podman and SSH
+  agents.
 
 ## Local bugs / brittleness
 

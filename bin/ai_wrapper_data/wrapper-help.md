@@ -122,15 +122,40 @@ The sandbox bounds *writes* — it does not bound *reads* or *network*. Be aware
   the agent can do whatever `tailscaled` allows your user (with
   `tailscale set --operator=$USER`, that includes changing settings).
   Red banner.
+- User runtime dir: the host `$XDG_RUNTIME_DIR` (`/run/user/UID`) is
+  **not** shared. The sandbox gets its own empty runtime dir (mode
+  `0700`), exported as `XDG_RUNTIME_DIR` — the host path when it lies
+  under `/run` or `/tmp` and nothing else is mounted there, otherwise
+  `/run/user/UID`; also when the host value is unset or invalid. Files
+  and sockets created there vanish with the sandbox. Only named sockets
+  are shared: the SSH agent socket at its own path
+  (`AI_SANDBOX_PASS_SSH_AGENT=1`) and the rootless Docker
+  (`$XDG_RUNTIME_DIR/docker.sock`) and Podman
+  (`$XDG_RUNTIME_DIR/podman/podman.sock`) sockets
+  (`AI_SANDBOX_ALLOW_DOCKER=1`; a `DOCKER_HOST` passed by
+  `AI_SANDBOX_PASS_DOCKER=1` that names the rootless socket is pointed at
+  where it is mounted). The D-Bus session bus, `systemd --user`,
+  keyring, display and audio servers are not reachable.
+- `AI_SANDBOX_ALLOW_XDG_RUNTIME_RW=1` — bind the host `$XDG_RUNTIME_DIR`
+  read-write (the behaviour before this setting existed). It must exist,
+  be yours, and not be a system directory, `$HOME`, a dotfile directory,
+  a parent of `$HOME`, or writable by others; otherwise the launch stops
+  with the reason. Every socket in it becomes reachable with your user ID,
+  whatever the SSH-agent and Docker settings say. What the agent can then
+  do depends on each service (through the session bus or
+  `systemd --user` this may include starting programs outside the
+  sandbox). Red banner and a launch `WARNING`.
 
-These four controls are Linux-only and ordinary settings: saved to and
+These five controls are Linux-only and ordinary settings: saved to and
 restored from the per-workdir preset like the other toggles. A path
 missing on the host is skipped, never created. An explicit wider grant
 still applies: launching from (or `AI_SANDBOX_EXTRA_RW_DIRS` on) a
 directory at or above `~/bin` or `~/ai-wrapper/.agents` makes that tree
-writable whatever these toggles say. Kind support was removed: `~/.kind`
-and `~/kind_dot_kube` are never mounted and `KIND_EXPERIMENTAL_PROVIDER`
-is not passed; Kubernetes access is `AI_SANDBOX_PASS_KUBE` (`~/.kube`,
+writable whatever these toggles say; likewise a WORKDIR or
+`AI_SANDBOX_EXTRA_RW_DIRS` entry that contains the host runtime dir
+exposes it and its sockets whatever the runtime settings say. Kind
+support was removed: `~/.kind` and `~/kind_dot_kube` are never mounted
+and `KIND_EXPERIMENTAL_PROVIDER` is not passed; Kubernetes access is `AI_SANDBOX_PASS_KUBE` (`~/.kube`,
 `KUBECONFIG`).
 <!-- os:end -->
 <!-- os:darwin -->
