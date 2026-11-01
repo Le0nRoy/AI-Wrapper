@@ -21,6 +21,7 @@ import unittest
 from unittest import mock
 
 HELPER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "bin", "ai_wrapper_data")
+sys.dont_write_bytecode = True  # never leave __pycache__ in the deployed bin dir
 sys.path.insert(0, HELPER_DIR)
 import linux_tty_seccomp as helper  # noqa: E402  (path set up above)
 

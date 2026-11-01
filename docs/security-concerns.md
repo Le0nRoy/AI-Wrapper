@@ -572,7 +572,9 @@ Three gaps in the bwrap backend:
   (instead of `--no-sandbox`), and rootless container engines run
   *inside* the sandbox fail. Docker / Podman clients talking to a host
   daemon through a shared socket (#63) are unaffected; that daemon
-  creates the namespaces outside the sandbox.
+  creates the namespaces outside the sandbox. A client's own
+  bubblewrap-based command sandbox would also need the opt-out; the
+  wrappers launch clients with their built-in sandboxes turned off.
 - bwrap without `--disable-userns` / `--add-seccomp-fd` support refuses
   the protected launch; there is no warn-and-skip path.
 - `TIOCSTI` is often already blocked by the kernel (`legacy_tiocsti=0`,

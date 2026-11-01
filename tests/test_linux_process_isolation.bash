@@ -388,7 +388,7 @@ assert_not_contains "${out}" "NULL_TIOCLINUX=${EPERM}${NL}" "native ALLOW_TIOCST
 
 # A caller filter (mkdir/mkdirat -> EXDEV) combined with ours: both apply.
 NATIVE_USER_FILTER="${STUB_DIR}/user-mkdir.bpf"
-python3 -I - "${REPO_ROOT}/bin/ai_wrapper_data" "${NATIVE_USER_FILTER}" <<'PY'
+python3 -I -B - "${REPO_ROOT}/bin/ai_wrapper_data" "${NATIVE_USER_FILTER}" <<'PY'
 import errno, sys
 sys.path.insert(0, sys.argv[1])
 import linux_tty_seccomp as h
@@ -429,12 +429,13 @@ assert_contains "${res}" "setup problem, not a user namespace denial" "native pr
 DENY_SCRIPT="${STUB_DIR}/deny-${RUN_ID}.sh"
 cat >"${DENY_SCRIPT}" <<EOF
 echo 0 >/proc/sys/user/max_user_namespaces || { echo CANNOT_LIMIT; exit 0; }
+echo LIMIT_SET
 cd "${WORK}" && source "${REPO_ROOT}/bin/ai_agent_universal_wrapper.bash"
 _sandbox_linux_probe; echo "probe_rc=\$?"
 ( _run_sandboxed_agent_linux true -- -- ); echo "wrapper_rc=\$?"
 EOF
 res="$(unshare --user --map-root-user bash "${DENY_SCRIPT}" 2>&1)"
-assert_not_contains "${res}" "CANNOT_LIMIT" "native denial: child namespace limit applied"
+assert_contains "${res}" "LIMIT_SET" "native denial: child namespace limit applied"
 assert_contains "${res}" "user namespaces cannot be created here" "native denial: probe reports a namespace denial"
 assert_contains "${res}" "probe_rc=1" "native denial: probe fails"
 assert_contains "${res}" "user.max_user_namespaces is 0" "native denial: wrapper refuses on the real knob"
@@ -577,10 +578,11 @@ out="$(_pty default-int)"
 assert_contains "${out}" "COOKED" "pty Ctrl+C: client reached cooked mode"
 assert_contains "${out}" "DRIVER_EXIT" "pty Ctrl+C: run ended"
 assert_not_contains "${out}" "DRIVER_TIMEOUT" "pty Ctrl+C: no hang"
+# Scan every process's argv; "[.]" keeps grep's own argv from matching.
 leftover=yes
 deadline=$(( SECONDS + 10 ))
 while (( SECONDS < deadline )); do
-    pgrep -f "tty-probe-${RUN_ID}" >/dev/null || { leftover=no; break; }
+    grep -qsa "tty-probe-${RUN_ID}[.]py" /proc/[0-9]*/cmdline || { leftover=no; break; }
     sleep 0.2
 done
 assert_eq "${leftover}" no "pty Ctrl+C: no sandboxed client left running"
