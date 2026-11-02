@@ -255,6 +255,13 @@ clear_catalog_env() {
     unset AI_SANDBOX_ALLOW_DOCKER
     unset AI_SANDBOX_PASS_DOCKER
     unset AI_SANDBOX_WORKDIR_WARNING
+    # Catch catalog rows added since this list was written: a leftover
+    # value now counts as caller-set and blocks the preset (CC-6).
+    local name
+    for name in $(compgen -v AI_SANDBOX_); do
+        unset "${name}"
+    done
+    unset CLAUDE_ACCOUNT CODEX_ACCOUNT AGY_ACCOUNT
 }
 
 # --- macOS stat mode bits -------------------------------------------------

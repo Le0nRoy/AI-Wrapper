@@ -69,10 +69,10 @@ _AI_SETTINGS_LIST+=(
     "CODEX_ACCOUNT|str|private|info|Account profile|Which ~/.codex-<name>/ credential profile to use. 'private' = default ~/.codex. Type a profile name, or 'private' to reset.|account"
 )
 
-# Export the default so the settings table shows "private" rather than
-# "<unset>" (str entries don't substitute DEFAULT). See the matching
-# comment in claude_wrapper_lib.bash.
-export CODEX_ACCOUNT="${CODEX_ACCOUNT:-private}"
+# No source-time `export CODEX_ACCOUNT=private`: _preset_autoload treats a set
+# variable as caller-set and would skip a saved account. The settings table
+# shows "private" for unset via _setting_current_value's catalog default.
+
 
 # List available account profile names (suffixes of ~/.codex-<name>/),
 # one per line.

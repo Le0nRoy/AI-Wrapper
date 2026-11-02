@@ -674,6 +674,39 @@ Three gaps (CC-1..CC-3):
   binds) and `tests/test_extra_bind_dirs.bash` (native refusals and
   grants through the real sandbox, CI `smoke-linux` / `smoke-macos`).
 
+### S-μ — saved preset overrode the launch environment (RESOLVED, 2026-11, #66)
+
+CC-6. `_preset_autoload` exported every saved setting unconditionally,
+so `AI_SANDBOX_PASS_AWS=0 claude_wrapper` in a workdir whose preset held
+`AI_SANDBOX_PASS_AWS=1` launched with AWS credentials anyway. Only
+`AI_SANDBOX_ALLOW_GIT_CONFIG` had a launch-wins check, and only that
+setting WARNed when a relaxed value was restored; every other red or
+yellow setting (Docker socket, SSH agent, extra RW dirs, ...) came back
+silently, including for scripted launches with no menu.
+
+**Resolution.**
+
+- A setting already present in the launch environment (even set to an
+  empty string) is never overwritten by the preset
+  (`[[ -n "${!key+x}" ]]`). This replaces the one-off
+  `_AI_GIT_CONFIG_SET_AT_LAUNCH` flag. Ordinary settings, red and yellow
+  ones included, still persist in the preset by owner choice.
+- Restoring a red or yellow setting at a non-default value WARNs on
+  stderr (`Restored KEY=VAL from the saved preset (...)`) in interactive
+  and scripted launches alike. Default values and info settings restore
+  silently.
+- The claude, codex and agy libs no longer `export *_ACCOUNT=private` at
+  source time — that would count as caller-set and hide a saved account.
+  `_setting_current_value` now substitutes the catalog default for an
+  empty str/path, so the settings table still shows `private`.
+- Session-only settings (`AI_SANDBOX_ALLOW_EXTERNAL_WORKTREES`, B-ο) are
+  still rejected before the precedence check: never saved, never loaded.
+
+**Residual.** In an interactive launch, auto-save runs after the menu and
+writes the session's current values, so a one-off launch value (e.g.
+`AI_SANDBOX_PASS_AWS=0`) replaces the saved one for that workdir. A
+preset entry for a variable that is set at launch is skipped silently.
+
 ## Local bugs / brittleness
 
 ### B-α — `mkdir -p ~/.claude` follows symlinks (RESOLVED, 2026-05-24, WS3)
@@ -985,7 +1018,8 @@ starts. It protects only entries that exist at launch:
   (WORKDIR's submodules and a linked worktree's own submodules). The
   pins, pointer files, `commondir`, `worktrees/` and all validation and
   limits stay. A value given explicitly at launch (even `=0`) wins over
-  the per-workdir preset; restoring `1` from a preset WARNs. It does not
+  the per-workdir preset, as for every setting (S-μ); restoring `1` from
+  a preset WARNs. It does not
   relax the worktree common dir or its shared submodules (B-λ).
 - **Submodule git dirs (#12).** `_wrapper_git_scan_modules` walks
   `modules/` (WORKDIR's git dir, a worktree's shared common dir and its

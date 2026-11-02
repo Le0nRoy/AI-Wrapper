@@ -248,6 +248,34 @@ assert_eq "$(_exists "${ID_A}-codex.env") $(_exists "${ID_B}-claude.env") $(_exi
     "present present present present" "... leaving other agents, projects and unrelated files alone"
 
 # ---------------------------------------------------------------------------
+echo "-- launch environment wins over the preset; saved accounts still load (CC-6)"
+# The agent lib is sourced AFTER the launch environment is in place, as the
+# wrapper entry scripts do, so a source-time account default would count as
+# caller-set and hide the saved account.
+_launch() {
+    local agent="${1}" var="${2}" launch="${3}"
+    (
+        cd "${A}" || exit 1
+        unset CLAUDE_ACCOUNT CODEX_ACCOUNT AGY_ACCOUNT
+        [[ "${launch}" != "<unset>" ]] && export "${var}=${launch}"
+        _load "${agent}"
+        _preset_autoload
+        echo "VAL=${!var-<unset>}"
+    ) 2>&1
+}
+for spec in claude:CLAUDE_ACCOUNT codex:CODEX_ACCOUNT agy:AGY_ACCOUNT; do
+    agent="${spec%%:*}" var="${spec#*:}"
+    printf '%s=saved-acc\n' "${var}" >"${PRESET_DIR}/${ID_A}-${agent}.env"
+    out="$(_launch "${agent}" "${var}" "<unset>")"
+    assert_contains "${out}" "VAL=saved-acc" "${agent}: saved ${var} loads when not set at launch"
+    out="$(_launch "${agent}" "${var}" cli-acc)"
+    assert_contains "${out}" "VAL=cli-acc" "${agent}: ${var} set at launch wins over the preset"
+    out="$( (cd "${A}" && unset "${var}" && _load "${agent}" && echo "VAL=${!var-<unset>}"; _setting_current_value "${var}" str private) 2>&1 )"
+    assert_contains "${out}" $'VAL=<unset>\nprivate' "${agent}: lib exports no account default; the settings table still shows 'private'"
+    rm -f "${PRESET_DIR}/${ID_A}-${agent}.env"
+done
+
+# ---------------------------------------------------------------------------
 echo "-- agy trusted-target check on hash failure"
 mkdir -p "${FAKE_HOME}/agy-stub" "${FAKE_HOME}/.gemini-x/antigravity-cli" "${FAKE_HOME}/dot"
 _stub "${FAKE_HOME}/agy-stub" sha256sum 'exit 1'

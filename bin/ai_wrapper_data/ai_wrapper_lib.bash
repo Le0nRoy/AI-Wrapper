@@ -1187,13 +1187,6 @@ _setting_is_session_only() {
     return 1
 }
 
-# AI_SANDBOX_ALLOW_GIT_CONFIG given explicitly at launch (even =0) wins
-# over the per-workdir preset, so a one-off `AI_SANDBOX_ALLOW_GIT_CONFIG=0`
-# cannot be undone by a saved relaxed value. Captured at source time,
-# before _preset_autoload exports anything.
-_AI_GIT_CONFIG_SET_AT_LAUNCH=0
-[[ -n "${AI_SANDBOX_ALLOW_GIT_CONFIG+set}" ]] && _AI_GIT_CONFIG_SET_AT_LAUNCH=1
-
 # Parse one catalog entry into globals: _set_name _set_type _set_default
 # _set_severity _set_headline _set_detail _set_category _set_os_scope.
 # Globals because bash 3.2 lacks namerefs and returning an 8-tuple via
@@ -1272,19 +1265,18 @@ _setting_state_color() {
 
 # Echo the current value of a setting (after default-substitution). For
 # bools, anything other than "1" is normalised to "0" — matching how the
-# wrapper itself interprets these vars elsewhere.
+# wrapper itself interprets these vars elsewhere. An empty str/path takes
+# the catalog default (e.g. CLAUDE_ACCOUNT -> "private"); most str/path
+# defaults are empty, so empty stays empty for them. Agent libs must not
+# export such defaults at source time: _preset_autoload treats any set
+# variable as caller-set and would skip the saved value.
 _setting_current_value() {
     local name="${1}" type="${2}" default="${3}" cur
     cur="${!name:-}"
-    case "${type}" in
-        bool)
-            [[ -z "${cur}" ]] && cur="${default}"
-            [[ "${cur}" == "1" ]] || cur="0"
-            ;;
-        str|path)
-            # No default substitution for non-bool (empty is meaningful).
-            ;;
-    esac
+    [[ -z "${cur}" ]] && cur="${default}"
+    if [[ "${type}" == "bool" && "${cur}" != "1" ]]; then
+        cur="0"
+    fi
     printf '%s' "${cur}"
 }
 
@@ -1532,6 +1524,13 @@ _preset_autosave() {
 # from the Claude wrapper). Sets AI_WRAPPER_PRESET_AUTOLOADED_FROM=<path>
 # when >=1 setting was applied so show_header can render the dim
 # "restored from" banner line.
+#
+# The launch environment wins: a key already set in the caller's
+# environment (even to an empty string) is left untouched, so a one-off
+# `AI_SANDBOX_PASS_AWS=0 claude_wrapper` cannot be undone by a saved
+# relaxed value. Must run once, before the menu, so only launch-time
+# values count as caller-set. Restoring a non-default red or yellow
+# setting WARNs on stderr so scripted launches see what was relaxed.
 _preset_autoload() {
     local path entry line key val catalog_type applied=0 legacy=0
     path="$(_preset_autosave_path)" || { _preset_mark_unavailable; return 1; }
@@ -1571,6 +1570,7 @@ _preset_autoload() {
                 break
             fi
         done
+        # _set_* now describe the matched entry (when catalog_type is set).
         if [[ -z "${catalog_type}" ]]; then
             (( legacy )) && continue
             echo "  WARN: _preset_autoload: unknown setting: ${key}" >/dev/tty
@@ -1588,11 +1588,9 @@ _preset_autoload() {
                 # No further validation — accept-any-string contract.
                 ;;
         esac
-        if [[ "${key}" == "AI_SANDBOX_ALLOW_GIT_CONFIG" ]]; then
-            (( _AI_GIT_CONFIG_SET_AT_LAUNCH )) && continue
-            # stderr, not /dev/tty: scripted launches must see it too.
-            [[ "${val}" == "1" ]] && echo "  WARN: [${AI_AGENT_COMMAND:-ai-wrapper}] Restored AI_SANDBOX_ALLOW_GIT_CONFIG=1 from the saved preset: git config and hooks in this workdir will be writable by the agent (set AI_SANDBOX_ALLOW_GIT_CONFIG=0 at launch or toggle it in s) Settings to protect them)." >&2
-        fi
+        # Caller environment precedence (set, even if empty).
+        [[ -n "${!key+x}" ]] && continue
+        _preset_warn_restored "${key}" "${val}"
         export "${key}=${val}"
         applied=$((applied + 1))
     done < "${path}"
@@ -1603,6 +1601,23 @@ _preset_autoload() {
         export AI_WRAPPER_PRESET_AUTOLOADED_FROM="${path}"
     fi
     return 0
+}
+
+# WARN on stderr (not /dev/tty: scripted launches must see it too) when
+# _preset_autoload restores KEY=VAL for a red or yellow setting at a
+# non-default value. Reads the _set_* globals of KEY's catalog entry.
+_preset_warn_restored() {
+    local key="${1}" val="${2}" tag="[${AI_AGENT_COMMAND:-ai-wrapper}]"
+    case "${_set_severity}" in
+        red|yellow) ;;
+        *) return 0 ;;
+    esac
+    [[ -z "${val}" || "${val}" == "${_set_default}" ]] && return 0
+    if [[ "${key}" == "AI_SANDBOX_ALLOW_GIT_CONFIG" ]]; then
+        echo "  WARN: ${tag} Restored AI_SANDBOX_ALLOW_GIT_CONFIG=1 from the saved preset: git config and hooks in this workdir will be writable by the agent (set AI_SANDBOX_ALLOW_GIT_CONFIG=0 at launch or toggle it in s) Settings to protect them)." >&2
+        return 0
+    fi
+    echo "  WARN: ${tag} Restored ${key}=${val} from the saved preset (${_set_severity}: ${_set_headline}); set ${key} at launch or change it in s) Settings to override." >&2
 }
 
 # Remove this agent's per-workdir preset file and clear the
