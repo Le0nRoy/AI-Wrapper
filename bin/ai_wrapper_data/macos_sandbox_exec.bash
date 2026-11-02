@@ -120,9 +120,11 @@ _run_sandboxed_agent_impl() {
     # AI_SANDBOX_EXTRA_{RW,RO}_DIRS: comma-separated absolute paths that
     # extend the per-call bind list without patching individual wrappers.
     # Populated by the interactive Settings sub-menu (str catalog entries
-    # in ai_wrapper_lib.bash) or set directly in the environment. Missing
-    # or non-directory entries WARN and are skipped rather than failing
-    # the launch.
+    # in ai_wrapper_lib.bash) or set directly in the environment. Entries
+    # are resolved by _sandbox_resolve_extra_dir (ai_agent_universal_wrapper
+    # .bash) before they are granted or classified: missing entries WARN
+    # and are skipped, entries that exist but do not resolve to a directory
+    # refuse the launch.
     # Entries accepted from AI_SANDBOX_EXTRA_{RW,RO}_DIRS, tracked separately
     # from binds_rw/binds_ro (which at this point already carry the
     # wrapper's own trusted binds parsed from --bind/--ro-bind above, e.g.
@@ -132,8 +134,9 @@ _run_sandboxed_agent_impl() {
     # also flag those trusted binds and refuse every launch.
     # Tilde is preserved verbatim in preset files; quoted [[ -d ]] does not
     # expand it, so use parameter substitution to expand a leading ~ to $HOME.
-    local -a _user_extra_bind_dirs=()
-    local _extra_dirs_ifs _d
+    # _user_extra_bind_dirs: resolved (granted); _user_extra_bind_names: as given.
+    local -a _user_extra_bind_dirs=() _user_extra_bind_names=()
+    local _extra_dirs_ifs _d _d_resolved _d_rc
     if [[ -n "${AI_SANDBOX_EXTRA_RW_DIRS:-}" ]]; then
         _extra_dirs_ifs="${IFS}"; IFS=','
         for _d in ${AI_SANDBOX_EXTRA_RW_DIRS}; do
@@ -141,13 +144,16 @@ _run_sandboxed_agent_impl() {
             _d="${_d%"${_d##*[![:space:]]}"}"
             [[ -z "${_d}" ]] && continue
             _d="${_d/#\~/${HOME}}"
-            if [[ -d "${_d}" ]]; then
-                binds_rw+=("${_d}")
-                _user_extra_bind_dirs+=("${_d}")
-                _sandbox_warn_extra_rw_git "${tag}" "${_d}"
-            else
-                echo_log "WARN" "[${tag}] AI_SANDBOX_EXTRA_RW_DIRS: skipping '${_d}' (not a directory)"
+            _d_resolved="$(_sandbox_resolve_extra_dir "${tag}" AI_SANDBOX_EXTRA_RW_DIRS "${_d}")"; _d_rc=$?
+            (( _d_rc == 2 )) && continue
+            if (( _d_rc != 0 )); then
+                IFS="${_extra_dirs_ifs}"
+                return 1
             fi
+            binds_rw+=("${_d_resolved}")
+            _user_extra_bind_dirs+=("${_d_resolved}")
+            _user_extra_bind_names+=("${_d}")
+                _sandbox_warn_extra_rw_git "${tag}" "${_d_resolved}"
         done
         IFS="${_extra_dirs_ifs}"
     fi
@@ -158,12 +164,15 @@ _run_sandboxed_agent_impl() {
             _d="${_d%"${_d##*[![:space:]]}"}"
             [[ -z "${_d}" ]] && continue
             _d="${_d/#\~/${HOME}}"
-            if [[ -d "${_d}" ]]; then
-                binds_ro+=("${_d}")
-                _user_extra_bind_dirs+=("${_d}")
-            else
-                echo_log "WARN" "[${tag}] AI_SANDBOX_EXTRA_RO_DIRS: skipping '${_d}' (not a directory)"
+            _d_resolved="$(_sandbox_resolve_extra_dir "${tag}" AI_SANDBOX_EXTRA_RO_DIRS "${_d}")"; _d_rc=$?
+            (( _d_rc == 2 )) && continue
+            if (( _d_rc != 0 )); then
+                IFS="${_extra_dirs_ifs}"
+                return 1
             fi
+            binds_ro+=("${_d_resolved}")
+            _user_extra_bind_dirs+=("${_d_resolved}")
+            _user_extra_bind_names+=("${_d}")
         done
         IFS="${_extra_dirs_ifs}"
     fi
@@ -259,10 +268,11 @@ _run_sandboxed_agent_impl() {
     # wrapper's own trusted binds (~/.claude, ~/.claude.json, glab-cli
     # dirs, etc.) parsed earlier in this function.
     if [[ "${AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR:-}" != "1" ]]; then
-        local _sens_bind _sens_resolved
-        for _sens_bind in "${_user_extra_bind_dirs[@]+"${_user_extra_bind_dirs[@]}"}"; do
-            _sens_resolved="$(_realpath "${_sens_bind}" 2>/dev/null)" || _sens_resolved="${_sens_bind%/}"
-            case "$(_sandbox_sensitive_dir_kind "${_sens_resolved}" "${resolved_home}")" in
+        local _sens_bind _sens_resolved _sens_i
+        for (( _sens_i = 0; _sens_i < ${#_user_extra_bind_dirs[@]}; _sens_i++ )); do
+            _sens_bind="${_user_extra_bind_names[_sens_i]}"
+            _sens_resolved="${_user_extra_bind_dirs[_sens_i]}"
+            case "$(_sandbox_sensitive_pair_kind "${_sens_bind}" "${_sens_resolved}" "${HOME%/}" "${resolved_home}")" in
                 system)
                     echo_log "ERROR" "[${tag}] Refusing extra bind '${_sens_bind}' (top-level or system location). Remove it from AI_SANDBOX_EXTRA_RW_DIRS/AI_SANDBOX_EXTRA_RO_DIRS, or set AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 to override."
                     return 1
@@ -277,7 +287,7 @@ _run_sandboxed_agent_impl() {
                     ;;
             esac
         done
-        unset _sens_bind _sens_resolved
+        unset _sens_bind _sens_resolved _sens_i
     fi
 
     # WS3 / U-E: yellow-warn when WORKDIR is a direct $HOME child that
@@ -868,85 +878,6 @@ _check_workdir_breadth() {
     echo_log "WARN" "[${tag}] WORKDIR=${wd} is a direct \$HOME child outside the project-dir allowlist (Workspace/Projects/src/code/bin/work/dev/repos). The write fence grants RW on every file under it. cd one level deeper if that's broader than you intend."
     export AI_SANDBOX_WORKDIR_WARNING="${wd}"
     return 0
-}
-
-# Resolve a path canonically. macOS lacks GNU `readlink -f`; use perl as the
-# fallback that ships in the base system. Returns non-zero (and prints nothing)
-# if no resolver is available or the resolution fails — callers must check.
-# We deliberately don't synthesize an unresolved fallback: symlink-mismatched
-# paths silently break sandbox rules, which is worse than failing loudly.
-_realpath() {
-    local p="${1}" out
-    if command -v realpath >/dev/null 2>&1; then
-        if out="$(realpath "${p}" 2>/dev/null)" && [[ -n "${out}" ]]; then
-            [[ "${AI_SANDBOX_DEBUG:-0}" == "1" ]] && echo_log "DEBUG" "_realpath: branch=realpath path=${p}"
-            echo "${out}"
-            return 0
-        fi
-    fi
-    if command -v perl >/dev/null 2>&1; then
-        if out="$(perl -MCwd=abs_path -e 'my $r = abs_path($ARGV[0]); print $r if defined $r' "${p}" 2>/dev/null)" && [[ -n "${out}" ]]; then
-            [[ "${AI_SANDBOX_DEBUG:-0}" == "1" ]] && echo_log "DEBUG" "_realpath: branch=perl-abs_path path=${p}"
-            echo "${out}"
-            return 0
-        fi
-    fi
-    # Last-ditch: canonicalize via `cd … && pwd -P`. Works for directories
-    # directly; for files, follow any final-component symlinks via readlink
-    # (capped to a small depth to prevent loops) before resolving the parent
-    # and re-attaching the basename so symlinks in the directory chain are
-    # also resolved.
-    local parent base resolved_parent
-    if [[ -d "${p}" ]]; then
-        if out="$( cd "${p}" 2>/dev/null && pwd -P )" && [[ -n "${out}" ]]; then
-            [[ "${AI_SANDBOX_DEBUG:-0}" == "1" ]] && echo_log "DEBUG" "_realpath: branch=cd-pwd-dir path=${p}"
-            echo "${out}"
-            return 0
-        fi
-    elif [[ -e "${p}" || -L "${p}" ]]; then
-        local cur="${p}" target depth=0
-        # Cycle detection: the depth cap protects against unbounded
-        # recursion, but a tight loop (a → b → a) would otherwise spin up
-        # to 40 iterations and then silently return a non-canonical
-        # intermediate path. Track visited paths and bail the moment we
-        # revisit one. Bash 3.2-compatible: linear scan of a small array
-        # (cap is the depth limit, so ~40 entries max).
-        local -a seen=()
-        local _s_i
-        while [[ -L "${cur}" && ${depth} -lt 40 ]]; do
-            seen+=("${cur}")
-            target="$(readlink "${cur}" 2>/dev/null)" || break
-            [[ -z "${target}" ]] && break
-            if [[ "${target}" == /* ]]; then
-                cur="${target}"
-            else
-                cur="$(dirname -- "${cur}")/${target}"
-            fi
-            depth=$((depth + 1))
-            for (( _s_i = 0; _s_i < ${#seen[@]}; _s_i++ )); do
-                if [[ "${seen[$_s_i]}" == "${cur}" ]]; then
-                    [[ "${AI_SANDBOX_DEBUG:-0}" == "1" ]] && echo_log "DEBUG" "_realpath: symlink cycle detected path=${p} depth=${depth}"
-                    return 1
-                fi
-            done
-        done
-        # After following the chain, the target might itself be a directory.
-        if [[ -d "${cur}" ]]; then
-            if out="$( cd "${cur}" 2>/dev/null && pwd -P )" && [[ -n "${out}" ]]; then
-                [[ "${AI_SANDBOX_DEBUG:-0}" == "1" ]] && echo_log "DEBUG" "_realpath: branch=cd-pwd-symlink-walk-dir path=${p} depth=${depth}"
-                echo "${out}"
-                return 0
-            fi
-        fi
-        parent="$(dirname -- "${cur}")"
-        base="$(basename -- "${cur}")"
-        if resolved_parent="$( cd "${parent}" 2>/dev/null && pwd -P )" && [[ -n "${resolved_parent}" ]]; then
-            [[ "${AI_SANDBOX_DEBUG:-0}" == "1" ]] && echo_log "DEBUG" "_realpath: branch=cd-pwd-symlink-walk-file path=${p} depth=${depth}"
-            echo "${resolved_parent%/}/${base}"
-            return 0
-        fi
-    fi
-    return 1
 }
 
 # Reject paths containing characters that would break SBPL string literals or
