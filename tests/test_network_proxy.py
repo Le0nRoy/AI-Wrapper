@@ -672,6 +672,44 @@ class CommandLineTests(unittest.TestCase):
                 self.assertIn(b"[BLOCKED] CONNECT 10.0.0.1:443", stderr)
                 self.assertFalse(os.path.lexists(self.path))
 
+    def test_parent_pid_detaches_into_own_session(self):
+        process = self.launch("--socket", self.path, "--parent-pid", str(os.getpid()))
+        self.assertEqual(self.read_ready_lines(process, 1), ["READY unix %s" % self.path])
+        # A new session: the terminal's Ctrl+C (sent to the foreground
+        # process group of the launching session) never reaches it.
+        self.assertNotEqual(os.getsid(process.pid), os.getsid(0))
+        self.assertEqual(os.getpgid(process.pid), process.pid)
+        process.send_signal(signal.SIGTERM)
+        _stdout, stderr = process.communicate(timeout=STARTUP_TIMEOUT_SECONDS)
+        self.assertEqual(process.returncode, 0, stderr)
+        self.assertFalse(os.path.lexists(self.path))
+
+    def test_parent_pid_exits_when_parent_is_gone(self):
+        # An intermediate process starts the proxy with its own PID, reports
+        # the proxy's READY line and exits: the orphaned proxy must stop on
+        # its own and remove its socket.
+        launcher = (
+            "import os, subprocess, sys\n"
+            "child = subprocess.Popen([sys.executable, '-I', '-B', sys.argv[1], '--socket', sys.argv[2],"
+            " '--parent-pid', str(os.getpid())], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)\n"
+            "print(child.stdout.readline().decode().strip(), flush=True)\n"
+            "os._exit(0)\n"
+        )
+        intermediate = subprocess.run([sys.executable, "-I", "-B", "-c", launcher, HELPER_PATH, self.path],
+                                      stdout=subprocess.PIPE, timeout=STARTUP_TIMEOUT_SECONDS)
+        self.assertEqual(intermediate.stdout.decode().strip(), "READY unix %s" % self.path)
+        deadline = time.monotonic() + STARTUP_TIMEOUT_SECONDS
+        while os.path.lexists(self.path) and time.monotonic() < deadline:
+            time.sleep(SERVER_POLL_INTERVAL_SECONDS)
+        self.assertFalse(os.path.lexists(self.path), "orphaned proxy kept its socket")
+
+    def test_parent_pid_mismatch_at_start_fails(self):
+        process = self.launch("--socket", self.path, "--parent-pid", str(os.getpid() + 1))
+        _stdout, stderr = process.communicate(timeout=STARTUP_TIMEOUT_SECONDS)
+        self.assertEqual(process.returncode, 1)
+        self.assertIn(b"is not the parent", stderr)
+        self.assertFalse(os.path.lexists(self.path))
+
     def test_requires_a_listener(self):
         process = self.launch()
         _stdout, stderr = process.communicate(timeout=STARTUP_TIMEOUT_SECONDS)

@@ -266,6 +266,134 @@ _AI_SANDBOX_TTY_FILTER_HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/
 # explicit --unshare-user: --unshare-all only tries one.
 _AI_SANDBOX_NO_NESTED_USERNS_ARGS=(--unshare-user --disable-userns --assert-userns-disabled)
 
+# Restricted network (AI_SANDBOX_ALLOW_UNRESTRICTED_NET=0): the sandbox gets
+# its own network namespace (--unshare-net, loopback only) and reaches the
+# outside through the host egress proxy, which listens on a UNIX socket in
+# a private directory and refuses loopback, LAN and link-local / cloud
+# metadata destinations. The socket and the in-sandbox loopback forwarder
+# are bound under NET_DIR; clients get http(s)_proxy pointing at
+# 127.0.0.1:PROXY_PORT on the sandbox's own loopback (no host port is
+# opened). The sandbox's python3 is looked up in SYSTEM_PATH only (the
+# read-only system binds). Assigned at source time, so the caller's
+# environment cannot redirect them.
+_AI_SANDBOX_DATA_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/ai_wrapper_data"
+_AI_SANDBOX_NET_PROXY_HELPER="${_AI_SANDBOX_DATA_DIR}/ai_network_proxy.py"
+_AI_SANDBOX_NET_FORWARDER_HELPER="${_AI_SANDBOX_DATA_DIR}/ai_sandbox_net_forwarder.py"
+_AI_SANDBOX_NET_DIR=/run/ai-sandbox-net
+_AI_SANDBOX_NET_PROXY_PORT=3128
+_AI_SANDBOX_NET_NO_PROXY=localhost,127.0.0.1,::1
+_AI_SANDBOX_NET_SYSTEM_PATH=/usr/bin:/bin:/usr/local/bin
+_AI_SANDBOX_NET_POLL_SECONDS=0.05
+# 5 s at the poll interval, for the proxy's READY line and for its exit.
+_AI_SANDBOX_NET_MAX_POLLS=100
+# sun_path holds 108 bytes including the terminating NUL.
+_AI_SANDBOX_UNIX_SOCKET_PATH_MAX=107
+# The running proxy (set by _sandbox_start_network_proxy).
+_AI_SANDBOX_NET_PROXY_PID=""
+_AI_SANDBOX_NET_PROXY_DIR=""
+_AI_SANDBOX_NET_PROXY_ERROR=""
+
+# Starts the host egress proxy on a UNIX socket in a fresh private (0700)
+# directory under BASE (/tmp when empty) and
+# waits for its READY line. The proxy runs in its own session (Ctrl+C in
+# the terminal does not stop it) and stops by itself if this shell dies
+# without cleaning up (--parent-pid). Sets _AI_SANDBOX_NET_PROXY_PID and
+# _AI_SANDBOX_NET_PROXY_DIR; on failure stops what it started, sets
+# _AI_SANDBOX_NET_PROXY_ERROR to the reason and returns 1. Runs in the
+# calling shell, never in $(...): the proxy's parent must be the shell
+# that launches the sandbox. Args: BASE
+_sandbox_start_network_proxy() {
+    local base="${1:-/tmp}" python_bin dir sock shell_pid polls=0 reason
+    _AI_SANDBOX_NET_PROXY_ERROR=""
+    if ! python_bin="$(type -P "${_AI_SANDBOX_PYTHON}")"; then
+        _AI_SANDBOX_NET_PROXY_ERROR="${_AI_SANDBOX_PYTHON} not found on PATH"; return 1
+    fi
+    if [[ ! -r "${_AI_SANDBOX_NET_PROXY_HELPER}" ]]; then
+        _AI_SANDBOX_NET_PROXY_ERROR="helper ${_AI_SANDBOX_NET_PROXY_HELPER} is missing"; return 1
+    fi
+    if ! dir="$(mktemp -d "${base%/}/ai-sandbox-net.XXXXXXXX" 2>&1)"; then
+        _AI_SANDBOX_NET_PROXY_ERROR="cannot create a private directory under ${base}: ${dir}"; return 1
+    fi
+    if ! chmod 0700 "${dir}"; then
+        rm -rf -- "${dir}"
+        _AI_SANDBOX_NET_PROXY_ERROR="cannot make ${dir} private"; return 1
+    fi
+    sock="${dir}/proxy.sock"
+    if (( ${#sock} > _AI_SANDBOX_UNIX_SOCKET_PATH_MAX )); then
+        rm -rf -- "${dir}"
+        _AI_SANDBOX_NET_PROXY_ERROR="socket path ${sock} is longer than ${_AI_SANDBOX_UNIX_SOCKET_PATH_MAX} bytes"; return 1
+    fi
+    _AI_SANDBOX_NET_PROXY_DIR="${dir}"
+    # Read before the fork: an async command's words expand in the child.
+    shell_pid="${BASHPID}"
+    "${python_bin}" -I "${_AI_SANDBOX_NET_PROXY_HELPER}" --socket "${sock}" --parent-pid "${shell_pid}" \
+        >"${dir}/ready" 2>"${dir}/proxy.log" </dev/null &
+    _AI_SANDBOX_NET_PROXY_PID=$!
+    until grep -qxF "READY unix ${sock}" "${dir}/ready" 2>/dev/null; do
+        if ! kill -0 "${_AI_SANDBOX_NET_PROXY_PID}" 2>/dev/null; then
+            reason="$(cat -- "${dir}/proxy.log" 2>/dev/null)"
+            _sandbox_stop_network_proxy
+            _AI_SANDBOX_NET_PROXY_ERROR="the proxy exited during startup (${reason:-no output})"; return 1
+        fi
+        if (( polls++ >= _AI_SANDBOX_NET_MAX_POLLS )); then
+            reason="$(cat -- "${dir}/proxy.log" 2>/dev/null)"
+            _sandbox_stop_network_proxy
+            _AI_SANDBOX_NET_PROXY_ERROR="the proxy did not report READY in time (${reason:-no output})"; return 1
+        fi
+        sleep "${_AI_SANDBOX_NET_POLL_SECONDS}"
+    done
+    [[ "${AI_SANDBOX_DEBUG:-0}" == "1" ]] && echo_log "DEBUG" "network proxy pid=${_AI_SANDBOX_NET_PROXY_PID} socket=${sock}"
+    return 0
+}
+
+# Sets _AI_SANDBOX_OWN_EXIT_TRAP to this shell's own EXIT trap ("" if
+# none). A subshell's `trap -p` also lists the parent's traps until the
+# subshell changes any trap, and a parent's trap must not be restored (and
+# so run) when the subshell exits. Resetting a pseudo-signal that shows no
+# trap changes nothing but ends that listing. When every candidate shows a
+# trap, the source cannot be told: report none (never run a parent's trap).
+_sandbox_read_own_exit_trap() {
+    _AI_SANDBOX_OWN_EXIT_TRAP=""
+    if [[ "${BASHPID}" != "$$" ]]; then
+        local probe
+        for probe in RETURN ERR DEBUG ""; do
+            [[ -z "${probe}" ]] && return 0
+            [[ -z "$(trap -p "${probe}")" ]] && break
+        done
+        trap - "${probe}"
+    fi
+    _AI_SANDBOX_OWN_EXIT_TRAP="$(trap -p EXIT)"
+}
+
+# Stops the proxy started by _sandbox_start_network_proxy (SIGTERM, SIGKILL
+# if it has not exited within the poll budget), reports how many requests
+# the network policy refused (with AI_SANDBOX_DEBUG=1, the proxy's log
+# too), and removes its private directory. Safe to call when nothing runs.
+# Args: [AGENT_TAG]
+_sandbox_stop_network_proxy() {
+    local tag="${1:-sandbox}" pid="${_AI_SANDBOX_NET_PROXY_PID}" dir="${_AI_SANDBOX_NET_PROXY_DIR}" polls=0 blocked
+    _AI_SANDBOX_NET_PROXY_PID=""
+    _AI_SANDBOX_NET_PROXY_DIR=""
+    if [[ -n "${pid}" ]]; then
+        kill -TERM "${pid}" 2>/dev/null
+        while kill -0 "${pid}" 2>/dev/null && (( polls++ < _AI_SANDBOX_NET_MAX_POLLS )); do
+            sleep "${_AI_SANDBOX_NET_POLL_SECONDS}"
+        done
+        kill -KILL "${pid}" 2>/dev/null
+        wait "${pid}" 2>/dev/null
+    fi
+    [[ -n "${dir}" && -d "${dir}" ]] || return 0
+    blocked="$(grep -c '\[BLOCKED\]' "${dir}/proxy.log" 2>/dev/null)"
+    if (( ${blocked:-0} > 0 )); then
+        echo_log "WARNING" "[${tag}] The sandbox network policy refused ${blocked} request(s) (loopback, LAN or link-local / cloud metadata destinations). AI_SANDBOX_DEBUG=1 lists them."
+    fi
+    if [[ "${AI_SANDBOX_DEBUG:-0}" == "1" && -s "${dir}/proxy.log" ]]; then
+        echo_log "DEBUG" "[${tag}] network proxy log:"
+        cat -- "${dir}/proxy.log" >&2
+    fi
+    rm -rf -- "${dir}"
+}
+
 # Kernel knobs that can switch unprivileged user namespaces off; bubblewrap
 # needs them. A knob this kernel does not have is inconclusive (the launch
 # probe decides). One that exists refuses the launch when it is 0, cannot
@@ -468,6 +596,7 @@ _run_sandboxed_agent_linux() {
     local allow_xdg_runtime_rw="${AI_SANDBOX_ALLOW_XDG_RUNTIME_RW:-0}"; [[ "${allow_xdg_runtime_rw}" == "1" ]] || allow_xdg_runtime_rw=0
     local allow_nested_userns="${AI_SANDBOX_ALLOW_NESTED_USERNS:-0}"; [[ "${allow_nested_userns}" == "1" ]] || allow_nested_userns=0
     local allow_tiocsti="${AI_SANDBOX_ALLOW_TIOCSTI:-0}"; [[ "${allow_tiocsti}" == "1" ]] || allow_tiocsti=0
+    local allow_unrestricted_net="${AI_SANDBOX_ALLOW_UNRESTRICTED_NET:-0}"; [[ "${allow_unrestricted_net}" == "1" ]] || allow_unrestricted_net=0
     # AI_SANDBOX_PASS_ENV is a str (comma-separated var-name list), not a
     # bool — no 0/1 normalization, empty is the meaningful default.
     local pass_env_list="${AI_SANDBOX_PASS_ENV:-}"
@@ -718,11 +847,20 @@ _run_sandboxed_agent_linux() {
         fi
     done
 
+    # Network: a private network namespace by default (no host loopback,
+    # host abstract UNIX sockets, LAN or direct egress; the proxy is wired
+    # in at launch below); the host network only when opted in.
+    local -a net_args=(--unshare-net)
+    if [[ "${allow_unrestricted_net}" == "1" ]]; then
+        echo_log "WARNING" "[$agent_name] AI_SANDBOX_ALLOW_UNRESTRICTED_NET=1: the sandbox shares the host network; the agent can reach services on this machine (loopback, abstract UNIX sockets such as X11 or D-Bus), your LAN and cloud metadata endpoints, and send traffic anywhere without the egress proxy."
+        net_args=(--share-net)
+    fi
+
     # Build bwrap arguments
     local -a bwrap_args=(
         --die-with-parent
         --unshare-all
-        --share-net
+        "${net_args[@]}"
         # Common read-only system binds
         --ro-bind /usr /usr
         --ro-bind /bin /bin
@@ -1070,6 +1208,51 @@ _run_sandboxed_agent_linux() {
         exit 1
     fi
 
+    # Restricted network: start the host proxy (after the probe, before the
+    # filter descriptor opens, so the proxy inherits neither), bind its
+    # socket and the forwarder read-only into the sandbox (connecting to a
+    # socket needs no write access to the mount) and launch the client
+    # through the forwarder. The proxy variables are set last, so no
+    # passthrough (AI_SANDBOX_PASS_ENV, hook) can point them elsewhere.
+    # Fails closed: a proxy that cannot start refuses the launch.
+    local -a launch_cmd=("${command}")
+    local previous_exit_trap="" sandbox_python _proxy_var
+    if [[ "${allow_unrestricted_net}" != "1" ]]; then
+        local net_setup_hint="Fix it, or set AI_SANDBOX_ALLOW_UNRESTRICTED_NET=1 to share the host network without filtering."
+        if ! sandbox_python="$(PATH="${_AI_SANDBOX_NET_SYSTEM_PATH}" type -P python3)"; then
+            echo_log "ERROR" "[$agent_name] No python3 in ${_AI_SANDBOX_NET_SYSTEM_PATH//:/, } for the sandbox's network forwarder. ${net_setup_hint}"
+            exit 1
+        fi
+        if [[ ! -r "${_AI_SANDBOX_NET_FORWARDER_HELPER}" ]]; then
+            echo_log "ERROR" "[$agent_name] Network forwarder ${_AI_SANDBOX_NET_FORWARDER_HELPER} is missing. ${net_setup_hint}"
+            exit 1
+        fi
+        # The proxy's private directory goes in the host runtime dir when it
+        # is a normal one under /run (tmpfs, per user), else in /tmp.
+        local proxy_base=/tmp
+        [[ "${host_runtime_dir}" == /run/?* ]] && proxy_base="${host_runtime_dir}"
+        if ! _sandbox_start_network_proxy "${proxy_base}"; then
+            echo_log "ERROR" "[$agent_name] Cannot start the sandbox network proxy: ${_AI_SANDBOX_NET_PROXY_ERROR}. ${net_setup_hint}"
+            exit 1
+        fi
+        # Stops the proxy if the shell exits or is killed (SIGHUP, SIGTERM)
+        # during the session; restored after the launch below.
+        _sandbox_read_own_exit_trap
+        previous_exit_trap="${_AI_SANDBOX_OWN_EXIT_TRAP}"
+        # shellcheck disable=SC2064  # the tag is expanded (and quoted) now
+        trap "_sandbox_stop_network_proxy $(printf '%q' "${agent_name}")" EXIT
+        bwrap_args+=(
+            --ro-bind "${_AI_SANDBOX_NET_PROXY_DIR}/proxy.sock" "${_AI_SANDBOX_NET_DIR}/proxy.sock"
+            --ro-bind "${_AI_SANDBOX_NET_FORWARDER_HELPER}" "${_AI_SANDBOX_NET_DIR}/forwarder.py"
+        )
+        for _proxy_var in http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY; do
+            bwrap_args+=(--setenv "${_proxy_var}" "http://127.0.0.1:${_AI_SANDBOX_NET_PROXY_PORT}")
+        done
+        bwrap_args+=(--setenv no_proxy "${_AI_SANDBOX_NET_NO_PROXY}" --setenv NO_PROXY "${_AI_SANDBOX_NET_NO_PROXY}")
+        launch_cmd=("${sandbox_python}" -I "${_AI_SANDBOX_NET_DIR}/forwarder.py"
+            --socket "${_AI_SANDBOX_NET_DIR}/proxy.sock" --port "${_AI_SANDBOX_NET_PROXY_PORT}" -- "${command}")
+    fi
+
     if [[ -n "${tty_filter}" ]]; then
         exec {tty_filter_fd}< <(printf '%b' "${tty_filter}")
         bwrap_args+=(--add-seccomp-fd "${tty_filter_fd}")
@@ -1077,10 +1260,19 @@ _run_sandboxed_agent_linux() {
 
     # ===== EXECUTE — no more setpriv/prlimit wrapper =====
 
-    bwrap "${bwrap_args[@]}" "${command}" "${cmd_args[@]}"
+    bwrap "${bwrap_args[@]}" "${launch_cmd[@]}" "${cmd_args[@]}"
 
     local exit_code=$?
     [[ -n "${tty_filter_fd}" ]] && exec {tty_filter_fd}<&-
+    if [[ "${allow_unrestricted_net}" != "1" ]]; then
+        _sandbox_stop_network_proxy "${agent_name}"
+        # Hand this shell's own EXIT trap back (none: clear ours).
+        if [[ -n "${previous_exit_trap}" ]]; then
+            eval "${previous_exit_trap}"
+        else
+            trap - EXIT
+        fi
+    fi
 
     # ===== EXIT CODE TRANSLATION & FEEDBACK =====
 
