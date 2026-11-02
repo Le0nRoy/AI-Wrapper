@@ -113,6 +113,7 @@ jobs:
       - run: bash tests/test_linux_host_binds.bash
       - run: bash tests/test_linux_runtime_dir.bash
       - run: bash tests/test_linux_process_isolation.bash
+      - run: bash tests/test_linux_network_isolation.bash
 
   # macOS's built-in sandbox-exec needs no install step. Runs the same
   # cross-platform smoke tests as Linux (run_sandboxed_agent dispatches on
