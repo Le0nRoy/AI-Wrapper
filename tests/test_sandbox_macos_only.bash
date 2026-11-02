@@ -58,4 +58,17 @@ out_trusted="$(cd "${FAKE_HOME}/project" && AI_SANDBOX_PROFILE="${BAD_PROFILE}" 
 echo "  (bad-profile + TRUST_ME launch output: ${out_trusted})"
 assert_not_contains "${out_trusted}" "lacks (version 1) and/or (deny default)" "AI_SANDBOX_PROFILE_TRUST_ME=1 bypasses the header check"
 
+# The whole body is scanned (#67): an (allow default) far past the old
+# 80-line window, split across lines, is still refused. Scanner edge cases
+# live in tests/test_macos_credential_policy.bash.
+LATE_PROFILE="${FAKE_HOME}/late.sb"
+{
+    printf '(version 1)\n(deny default)\n'
+    for _ in $(seq 1 120); do printf '(allow file-read* (literal "/dev/null"))\n'; done
+    printf '(  allow\n   default )\n'
+} >"${LATE_PROFILE}"
+out="$(cd "${FAKE_HOME}/project" && AI_SANDBOX_PROFILE="${LATE_PROFILE}" run_sandboxed_agent /bin/echo -- -- hi 2>&1)"
+echo "  (late allow-default launch output: ${out})"
+assert_contains "${out}" "contains an (allow default) rule" "(allow default) after line 80 is rejected"
+
 tests_summary_and_exit

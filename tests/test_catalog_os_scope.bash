@@ -17,6 +17,7 @@ DARWIN_ONLY_KEYS=(
     AI_SANDBOX_DRYRUN
     AI_SANDBOX_ALLOW_RO_HOMEDIR
     AI_SANDBOX_BLOCK_LOCALHOST
+    AI_SANDBOX_ALLOW_KEYCHAIN
 )
 # Linux bubblewrap host-path gates (#62); the macOS backend never binds
 # these paths, so the controls are hidden there.
@@ -92,6 +93,12 @@ assert_contains "$(grep '^AI_SANDBOX_ALLOW_DOCKER|' <<<"${linux_catalog}")" "pod
     "Linux ALLOW_DOCKER help names the rootless Podman socket"
 assert_not_contains "$(grep '^AI_SANDBOX_ALLOW_DOCKER|' <<<"${darwin_catalog}")" "XDG_RUNTIME_DIR" \
     "macOS ALLOW_DOCKER help has no Linux runtime-dir wording"
+# Keychain gate (#67): red, off by default, help names both access paths.
+assert_contains "${darwin_catalog}" "AI_SANDBOX_ALLOW_KEYCHAIN|bool|0|red|" "Keychain control is red severity, default 0"
+keychain_row="$(grep '^AI_SANDBOX_ALLOW_KEYCHAIN|' <<<"${darwin_catalog}")"
+assert_contains "${keychain_row}" "/Library/Keychains" "Keychain help names the file path"
+assert_contains "${keychain_row}" "securityd" "Keychain help names the daemon path"
+assert_contains "${keychain_row}" "|credentials|darwin" "Keychain control sits in the credentials category"
 
 # Process isolation opt-outs (#64): nested userns red, TIOCSTI yellow,
 # both ordinary preset settings whose help names what turning them on costs.

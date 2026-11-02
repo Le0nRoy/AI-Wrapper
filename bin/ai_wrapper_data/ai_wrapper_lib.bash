@@ -1130,6 +1130,7 @@ _AI_SETTINGS_LIST=(
     "AI_SANDBOX_PASS_GH|bool|0|red|Share GitHub token|Passes GITHUB_TOKEN / GH_TOKEN; agent can push to your repos|credentials"
     "AI_SANDBOX_PASS_GITLAB|bool|0|red|Share GitLab token + glab config|Passes GITLAB_TOKEN / CI_JOB_TOKEN env vars AND ${_ai_gitlab_bind_note} so glab reads its on-disk token. Agent can push to your repos.|credentials"
     "AI_SANDBOX_PASS_OPENAI|bool|0|red|Share OpenAI credentials|Passes all OPENAI_* env vars (advanced)|credentials"
+    "AI_SANDBOX_ALLOW_KEYCHAIN|bool|0|red|Allow macOS Keychain access|Grants RW on ~/Library/Keychains and lookups of the SecurityServer / securityd keychain daemons. The agent can then read (and add or change) any keychain item whose access list lets the calling program in without a prompt. Off: keychain-backed logins (Claude Code keeps its OAuth login in the Keychain) fail inside the sandbox; pass the credential through an env var (e.g. CLAUDE_CODE_OAUTH_TOKEN) instead.|credentials|darwin"
 
     # Networking (localhost, local docker)
     "AI_SANDBOX_BLOCK_LOCALHOST|bool|0|info|Block localhost network access|Denies network access to services running on your own machine|networking|darwin"

@@ -66,6 +66,7 @@ that launch a real sandbox.
 | `dot_agents/skills/tortuga/scripts/test_gh.py` | none (mocked `subprocess`) | python3 | full | full |
 | `test_sandbox_common.bash`, `test_extra_bind_dirs.bash` | launches the real sandbox, fake home | bwrap + userns, python3 + libseccomp / sandbox-exec | fails without bwrap, user namespaces or the filter prerequisites | full |
 | `test_sandbox_macos_only.bash` | sandbox-exec dry-run | sandbox-exec | exits 0 with a skip line | full |
+| `test_macos_credential_policy.bash` | fake home under `$HOME` with synthetic git credential files and a fake `*.keychain-db`; stub `getconf`/`sandbox-exec` off macOS; on CI or with `AI_WRAPPER_TEST_SYNTHETIC_KEYCHAIN=1` a throwaway keychain in the fake home (added to and removed from the user keychain search list) | bash; sandbox-exec and `security` for native probes | profile-check unit tests + rendered profile; native part skipped | full: native git-credential and Keychain denial (missing sandbox-exec fails) |
 | `test_macos_ro_overlays.bash` | git repos in fake home; stub `getconf`/`sandbox-exec` off macOS | git; sandbox-exec for native checks | rule rendering + mocked dry-run; native part skipped | full, native write denial (missing sandbox-exec fails) |
 | `test_codex_wrapper.bash`, `test_agy_wrapper.bash`, `test_copilot_wrapper.bash` | git repos, sqlite db, stub clients in fake home; bwrap e2e | git, python3 (sqlite3, tomllib optional), bwrap for e2e | full with bwrap; e2e skipped without | argv/unit parts; bwrap e2e skipped |
 | `test_bind_hardening.bash` | git repos (incl. a worktree with nested submodules via local file:// clones), stub codex/claude in fake home, symlinks into the fake home's `.ssh`/`.config`/`.bashrc` and to `/etc` (never followed by a write), stub `bwrap`/`sysctl` dir (Linux argv), temp alias dir under `/tmp` (macOS) | git, perl; bwrap or sandbox-exec for e2e | full with bwrap (path-resolution argv and config-symlink policy run without it); e2e skipped without | full: native worktree write-denial e2e (missing sandbox-exec fails) |
@@ -88,13 +89,15 @@ is the local equivalent. Keep both in sync when adding a test file.
   identity.
 - `smoke-linux`: bubblewrap installed; sandbox, extra-binds, isolation
   canaries (with e2e), codex, bind-hardening, external worktrees,
-  WORKDIR git metadata, macOS RO-overlay rendering, agy, copilot, Linux
+  WORKDIR git metadata, macOS RO-overlay and credential-policy rendering, agy, copilot, Linux
   host-path gates (native ~/bin / skills / Android / Tailscale / Kind probes),
   user runtime dir (native socket denial and named grants), process
   isolation (nested user namespaces, terminal-injection filter, launch
   preflight; installs `python3` and `libseccomp2`).
 - `smoke-macos`: sandbox, macOS-only, extra-binds, bind-hardening,
   external worktrees, WORKDIR git metadata and RO overlays (native write denial),
+  credential policy (native git-credential and Keychain denial, synthetic
+  keychain probe),
   agy trust grants for the Linux host-path gates and runtime dir, preset
   suite.
 

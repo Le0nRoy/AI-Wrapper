@@ -26,6 +26,76 @@ _regex_escape() {
     printf '%s' "${out}"
 }
 
+# Custom-profile sanity check (WS3 / U-C, hardened by #67 / CC-4). Prints
+# why the SBPL body in $1 must not launch, or nothing when it passes:
+#   header        — no (version 1) or no (deny default) form
+#   allow-default — an allow rule whose operation list names `default`,
+#                   e.g. (allow default), (allow default (with report)),
+#                   (allow file-read* default); it neutralises (deny default)
+#   syntax        — a block comment (#|), datum comment (#;) or character
+#                   literal (#\) outside a string: the scanner below cannot
+#                   tell what they hide, so it fails closed
+# The whole body is scanned, with no line limit. String literals (including
+# #"regex" strings, with backslash escapes) are blanked and `;` comments
+# dropped, so a rule in a comment or string neither satisfies nor trips the
+# check, and a `;` inside a string does not hide the rest of its line. The
+# remaining text is case-folded and whitespace-flattened, so forms split
+# across lines or extra spaces still match. This is a token match, not an
+# SBPL evaluator: rules built at run time (define, string->symbol) are not
+# seen — AI_SANDBOX_PROFILE_TRUST_ME=1 remains the explicit escape hatch.
+_sandbox_profile_violation() {
+    local body="${1}" flat="" line rest code escapes in_string=0
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        rest="${line}"
+        while [[ -n "${rest}" ]]; do
+            if [[ "${in_string}" == "1" ]]; then
+                code="${rest%%\"*}"
+                # No closing quote on this line: the string continues.
+                [[ "${code}" == "${rest}" ]] && break
+                rest="${rest:${#code}+1}"
+                # A quote preceded by an odd run of backslashes is escaped.
+                escapes="${code##*[!\\]}"
+                (( ${#escapes} % 2 == 1 )) && continue
+                in_string=0
+                flat+=' "" '
+                continue
+            fi
+            code="${rest%%[\";]*}"
+            flat+="${code}"
+            rest="${rest:${#code}}"
+            if [[ "${code}" == *'#|'* || "${code}" == *'#\'* ]]; then
+                printf 'syntax\n'
+                return 0
+            fi
+            [[ -z "${rest}" ]] && break
+            if [[ "${rest}" == ';'* ]]; then
+                if [[ "${code}" == *'#' ]]; then
+                    printf 'syntax\n'
+                    return 0
+                fi
+                break
+            fi
+            rest="${rest:1}"
+            in_string=1
+        done
+        flat+=" "
+    done <<< "${body}"
+    flat="$(printf '%s' "${flat}" | tr '[:upper:]' '[:lower:]' | tr -s '[:space:]' ' ')"
+
+    local ws='[[:space:]]*' wsp='[[:space:]]+'
+    local version_re="\(${ws}version${wsp}1${ws}\)"
+    local deny_re="\(${ws}deny${wsp}default${ws}\)"
+    local allow_re="\(${ws}allow(${wsp}[^()\"[:space:]]+)*${wsp}default([[:space:]]|[()])"
+    if [[ ! "${flat}" =~ ${version_re} || ! "${flat}" =~ ${deny_re} ]]; then
+        printf 'header\n'
+        return 0
+    fi
+    if [[ "${flat}" =~ ${allow_re} ]]; then
+        printf 'allow-default\n'
+    fi
+    return 0
+}
+
 _run_sandboxed_agent_impl() {
     local cmd="${1}"
     shift
@@ -499,6 +569,13 @@ _run_sandboxed_agent_impl() {
     local allow_docker="${AI_SANDBOX_ALLOW_DOCKER:-0}"
     [[ "${allow_docker}" == "1" ]] || allow_docker=0
 
+    # ALLOW_KEYCHAIN gates the ~/Library/Keychains file grant and the
+    # SecurityServer / securityd Mach lookups in the SBPL profile (#67 / M1).
+    # Default "0": the agent can neither open keychain files nor ask
+    # securityd for items. Any non-"1" value normalises to "0".
+    local allow_keychain="${AI_SANDBOX_ALLOW_KEYCHAIN:-0}"
+    [[ "${allow_keychain}" == "1" ]] || allow_keychain=0
+
     # Env scrubbing (Phase 1 of the sandbox-migration plan; closes U-A/U-B).
     # Without this, the agent inherits the parent shell's full environment,
     # including SSH_AUTH_SOCK (ssh-agent forwarding to corporate hosts),
@@ -686,43 +763,23 @@ _run_sandboxed_agent_impl() {
     # override pointing at a permissive profile like
     #   (version 1) (allow default)
     # would silently nullify the sandbox. The base SBPL contract is
-    # (version 1) followed by (deny default) — verify both are present
-    # somewhere in the first 80 non-comment, non-blank lines. If the
-    # check fails, refuse to launch unless the operator has explicitly
-    # set AI_SANDBOX_PROFILE_TRUST_ME=1 (red-banner opt-out).
-    #
-    # The check is intentionally cheap: a string-grep against the
-    # profile body, not a full SBPL parse. False positives are
-    # tolerable (the operator can set TRUST_ME=1) and false negatives
-    # ("profile has the right magic strings in a comment but no actual
-    # rule") are caught by the kernel parser downstream.
+    # (version 1) plus (deny default) and no broad default allowance; see
+    # _sandbox_profile_violation for what is matched. If the check fails,
+    # refuse to launch unless the operator has explicitly set
+    # AI_SANDBOX_PROFILE_TRUST_ME=1 (red-banner opt-out). False positives
+    # are tolerable (the operator can set TRUST_ME=1); a profile that has
+    # the right forms but does not parse is caught by the kernel parser.
     if [[ "${AI_SANDBOX_PROFILE_TRUST_ME:-0}" != "1" ]]; then
-        local _p_signal _p_version_seen=0 _p_deny_seen=0 _p_allow_default_seen=0 _p_line _p_inspected=0
-        while IFS= read -r _p_line; do
-            # Strip leading whitespace.
-            _p_signal="${_p_line#"${_p_line%%[![:space:]]*}"}"
-            # Skip blanks and SBPL comments (`;;`).
-            [[ -z "${_p_signal}" ]] && continue
-            [[ "${_p_signal}" == ';'* ]] && continue
-            _p_inspected=$((_p_inspected + 1))
-            [[ "${_p_signal}" == '(version 1)'* ]]   && _p_version_seen=1
-            [[ "${_p_signal}" == '(deny default)'* ]] && _p_deny_seen=1
-            # An `(allow default)` line — anywhere in the inspected window —
-            # neutralises the `(deny default)` fence that the rest of this
-            # block tries to enforce. The two strings can coexist in a
-            # profile that still passes the version/deny presence check, so
-            # we have to actively reject this case.
-            [[ "${_p_signal}" == '(allow default)'* ]] && _p_allow_default_seen=1
-            # Bail early; profile is invalid if version isn't first.
-            [[ ${_p_inspected} -ge 80 ]] && break
-        done <<< "${profile}"
-        if [[ "${_p_version_seen}" != "1" || "${_p_deny_seen}" != "1" ]]; then
-            echo_log "ERROR" "[${tag}] Sandbox profile ${profile_path} lacks (version 1) and/or (deny default) in the first 80 non-comment lines. A permissive profile silently neutralizes the sandbox; refusing to launch."
-            echo_log "ERROR" "[${tag}] If this profile is intentional, set AI_SANDBOX_PROFILE_TRUST_ME=1 to bypass this check. Red banner will be shown at menu launch."
-            return 1
-        fi
-        if [[ "${_p_allow_default_seen}" == "1" ]]; then
-            echo_log "ERROR" "[${tag}] Sandbox profile ${profile_path} contains an (allow default) rule in the first 80 non-comment lines. (allow default) neutralises (deny default) and leaves the sandbox fully permissive; refusing to launch."
+        local _p_violation; _p_violation="$(_sandbox_profile_violation "${profile}")"
+        case "${_p_violation}" in
+            header)
+                echo_log "ERROR" "[${tag}] Sandbox profile ${profile_path} lacks (version 1) and/or (deny default) outside comments and strings. A permissive profile silently neutralizes the sandbox; refusing to launch." ;;
+            allow-default)
+                echo_log "ERROR" "[${tag}] Sandbox profile ${profile_path} contains an (allow default) rule. (allow default) neutralises (deny default) and leaves the sandbox fully permissive; refusing to launch." ;;
+            syntax)
+                echo_log "ERROR" "[${tag}] Sandbox profile ${profile_path} uses a block comment (#|), datum comment (#;) or character literal (#\\) the safety check cannot verify; refusing to launch." ;;
+        esac
+        if [[ -n "${_p_violation}" ]]; then
             echo_log "ERROR" "[${tag}] If this profile is intentional, set AI_SANDBOX_PROFILE_TRUST_ME=1 to bypass this check. Red banner will be shown at menu launch."
             return 1
         fi
@@ -798,6 +855,7 @@ _run_sandboxed_agent_impl() {
             -D "ENABLE_SIGNPOST=${enable_signpost}"
             -D "BLOCK_LOCALHOST=${block_localhost}"
             -D "ALLOW_DOCKER=${allow_docker}"
+            -D "ALLOW_KEYCHAIN=${allow_keychain}"
         )
         if [[ "${enable_signpost}" == "1" ]]; then
             sandbox_argv+=(-D "DARWIN_USER_SIGNPOST_DIR=${darwin_user_signpost}")
