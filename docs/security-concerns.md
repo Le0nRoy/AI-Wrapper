@@ -328,7 +328,9 @@ servers on `localhost:*`, AWS instance metadata via VPN, etc.
 wrapper passes `-D BLOCK_LOCALHOST=…` and the SBPL profile gates a
 `(deny network-outbound (remote ip "localhost:*"))` / symmetric
 inbound rule on the param. Off by default — dev DBs and other
-localhost workflows keep working without the flag.
+localhost workflows keep working without the flag. Since #78 (S-ο) the
+default restricted network blocks loopback anyway; the flag only
+matters with `AI_SANDBOX_ALLOW_UNRESTRICTED_NET=1`.
 
 The "localhost" string is the only host form sandbox-exec accepts
 besides "*" in `(remote ip "...")` — literal IPs are rejected at
@@ -789,7 +791,7 @@ multicast or reserved ranges, with IPv4-in-IPv6 unwrapped.
 | Client env | sandbox | `http_proxy` `https_proxy` `HTTP_PROXY` `HTTPS_PROXY` `all_proxy` `ALL_PROXY` = `http://127.0.0.1:3128`; `no_proxy` / `NO_PROXY` = `localhost,127.0.0.1,::1` (the sandbox's own loopback). Set after `AI_SANDBOX_PASS_ENV` and the `_extra_sandbox_setup` hook, so a passthrough cannot point clients elsewhere (and the namespace leaves nowhere else to go). |
 | Cleanup | host | After the launch: SIGTERM (SIGKILL after 5 s), DIR removed, a `WARNING` with the number of refused requests (`AI_SANDBOX_DEBUG=1` prints the proxy log). An EXIT trap covers the shell exiting or being killed during the session; the caller's own EXIT trap is restored afterwards, in a subshell too; a trap the subshell only inherited (which `trap -p` there also reports) is never restored, so the parent's cleanup does not run when the subshell exits. |
 | Fail closed | host | No `python3`, missing helper, proxy exit or no `READY unix` within 5 s, socket path over 107 bytes: launch refused, naming `AI_SANDBOX_ALLOW_UNRESTRICTED_NET=1`. |
-| Opt-out | `AI_SANDBOX_ALLOW_UNRESTRICTED_NET=1` (red, Linux, networking, saved in presets; a restored `1` WARNs) | `--share-net`, no proxy, launch `WARNING`. Any other value keeps the isolation. |
+| Opt-out | `AI_SANDBOX_ALLOW_UNRESTRICTED_NET=1` (red, networking, Linux and macOS since #78, saved in presets; a restored `1` WARNs) | `--share-net`, no proxy, launch `WARNING`. Any other value keeps the isolation. |
 
 Why a forwarder: the proxy listens on a UNIX socket (a host TCP port
 cannot be reached from another network namespace, and an unprivileged
@@ -809,13 +811,72 @@ curl/git, reqwest, Go and pip only accept `http://HOST:PORT` proxies.
 - The proxy dir is under the host runtime dir; with
   `AI_SANDBOX_ALLOW_XDG_RUNTIME_RW=1` the agent can see it (its own
   request log) and delete the socket (breaking only its own network).
-- macOS (Seatbelt) wiring of the same proxy is #78.
+- macOS (Seatbelt) wiring of the same proxy: S-ο (#78).
 - Tests: `tests/test_linux_network_isolation.bash` (stub argv,
   lifecycle and failure handling with the real proxy; native bubblewrap:
   host abstract socket, host loopback and direct egress denied, proxy
   path refusing host loopback, `--share-net` as control; CI
   `smoke-linux`), `tests/test_sandbox_net_forwarder.py`,
   `tests/test_network_proxy.py`.
+
+### S-ο — macOS sandbox allowed all networking (RESOLVED, 2026-11, #78)
+
+`claude_wrapper.sb` granted `(allow network*)`: the agent could connect
+to every service on the host's loopback (dev databases, `kubectl proxy`,
+local admin UIs), the LAN, Tailscale peers and cloud metadata
+(`169.254.169.254`), listen on any port, and send raw TCP/UDP anywhere.
+`AI_SANDBOX_BLOCK_LOCALHOST=1` (S-α) only covered loopback and was off by
+default.
+
+**Resolution.** Seatbelt has no network namespaces, but filters socket
+operations by remote address. By default (`ALLOW_UNRESTRICTED_NET` other
+than `"1"`) the profile renders:
+
+    (deny network*)
+    (allow network* (subpath "/"))
+    (allow network-outbound (remote ip (string-append "localhost:" (param "PROXY_PORT"))))
+
+so the only IP operation left is an outbound connection to the host egress
+proxy from #76 on `localhost:PROXY_PORT`. The proxy resolves and checks
+every destination as on Linux (S-ξ), so `CONNECT 127.0.0.1:…` through it
+is refused too. A path filter never matches an IP operation:
+`(subpath "/")` re-allows only UNIX-domain socket networking, which
+`(allow network*)` allowed before (mDNSResponder name resolution, the SSH
+agent and Docker sockets, still gated by their own settings).
+
+| Piece | Where | Detail |
+|-------|-------|--------|
+| Proxy | host, as the user | `python3 -I ai_network_proxy.py --host 127.0.0.1 --port 0 --parent-pid PID` (python3 from `PATH`); the port is read from its `READY tcp 127.0.0.1:PORT` line. stdout/stderr go to files in a fresh `mktemp -d` (0700) under `DARWIN_USER_TEMP_DIR` (per-user, 0700 parent). Own session: terminal Ctrl+C does not reach it. Refuses to start unless PID is its parent and stops when it no longer is. PID is `BASHPID`, or on bash 3.2 the `PPID` of a `sh` exec'd in a command substitution. |
+| Profile | `sandbox-exec -D` | `ALLOW_UNRESTRICTED_NET=0 PROXY_PORT=<port>`; `ALLOW_UNRESTRICTED_NET=1 PROXY_PORT=0` when opted out. |
+| Client env | `env -i` allowlist | `http_proxy` `https_proxy` `HTTP_PROXY` `HTTPS_PROXY` `all_proxy` `ALL_PROXY` = `http://127.0.0.1:<port>`. Entries with those names are removed and the wrapper's appended after `AI_SANDBOX_PASS_ENV` and the `_extra_sandbox_setup` hook. No `no_proxy`: a direct localhost connection is denied anyway, and through the proxy the refusal is counted. |
+| Cleanup | host | As on Linux: SIGTERM (SIGKILL after 5 s), dir removed, refused-request `WARNING`, `AI_SANDBOX_DEBUG=1` proxy log; EXIT trap during the session, caller's own EXIT trap restored. `AI_SANDBOX_DRYRUN=1` starts the proxy too, so it prints the real port and environment, then stops it. |
+| Fail closed | host | No `python3`, missing helper, proxy exit or no `READY tcp` within 5 s, temp dir not creatable: launch refused, naming `AI_SANDBOX_ALLOW_UNRESTRICTED_NET=1`. |
+| Opt-out | `AI_SANDBOX_ALLOW_UNRESTRICTED_NET=1` (red, networking, both OSes) | `(allow network*)` plus the optional `BLOCK_LOCALHOST` rules, no proxy, launch `WARNING`. Any other value keeps the restriction. |
+
+**Residual / tradeoffs.**
+- Read + network exfiltration through the proxy to public hosts is
+  unchanged (as on Linux).
+- The proxy port is on the host loopback: any local process of any user
+  can use it while the session runs, getting the same filtered egress
+  it already has directly. The sandbox cannot reach any other localhost
+  port.
+- Unlike the Linux namespace, the sandbox has no private loopback: dev
+  servers or test fixtures inside the sandbox cannot listen on or connect
+  to `localhost`; those sessions need the opt-out.
+- UNIX-domain sockets stay open as before (S-α scope note); a Docker
+  daemon reachable through `AI_SANDBOX_ALLOW_DOCKER=1` can still run
+  containers with open networking. DNS queries through mDNSResponder
+  remain possible (a low-bandwidth channel; the proxy is what connects).
+- Clients that ignore the proxy variables, SSH remotes, raw TCP/UDP and
+  LAN / cluster endpoints fail, as on Linux.
+- A custom `AI_SANDBOX_PROFILE` decides its own network rules; the
+  wrapper still passes `ALLOW_UNRESTRICTED_NET` / `PROXY_PORT` and starts
+  the proxy.
+- Tests: `tests/test_macos_network_isolation.bash` (profile text; stub
+  `sandbox-exec` argv/env, lifecycle and failure handling with the real
+  proxy on any OS; native Seatbelt: host loopback port and direct egress
+  denied, proxy port reachable and refusing host loopback, opt-out as
+  control; CI `smoke-macos` and `smoke-linux`).
 
 ## Local bugs / brittleness
 
@@ -1490,9 +1551,10 @@ when that plugin is loaded.
 
 ## Carry-overs from earlier reviews (still open by design)
 
-- **S2** — `(allow network*)`. Required for the Anthropic API. Documented.
-  On Linux the network is isolated since #77 (S-ξ); the macOS profile
-  still allows it until #78.
+- **S2** — `(allow network*)`. Closed: Linux isolates the network since
+  #77 (S-ξ), macOS since #78 (S-ο); both route HTTP(S) through the
+  filtering egress proxy, and `(allow network*)` remains only under
+  `AI_SANDBOX_ALLOW_UNRESTRICTED_NET=1`.
 - **S4** — `~/Library/Keychains` RW. Closed by #67 (S-ν): gated on
   `AI_SANDBOX_ALLOW_KEYCHAIN`, default off.
 - **S7** — `~/Library/Caches/claude-cli-nodejs` RW. Today log-only, no
