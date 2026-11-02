@@ -113,29 +113,16 @@ _bind_claude_account() {
         claude_dir="${HOME}/.claude"
         claude_json_src="${HOME}/.claude.json"
 
-        # WS3 / B-alpha: symlink-safety guard. Refuse if ~/.claude exists as
-        # a non-directory (a stray file from a botched migration) or as a
-        # symlink whose target escapes $HOME. A rogue symlink would cause
-        # `mkdir -p` to follow it, then the subsequent bind would grant RW
-        # on the symlink target's real location — silently moving the
-        # write fence somewhere unintended. Only applies to the private
-        # (default) account — a named account's directory must already
-        # exist as a real directory (checked above).
-        if [[ -L "${claude_dir}" ]]; then
-            local _resolved_claude_dir
-            if ! _resolved_claude_dir="$(_realpath "${claude_dir}")" || [[ -z "${_resolved_claude_dir}" ]]; then
-                echo "ERROR: ${claude_dir} is a symlink whose target cannot be resolved. Inspect and remove before launching." >&2
-                exit 1
-            fi
-            case "${_resolved_claude_dir}" in
-                "${HOME}"/*) ;;
-                *)
-                    echo "ERROR: ${claude_dir} is a symlink pointing outside \$HOME (resolves to ${_resolved_claude_dir}). Refusing — the bind would grant RW on the target." >&2
-                    exit 1
-                    ;;
-            esac
-        elif [[ -e "${claude_dir}" && ! -d "${claude_dir}" ]]; then
-            echo "ERROR: ${claude_dir} exists but is not a directory or symlink. Move or remove it before launching." >&2
+        # WS3 / B-alpha: symlink-safety guard. Refuse if ~/.claude is a
+        # symlink the shared guard rejects (dangling, outside $HOME, a broad
+        # root or a credential location — `mkdir -p` would follow it and
+        # the bind would grant RW on the target) or exists as a
+        # non-directory (a stray file from a botched migration). Only
+        # applies to the private (default) account — a named account's
+        # directory must already exist as a directory (checked above).
+        _wrapper_check_config_symlink "${claude_dir}" || exit 1
+        if [[ -e "${claude_dir}" && ! -d "${claude_dir}" ]]; then
+            echo "ERROR: ${claude_dir} exists but is not a directory. Move or remove it before launching." >&2
             exit 1
         fi
 
@@ -143,7 +130,6 @@ _bind_claude_account() {
         # requires bind sources to exist, so a fresh machine (no prior
         # Claude run) would otherwise hard-fail here instead of letting
         # Claude initialize the directory itself.
-        _wrapper_check_config_symlink "${claude_dir}" || exit 1
         if ! mkdir -p "${claude_dir}"; then
             echo "ERROR: failed to create ${claude_dir}" >&2
             exit 1
@@ -170,15 +156,26 @@ _bind_claude_account() {
     fi
 
     # Shared symlink-target guard (ai_wrapper_lib.bash): refuses a
-    # symlinked profile dir / .claude.json whose target is outside $HOME or
-    # inside a credential location. Covers the named-account paths, the
-    # ~/.claude.json file, and credential-dir targets of ~/.claude, none of
-    # which the checks above caught.
+    # symlinked profile dir / .claude.json that is dangling or whose target
+    # is outside $HOME, a broad root, or in/above a credential location.
+    # Covers the named-account paths and their .json files.
     _wrapper_check_config_symlink "${claude_dir}" || exit 1
     _wrapper_check_config_symlink "${claude_json_src}" || exit 1
 
-    _wrapper_add_bind "${claude_dir}" "${HOME}/.claude"
-    _wrapper_add_bind "${claude_json_src}" "${HOME}/.claude.json"
+    # Bind the resolved paths, never a (checked) symlink unresolved. A
+    # missing ~/.claude.json (named account without its own .json) stays
+    # as-is; the sandbox skips a missing bind source with a warning.
+    local claude_dir_src claude_json_bind_src="${claude_json_src}"
+    if ! claude_dir_src="$(_realpath "${claude_dir}")" || [[ -z "${claude_dir_src}" ]]; then
+        echo "ERROR: cannot resolve ${claude_dir}" >&2
+        exit 1
+    fi
+    if [[ -e "${claude_json_src}" ]] && ! claude_json_bind_src="$(_realpath "${claude_json_src}")"; then
+        echo "ERROR: cannot resolve ${claude_json_src}" >&2
+        exit 1
+    fi
+    _wrapper_add_bind "${claude_dir_src}" "${HOME}/.claude"
+    _wrapper_add_bind "${claude_json_bind_src}" "${HOME}/.claude.json"
 }
 
 # Git worktree common-dir bind (shared .git outside WORKDIR) and the
