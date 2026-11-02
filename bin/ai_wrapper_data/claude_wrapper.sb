@@ -5,7 +5,8 @@
 ;;   - The agent is trusted by the user to *read* their files (it was invited
 ;;     into the session). The sandbox bounds *writes* to the working directory,
 ;;     agent config, and tmp.
-;;   - Network is allowed because the Anthropic API call would otherwise fail.
+;;   - Network goes through the host egress proxy (#78): public hosts stay
+;;     reachable because the Anthropic API call would otherwise fail.
 ;;     Consequence: combined with broad file-read, the agent can exfiltrate any
 ;;     readable file (~/.ssh, ~/.aws, browser data, etc.). The trust assumption
 ;;     is "the agent is invited and not malicious"; if you don't grant that
@@ -58,8 +59,14 @@
 ;;                              GITLAB_TOKEN / CI_JOB_TOKEN env var
 ;;                              pass-through so `glab` also works when it
 ;;                              reads its token from disk instead of the env.
+;;   ALLOW_UNRESTRICTED_NET  — "1" allows all networking (network*); any
+;;                              other value denies IP networking except
+;;                              outbound TCP to localhost:PROXY_PORT (#78)
+;;   PROXY_PORT              — the host egress proxy's TCP port on
+;;                              127.0.0.1 ("0" when ALLOW_UNRESTRICTED_NET=1)
 ;;   BLOCK_LOCALHOST         — "1" emits (deny network-* (… ip "localhost:*"))
-;;                              pair; any other value leaves localhost reachable.
+;;                              pair under ALLOW_UNRESTRICTED_NET=1; any other
+;;                              value leaves localhost reachable there.
 ;;                              NOTE: this only covers IP loopback. Unix-domain
 ;;                              sockets (/var/run/docker.sock, ~/.colima/*.sock)
 ;;                              and link-local addresses (e.g. AWS IMDS at
@@ -428,23 +435,43 @@
 ;; --- Working directory (read-write) ----------------------------------------
 (allow file* (subpath (param "WORKDIR")))
 
-;; --- Network: full (required for the Anthropic API) ------------------------
-(allow network*)
-(allow system-socket)
-
-;; WS4 / S-α: optional localhost block. Opt-in via
-;; AI_SANDBOX_BLOCK_LOCALHOST=1. Off by default to keep dev workflows
-;; working (local DBs, dev servers). When set, the agent cannot
-;; connect() or bind() the loopback interface; common targets it cuts off are
+;; --- Network (#78) --------------------------------------------------------
+;; Restricted by default (ALLOW_UNRESTRICTED_NET other than "1"): no IP
+;; networking except outbound TCP to the host egress proxy on
+;; localhost:PROXY_PORT. The wrapper starts the proxy (ai_network_proxy.py)
+;; on 127.0.0.1 for the session and points http(s)_proxy / all_proxy at it;
+;; the proxy refuses loopback, LAN, link-local / cloud metadata, multicast
+;; and reserved destinations. Direct connections anywhere else (public
+;; hosts, LAN, 169.254.169.254, other localhost ports) and listening on IP
+;; ports fail with EPERM. UNIX-domain sockets keep their previous access:
+;; a path filter never matches an IP operation, so (subpath "/") re-allows
+;; only UNIX-socket networking (mDNSResponder, ssh-agent, Docker socket —
+;; the latter two still gated by their own settings). Name resolution goes
+;; through mDNSResponder (Mach IPC above), not raw UDP.
+;;
+;; ALLOW_UNRESTRICTED_NET=1 (AI_SANDBOX_ALLOW_UNRESTRICTED_NET=1, red):
+;; open networking, as before #78, with the optional localhost block.
+;;
+;; WS4 / S-α: optional localhost block for the unrestricted case. Opt-in via
+;; AI_SANDBOX_BLOCK_LOCALHOST=1. When set, the agent cannot connect() or
+;; bind() the loopback interface; common targets it cuts off are
 ;; postgres/redis/kubectl-proxy on localhost, AWS instance metadata
-;; via VPN, and any localhost-bound dev server.
+;; via VPN, and any localhost-bound dev server. The restricted policy
+;; already blocks all of these.
 ;;
 ;; sandbox-exec accepts only "*" or "localhost" as the host portion
 ;; of (remote ip ...) — literal IPs (127.0.0.1, ::1) are rejected at
 ;; parse time. The localhost form covers both IPv4 and IPv6 loopback.
-(when (equal? (param "BLOCK_LOCALHOST") "1")
-    (deny network-outbound (remote ip "localhost:*"))
-    (deny network-inbound  (local  ip "localhost:*")))
+(when (equal? (param "ALLOW_UNRESTRICTED_NET") "1")
+    (allow network*)
+    (when (equal? (param "BLOCK_LOCALHOST") "1")
+        (deny network-outbound (remote ip "localhost:*"))
+        (deny network-inbound  (local  ip "localhost:*"))))
+(when (not (equal? (param "ALLOW_UNRESTRICTED_NET") "1"))
+    (deny network*)
+    (allow network* (subpath "/"))
+    (allow network-outbound (remote ip (string-append "localhost:" (param "PROXY_PORT")))))
+(allow system-socket)
 
 ;; --- sysctl, system info, IOKit, pseudo-ttys -------------------------------
 (allow sysctl-read)

@@ -20,6 +20,8 @@ The sandbox bounds *writes* — it does not bound *reads* or *network*. Be aware
 - **Read + network = exfiltration.** The agent can read any user-readable file
   (`~/.ssh`, `~/.aws`, browser data, etc.) and POST it out. Use only with
   trusted agent versions.
+  The egress proxy (below) keeps the agent off this machine's services,
+  your LAN and cloud metadata endpoints; public hosts stay reachable.
 - **Write + exec inside WORKDIR.** The agent can drop a binary anywhere under
   the working directory and execute it; the child inherits the sandbox, so this
   is not an escape, but "sandboxed" is not the same as "cannot run code".
@@ -195,8 +197,34 @@ The sandbox bounds *writes* — it does not bound *reads* or *network*. Be aware
   says whether user namespaces are denied (kernel, AppArmor, container),
   bubblewrap lacks an option, the filter could not load, or it is a
   setup problem.
+- Network: the sandbox has its own network namespace (`--unshare-net`):
+  services on this machine (`127.0.0.1`, `::1`), abstract UNIX sockets
+  such as X11 or D-Bus, and your LAN are not reachable, and nothing can
+  connect out directly. HTTP and HTTPS go through an egress proxy the
+  wrapper starts on the host for the session: `http_proxy`,
+  `https_proxy`, `HTTP_PROXY`, `HTTPS_PROXY`, `all_proxy` and `ALL_PROXY`
+  are `http://127.0.0.1:3128` (the sandbox's own loopback, relayed to the
+  proxy's private UNIX socket), and `no_proxy` / `NO_PROXY` keep
+  `localhost` direct, so dev servers inside the sandbox still work. The
+  proxy refuses (403) any destination that resolves to loopback, private
+  LAN (RFC 1918, `100.64.0.0/10` incl. Tailscale, IPv6 ULA), link-local /
+  cloud metadata (`169.254.169.254`), multicast or reserved addresses;
+  at exit the wrapper reports how many requests it refused
+  (`AI_SANDBOX_DEBUG=1` lists them). Clients that ignore the proxy
+  variables, SSH (`git@github.com:` remotes; use `https://`), raw TCP/UDP
+  and LAN or cluster endpoints (`kubectl` to a LAN cluster) do not work.
+  Unix-socket grants (Docker, SSH agent, Tailscale) are unaffected. The
+  wrapper needs a `python3` in `/usr/bin`, `/bin` or `/usr/local/bin`
+  for the in-sandbox relay; if the proxy cannot start the launch stops
+  with the reason.
+- `AI_SANDBOX_ALLOW_UNRESTRICTED_NET=1` — share the host network
+  (`--share-net`, the behaviour before this setting existed) and start no
+  proxy. The agent can then reach everything on this machine and your
+  network, including cloud metadata endpoints. Red banner and a launch
+  `WARNING`. Also available on macOS (Seatbelt).
 
-These seven controls are Linux-only and ordinary settings: saved to and
+These controls are Linux-only (except
+`AI_SANDBOX_ALLOW_UNRESTRICTED_NET`) and ordinary settings: saved to and
 restored from the per-workdir preset like the other toggles. A path
 missing on the host is skipped, never created. An explicit wider grant
 still applies: launching from (or `AI_SANDBOX_EXTRA_RW_DIRS` on) a
@@ -223,12 +251,37 @@ and `KIND_EXPERIMENTAL_PROVIDER` is not passed; Kubernetes access is `AI_SANDBOX
 - `AI_SANDBOX_DRYRUN=1` — print the resolved sandbox-exec argv, the post-scrub
   child environment, and the rendered SBPL profile, then exit. Nothing
   launches. macOS only — not yet implemented on the bwrap backend.
-- `AI_SANDBOX_BLOCK_LOCALHOST=1` — emit SBPL `(deny network-outbound (remote
+- Network: Seatbelt denies IP networking. The only IP connection the
+  sandbox can make is outbound TCP to the egress proxy the wrapper starts
+  on the host for the session (`127.0.0.1`, a free port picked at
+  launch): `http_proxy`, `https_proxy`, `HTTP_PROXY`, `HTTPS_PROXY`,
+  `all_proxy` and `ALL_PROXY` are `http://127.0.0.1:<port>`, set after
+  `AI_SANDBOX_PASS_ENV` so a passthrough cannot replace them. Direct
+  connections (public hosts, your LAN, `169.254.169.254`, other
+  `localhost` ports such as dev databases) and listening on IP ports fail
+  with `Operation not permitted`. The proxy refuses (403) any destination
+  that resolves to loopback, private LAN (RFC 1918, `100.64.0.0/10` incl.
+  Tailscale, IPv6 ULA), link-local / cloud metadata, multicast or
+  reserved addresses; at exit the wrapper reports how many requests it
+  refused (`AI_SANDBOX_DEBUG=1` lists them). Clients that ignore the proxy
+  variables, SSH (`git@github.com:` remotes; use `https://`), raw TCP/UDP,
+  LAN or cluster endpoints and dev servers inside the sandbox do not
+  work. UNIX-domain sockets are unaffected (name resolution through
+  mDNSResponder, the SSH agent and Docker sockets still follow their own
+  settings). The proxy needs a `python3` on `PATH`; if it cannot start
+  the launch stops with the reason.
+- `AI_SANDBOX_ALLOW_UNRESTRICTED_NET=1` — open networking
+  (`(allow network*)`, the behaviour before this setting existed) and no
+  proxy. The agent can then reach everything on this machine and your
+  network, including cloud metadata endpoints. Red banner and a launch
+  `WARNING`. Saved in presets like other settings.
+- `AI_SANDBOX_BLOCK_LOCALHOST=1` — with
+  `AI_SANDBOX_ALLOW_UNRESTRICTED_NET=1`, emit SBPL `(deny network-outbound (remote
   ip "localhost:*"))` and the symmetric inbound rule. Blocks IPv4 + IPv6
-  loopback (sandbox-exec resolves "localhost" to both). Off by default so
-  dev workflows on `127.0.0.1` keep working; set this when you want the
-  agent unable to reach dev DBs / kubectl proxy on loopback. **Scope
-  caveat:** the flag is IP-only. Unix-domain sockets
+  loopback (sandbox-exec resolves "localhost" to both). The restricted
+  default already blocks loopback; set this with the unrestricted network
+  when you want the agent unable to reach dev DBs / kubectl proxy on
+  loopback. **Scope caveat:** the flag is IP-only. Unix-domain sockets
   (`/var/run/docker.sock`, `~/.colima/*.sock`) and link-local addresses
   (AWS IMDS at `169.254.169.254`) are **not** covered — fence those at
   the network or firewall layer if they matter. macOS only — no Linux

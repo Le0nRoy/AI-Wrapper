@@ -26,6 +26,63 @@ _regex_escape() {
     printf '%s' "${out}"
 }
 
+# Restricted network (#78): starts the host egress proxy
+# (_AI_SANDBOX_NET_PROXY_HELPER, see ai_agent_universal_wrapper.bash) on
+# 127.0.0.1 with an ephemeral port, its output in a fresh private (0700)
+# directory under BASE, and waits for its READY line. Seatbelt has no
+# network namespaces: the profile allows outbound TCP to that one localhost
+# port, so the client talks to the proxy directly (no in-sandbox relay).
+# The proxy runs in its own session and stops by itself if this shell dies
+# without cleaning up (--parent-pid). Sets _AI_SANDBOX_NET_PROXY_PID,
+# _AI_SANDBOX_NET_PROXY_DIR and _AI_SANDBOX_NET_PROXY_TCP_PORT; on failure
+# stops what it started (_sandbox_stop_network_proxy), sets
+# _AI_SANDBOX_NET_PROXY_ERROR and returns 1. Runs in the calling shell,
+# never in $(...): the proxy's parent must be the shell that launches the
+# sandbox. Args: BASE
+_sandbox_start_network_proxy_tcp() {
+    local base="${1:-/tmp}" python_bin dir shell_pid port="" polls=0 reason
+    _AI_SANDBOX_NET_PROXY_ERROR=""
+    _AI_SANDBOX_NET_PROXY_TCP_PORT=""
+    if ! python_bin="$(type -P "${_AI_SANDBOX_PYTHON}")"; then
+        _AI_SANDBOX_NET_PROXY_ERROR="${_AI_SANDBOX_PYTHON} not found on PATH"; return 1
+    fi
+    if [[ ! -r "${_AI_SANDBOX_NET_PROXY_HELPER}" ]]; then
+        _AI_SANDBOX_NET_PROXY_ERROR="helper ${_AI_SANDBOX_NET_PROXY_HELPER} is missing"; return 1
+    fi
+    if ! dir="$(mktemp -d "${base%/}/ai-sandbox-net.XXXXXXXX" 2>&1)"; then
+        _AI_SANDBOX_NET_PROXY_ERROR="cannot create a private directory under ${base}: ${dir}"; return 1
+    fi
+    if ! chmod 0700 "${dir}"; then
+        rm -rf -- "${dir}"
+        _AI_SANDBOX_NET_PROXY_ERROR="cannot make ${dir} private"; return 1
+    fi
+    _AI_SANDBOX_NET_PROXY_DIR="${dir}"
+    # Read before the fork: an async command's words expand in the child.
+    # bash 3.2 has no BASHPID; see _sandbox_read_own_exit_trap.
+    shell_pid="${BASHPID:-$(exec sh -c 'echo "${PPID}"')}"
+    "${python_bin}" -I "${_AI_SANDBOX_NET_PROXY_HELPER}" --host 127.0.0.1 --port 0 --parent-pid "${shell_pid}" \
+        >"${dir}/ready" 2>"${dir}/proxy.log" </dev/null &
+    _AI_SANDBOX_NET_PROXY_PID=$!
+    while [[ -z "${port}" ]]; do
+        port="$(sed -n 's/^READY tcp 127\.0\.0\.1:\([1-9][0-9]*\)$/\1/p' "${dir}/ready" 2>/dev/null)"
+        [[ -n "${port}" ]] && break
+        if ! kill -0 "${_AI_SANDBOX_NET_PROXY_PID}" 2>/dev/null; then
+            reason="$(cat -- "${dir}/proxy.log" 2>/dev/null)"
+            _sandbox_stop_network_proxy
+            _AI_SANDBOX_NET_PROXY_ERROR="the proxy exited during startup (${reason:-no output})"; return 1
+        fi
+        if (( polls++ >= _AI_SANDBOX_NET_MAX_POLLS )); then
+            reason="$(cat -- "${dir}/proxy.log" 2>/dev/null)"
+            _sandbox_stop_network_proxy
+            _AI_SANDBOX_NET_PROXY_ERROR="the proxy did not report READY in time (${reason:-no output})"; return 1
+        fi
+        sleep "${_AI_SANDBOX_NET_POLL_SECONDS}"
+    done
+    _AI_SANDBOX_NET_PROXY_TCP_PORT="${port}"
+    [[ "${AI_SANDBOX_DEBUG:-0}" == "1" ]] && echo_log "DEBUG" "network proxy pid=${_AI_SANDBOX_NET_PROXY_PID} port=${port} dir=${dir}"
+    return 0
+}
+
 # Custom-profile sanity check (WS3 / U-C, hardened by #67 / CC-4). Prints
 # why the SBPL body in $1 must not launch, or nothing when it passes:
 #   header        — no (version 1) or no (deny default) form
@@ -559,6 +616,15 @@ _run_sandboxed_agent_impl() {
     local block_localhost="${AI_SANDBOX_BLOCK_LOCALHOST:-0}"
     [[ "${block_localhost}" == "1" ]] || block_localhost=0
 
+    # Network (#78): restricted unless AI_SANDBOX_ALLOW_UNRESTRICTED_NET=1
+    # (any other value keeps the restriction). The SBPL profile branches on
+    # ALLOW_UNRESTRICTED_NET; the proxy is started just before the launch.
+    local allow_unrestricted_net="${AI_SANDBOX_ALLOW_UNRESTRICTED_NET:-0}"
+    [[ "${allow_unrestricted_net}" == "1" ]] || allow_unrestricted_net=0
+    if [[ "${allow_unrestricted_net}" == "1" ]]; then
+        echo_log "WARNING" "[${tag}] AI_SANDBOX_ALLOW_UNRESTRICTED_NET=1: the sandbox has open networking; the agent can reach services on this machine (localhost), your LAN and cloud metadata endpoints, and send traffic anywhere without the egress proxy."
+    fi
+
     # ALLOW_DOCKER gates the RW bind for the Docker / Colima sockets in the
     # SBPL profile. Default "0": the agent has no access to the local Docker
     # daemon. With a running daemon, RW on the socket is a full sandbox escape
@@ -823,6 +889,39 @@ _run_sandboxed_agent_impl() {
         profile+="${extra_rules}"
     fi
 
+    # Restricted network: start the host proxy and point the client at it.
+    # The proxy variables replace any already in the allowlist and are set
+    # after AI_SANDBOX_PASS_ENV and the _extra_sandbox_setup hook, so no
+    # passthrough can point clients elsewhere (Seatbelt would refuse a
+    # direct connection anyway). The proxy's directory goes in the per-user
+    # temp dir (0700 parent, outside the shared /tmp). Fails closed: a proxy
+    # that cannot start refuses the launch.
+    local proxy_port=0 previous_exit_trap="" _proxy_var _proxy_kv
+    if [[ "${allow_unrestricted_net}" != "1" ]]; then
+        if ! _sandbox_start_network_proxy_tcp "${darwin_user_tmp}"; then
+            echo_log "ERROR" "[${tag}] Cannot start the sandbox network proxy: ${_AI_SANDBOX_NET_PROXY_ERROR}. Fix it, or set AI_SANDBOX_ALLOW_UNRESTRICTED_NET=1 to allow open networking without filtering."
+            return 1
+        fi
+        proxy_port="${_AI_SANDBOX_NET_PROXY_TCP_PORT}"
+        # Stops the proxy if the shell exits or is killed (SIGHUP, SIGTERM)
+        # during the session; restored after the launch below.
+        _sandbox_read_own_exit_trap
+        previous_exit_trap="${_AI_SANDBOX_OWN_EXIT_TRAP}"
+        # shellcheck disable=SC2064  # the tag is expanded (and quoted) now
+        trap "_sandbox_stop_network_proxy $(printf '%q' "${tag}")" EXIT
+        local -a _proxy_env=()
+        for _proxy_kv in "${env_allowlist[@]+"${env_allowlist[@]}"}"; do
+            case "${_proxy_kv%%=*}" in
+                http_proxy|https_proxy|HTTP_PROXY|HTTPS_PROXY|all_proxy|ALL_PROXY) continue ;;
+            esac
+            _proxy_env+=("${_proxy_kv}")
+        done
+        for _proxy_var in http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY; do
+            _proxy_env+=("${_proxy_var}=http://127.0.0.1:${proxy_port}")
+        done
+        env_allowlist=("${_proxy_env[@]}")
+    fi
+
     # Run the sandboxed process in a subshell so locals here don't leak into
     # the caller's shell. Rlimits used to be applied here in the same subshell;
     # all rlimit enforcement was dropped (see "Deferred: rlimits" in
@@ -854,6 +953,8 @@ _run_sandboxed_agent_impl() {
             -D "PASS_GITLAB=${pass_gitlab}"
             -D "ENABLE_SIGNPOST=${enable_signpost}"
             -D "BLOCK_LOCALHOST=${block_localhost}"
+            -D "ALLOW_UNRESTRICTED_NET=${allow_unrestricted_net}"
+            -D "PROXY_PORT=${proxy_port}"
             -D "ALLOW_DOCKER=${allow_docker}"
             -D "ALLOW_KEYCHAIN=${allow_keychain}"
         )
@@ -897,6 +998,15 @@ _run_sandboxed_agent_impl() {
         exec env -i "${env_allowlist[@]}" sandbox-exec "${sandbox_argv[@]}"
     )
     local exit_code=$?
+    if [[ "${allow_unrestricted_net}" != "1" ]]; then
+        _sandbox_stop_network_proxy "${tag}"
+        # Hand this shell's own EXIT trap back (none: clear ours).
+        if [[ -n "${previous_exit_trap}" ]]; then
+            eval "${previous_exit_trap}"
+        else
+            trap - EXIT
+        fi
+    fi
 
     case ${exit_code} in
         0)   ;;
