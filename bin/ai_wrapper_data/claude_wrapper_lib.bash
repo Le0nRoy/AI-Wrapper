@@ -35,15 +35,10 @@ _AI_SETTINGS_LIST+=(
     "CLAUDE_ACCOUNT|str|private|info|Account profile|Which ~/.claude-<name>/ credential profile to use. 'private' = default ~/.claude. Type a profile name, or 'private' to reset.|account"
 )
 
-# The shared catalog's DEFAULT field is display-only for str/path entries —
-# _setting_current_value() never substitutes it (str/path treats empty as
-# meaningful, unlike bool), so an unset CLAUDE_ACCOUNT would render as
-# "<unset>" in the settings table rather than "private" even though
-# _bind_claude_account() (executable_claude_wrapper.bash) treats the two
-# identically. Export the default explicitly here so the displayed state
-# matches the resolved behavior; _preset_autoload overrides this with a
-# saved value when one exists, same as any other exported default.
-export CLAUDE_ACCOUNT="${CLAUDE_ACCOUNT:-private}"
+# No source-time `export CLAUDE_ACCOUNT=private`: _preset_autoload treats a set
+# variable as caller-set and would skip a saved account. The settings table
+# shows "private" for unset via _setting_current_value's catalog default.
+
 
 # List available account profile names (directory-name suffixes of
 # ~/.claude-<name>/), one per line, for the user to reference when typing

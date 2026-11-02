@@ -35,9 +35,10 @@ _AI_SETTINGS_LIST+=(
     "AGY_ACCOUNT|str|private|info|Account profile|Which ~/.gemini-<name>/ credential profile to use. 'private' = default ~/.gemini. Type a profile name, or 'private' to reset.|account"
 )
 
-# Export the default so the settings table shows "private" rather than
-# "<unset>" (str entries don't substitute DEFAULT).
-export AGY_ACCOUNT="${AGY_ACCOUNT:-private}"
+# No source-time `export AGY_ACCOUNT=private`: _preset_autoload treats a set
+# variable as caller-set and would skip a saved account. The settings table
+# shows "private" for unset via _setting_current_value's catalog default.
+
 
 # Active resolved profile directory set by _bind_agy_account (used by the
 # interactive resume conversation picker).
