@@ -51,8 +51,8 @@ this section records the disposition.
   sockets or link-local addresses (AWS IMDS at `169.254.169.254`).
   No code change; documentation only.
 - **3.K → strict profile sanity check.** The `(version 1)` /
-  `(deny default)` check now also refuses a profile whose first 80
-  non-comment lines contain `(allow default)`, which would otherwise
+  `(deny default)` check now also refuses a profile that contains
+  `(allow default)` (first 80 lines only until #67, S-ν), which would otherwise
   silently neutralise the `(deny default)` baseline.
   `AI_SANDBOX_PROFILE_TRUST_ME=1` bypasses this check too — single
   bypass for the whole sanity-check block.
@@ -148,8 +148,9 @@ regular file as a sandbox profile replacement. A trivially permissive
 substitute (`(version 1)(allow default)`) silently nullified the
 fence.
 
-**Resolution.** WS3 sanity-checks the loaded profile body: scans the
-first 80 non-comment lines for `(version 1)` and `(deny default)`. If
+**Resolution.** WS3 sanity-checks the loaded profile body: scans it
+for `(version 1)` and `(deny default)` (originally the first 80
+non-comment lines; the whole body since #67, see S-ν). If
 either is missing, refuses to launch unless
 `AI_SANDBOX_PROFILE_TRUST_ME=1` is set (red banner). The check is
 intentionally cheap string-grep — false positives can be overridden;
@@ -706,6 +707,61 @@ silently, including for scripted launches with no menu.
 writes the session's current values, so a one-off launch value (e.g.
 `AI_SANDBOX_PASS_AWS=0`) replaces the saved one for that workdir. A
 preset entry for a variable that is set at launch is skipped silently.
+
+### S-ν — macOS: git credential files, Keychain, custom-profile check (RESOLVED, 2026-11, #67)
+
+M3, M1, CC-4.
+
+- **Git credential-store files (M3).** The base profile granted read on
+  `(subpath ~/.config/git)` for git's XDG config (`ignore`,
+  `attributes`), which also covered `~/.config/git/credentials` — the
+  plaintext token file `git credential-store` uses there. Neither it nor
+  `~/.git-credentials` was in the `ALLOW_RO_HOMEDIR` `(require-not …)`
+  chain. **Resolution.** An explicit `(deny file-read* (literal …))` for
+  both files follows every read grant in the base profile (~/.config/git,
+  `ALLOW_RO_HOMEDIR`, `ALLOW_RO_CREDENTIALS`), and both are excluded from
+  the `ALLOW_RO_HOMEDIR` chain. Explicit grants rendered after the base
+  profile (WORKDIR, `--bind` / `--ro-bind`, `AI_SANDBOX_EXTRA_*_DIRS`)
+  still win, as for every other credential path. glab's on-disk token
+  stays with `AI_SANDBOX_PASS_GITLAB` (#47).
+- **Keychain (M1).** Formerly S4: `~/Library/Keychains` was RW and the
+  `com.apple.SecurityServer` / `com.apple.securityd` Mach lookups were
+  always granted. With `(allow process-exec)`, any process in the sandbox
+  could run `/usr/bin/security` against the login keychain and read any
+  item whose access list admits that program without a prompt — the
+  file path and the daemon path each reach items on their own.
+  **Resolution.** Both the file rule and the two lookups move under
+  `(when (equal? (param "ALLOW_KEYCHAIN") "1") …)`, driven by the new
+  catalog setting `AI_SANDBOX_ALLOW_KEYCHAIN` (macOS only, red,
+  default `0`; a restored `1` WARNs per S-μ). `trustd` / `trustd.agent`
+  (TLS certificate evaluation) and `cryptoTokenKit` stay granted.
+  Client evidence: Claude Code keeps its macOS OAuth login in the
+  Keychain, so with the default it needs an env-var credential
+  (`CLAUDE_CODE_OAUTH_TOKEN`, from `claude setup-token`; `CLAUDE_*` is
+  passed through) or `AI_SANDBOX_ALLOW_KEYCHAIN=1`. Codex, agy and
+  Copilot keep their state in their own dot-dirs, which the wrappers
+  bind. Tests use only throwaway fixtures: a fake `*.keychain-db` file in
+  the fake home for the file path, and — on CI or with
+  `AI_WRAPPER_TEST_SYNTHETIC_KEYCHAIN=1` — a keychain created with
+  `security create-keychain` in the fake home, named explicitly on every
+  call and deleted on exit. The default keychain is never queried.
+- **Custom-profile check (CC-4).** U-C / 3.K inspected only the first 80
+  non-comment lines and matched `(version 1)`, `(deny default)` and
+  `(allow default)` as line prefixes, so `(allow default)` on line 81, after
+  another form on the same line, or split across whitespace passed.
+  **Resolution.** `_sandbox_profile_violation` scans the whole body:
+  string literals (including `#"…"` regex strings, with escapes) are
+  blanked, `;` comments dropped, the rest case-folded and
+  whitespace-flattened, then token-matched. Any `allow` rule whose
+  operation list names `default` is refused. Block comments (`#|`), datum
+  comments (`#;`) and character literals (`#\`) outside strings refuse
+  the launch, because they can hide a rule from the scanner.
+  `AI_SANDBOX_PROFILE_TRUST_ME=1` still bypasses the whole check.
+
+**Residual.** The check is a token match, not an SBPL evaluator: a rule
+built at run time (`define`, `string->symbol`, macros) is not seen. A
+custom profile is operator-supplied; the check guards against mistakes
+and casual substitution, not against a profile author.
 
 ## Local bugs / brittleness
 
@@ -1381,8 +1437,8 @@ when that plugin is loaded.
 ## Carry-overs from earlier reviews (still open by design)
 
 - **S2** — `(allow network*)`. Required for the Anthropic API. Documented.
-- **S4** — `~/Library/Keychains` RW. Required for go-keyring
-  atomic-replace path. Documented.
+- **S4** — `~/Library/Keychains` RW. Closed by #67 (S-ν): gated on
+  `AI_SANDBOX_ALLOW_KEYCHAIN`, default off.
 - **S7** — `~/Library/Caches/claude-cli-nodejs` RW. Today log-only, no
   write→exec gadget. Documented.
 - **S9** — `--dangerously-skip-permissions`. By design; sandbox is the

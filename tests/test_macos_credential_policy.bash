@@ -166,7 +166,7 @@ assert_contains "${SB}" '(global-name "com.apple.trustd")' "trustd (TLS evaluati
 
 # ---------------------------------------------------------------------------
 if [[ "${OS}" != "Darwin" ]]; then
-    echo "  (native Seatbelt probes skipped: ${OS} is not Darwin)"
+    echo "  skip - native Seatbelt probes (${OS} is not Darwin)"
     assert_no_live_client_reached
     tests_summary_and_exit
 fi
@@ -208,7 +208,7 @@ rm -f "${probe_db}"
 
 echo "-- native: synthetic keychain through securityd"
 if [[ "${RUN_KEYCHAIN_PROBE}" != "1" ]]; then
-    echo "  skip: synthetic keychain probe runs on CI or with AI_WRAPPER_TEST_SYNTHETIC_KEYCHAIN=1"
+    echo "  skip - synthetic keychain probe (runs on CI or with AI_WRAPPER_TEST_SYNTHETIC_KEYCHAIN=1)"
 else
     # Only the throwaway keychain is ever named; the default keychain and
     # the user's items are never queried.

@@ -55,7 +55,8 @@ The sandbox bounds *writes* — it does not bound *reads* or *network*. Be aware
 
 - `AI_SANDBOX_ALLOW_RO_HOMEDIR=1` — widen the read allowlist to `$HOME`
   except the credential exclusions in the SBPL profile (the 9 credential
-  dotfiles, `~/Library/Keychains`, `~/Library/{Messages, Mail, Cookies}`,
+  dotfiles, `~/.git-credentials`, `~/.config/git/credentials`,
+  `~/Library/Keychains`, `~/Library/{Messages, Mail, Cookies}`,
   Chrome/Chromium/Brave/Arc/Edge/Firefox/Vivaldi profiles,
   `~/Library/Containers/com.apple.Safari`, Slack/Discord state,
   1Password/Bitwarden/KeePassXC sync caches). **The flag still exposes
@@ -69,6 +70,21 @@ The sandbox bounds *writes* — it does not bound *reads* or *network*. Be aware
   (~/.config/gcloud, ~/.gnupg, ~/.netrc, ~/.npmrc, ~/.pypirc). The
   per-service cred dirs (~/.ssh, ~/.aws, ~/.kube, ~/.docker) are
   enabled by their matching `AI_SANDBOX_PASS_*` flag instead. Red banner.
+<!-- os:darwin -->
+- git credential-store files (`~/.git-credentials`,
+  `~/.config/git/credentials`) are always unreadable, whatever
+  `AI_SANDBOX_ALLOW_RO_HOMEDIR` / `AI_SANDBOX_ALLOW_RO_CREDENTIALS` say;
+  the rest of `~/.config/git` stays readable. Only an explicit grant of
+  the file or a parent (WORKDIR, extra dirs, `--bind`) exposes them.
+- `AI_SANDBOX_ALLOW_KEYCHAIN=1` — grant RW on `~/Library/Keychains` and
+  lookups of the `com.apple.SecurityServer` / `com.apple.securityd`
+  keychain daemons. **Off by default:** the agent cannot read keychain
+  files or ask securityd for items. Claude Code keeps its macOS login in
+  the Keychain, so with the default either pass `CLAUDE_CODE_OAUTH_TOKEN`
+  (from `claude setup-token`) or set this to `1`. When on, the agent can
+  read, add or change any keychain item whose access list lets the
+  calling program in without a prompt. Red banner. macOS only.
+<!-- os:end -->
 - `AI_SANDBOX_ALLOW_GIT_CONFIG=1` — leave WORKDIR's `.git/config`,
   `.git/hooks/`, `config.worktree` and submodule config/hooks writable.
   By default (0) they are read-only because host git runs hooks and
@@ -196,8 +212,11 @@ and `KIND_EXPERIMENTAL_PROVIDER` is not passed; Kubernetes access is `AI_SANDBOX
 - `AI_SANDBOX_PROFILE=<path>` — point at an alternative SBPL profile (absolute
   path, or relative to the universal wrapper's directory). Replaces the base
   profile entirely; per-call `--bind` rules are still appended. The wrapper
-  refuses to load a profile that lacks `(version 1)` and `(deny default)` in
-  its first 80 non-comment lines (post-WS3 sanity check; closes U-C). Set
+  refuses to load a profile that lacks `(version 1)` or `(deny default)`, or
+  has an `allow` rule naming `default` (e.g. `(allow default)`), anywhere
+  outside comments and strings; forms split across lines still match.
+  Block comments (`#|`), datum comments (`#;`) and character literals
+  (`#\`) are refused too, since they can hide a rule from the check. Set
   `AI_SANDBOX_PROFILE_TRUST_ME=1` to bypass the check — required only for
   legitimately permissive profiles, red banner. macOS only — bwrap has no
   equivalent profile-file mechanism.
