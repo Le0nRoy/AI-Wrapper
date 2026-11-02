@@ -226,6 +226,34 @@ trap_out="$( cd "${WORK}" && export PATH="${STUB_PATH}${PATH}" && rm -rf "${STAT
         "${REPO_ROOT}/bin/ai_wrapper_data/macos_sandbox_exec.bash" )"
 assert_contains "${trap_out}" "trap -- 'echo CALLER_TRAP_RAN' EXIT" "caller's EXIT trap restored after the launch"
 assert_contains "${trap_out}" "CALLER_TRAP_RAN" "caller's EXIT trap still runs"
+# In a subshell (also a command substitution, as tests/test_sandbox_common.bash
+# runs it): a trap it only inherited (here the parent's) is not run when it
+# exits. Checked with BASHPID, without it (the bash 3.2 path) and, on macOS,
+# under /bin/bash (3.2), whose subshells keep listing the parent's traps.
+subshell_body='source "$1"; source "$2"; [[ "$3" == nobashpid ]] && unset BASHPID
+    trap "echo PARENT_TRAP_RAN" EXIT
+    ( trap "echo SUBSHELL_TRAP_RAN" EXIT; _run_sandboxed_agent_impl true -- -- 2>/dev/null; echo "OWN_TRAP_SET=[$(trap -p EXIT)]" )
+    echo SUBSHELL_1_DONE
+    ( _run_sandboxed_agent_impl true -- -- 2>/dev/null; echo "OWN_TRAP=[$(trap -p EXIT)]" )
+    echo SUBSHELL_2_DONE
+    echo "SUBST=[$(_run_sandboxed_agent_impl true -- -- 2>/dev/null)]"
+    trap - EXIT'
+subshell_shells="bash:bashpid bash:nobashpid"
+[[ "${OS}" == "Darwin" ]] && subshell_shells="${subshell_shells} /bin/bash:system"
+for shell_mode in ${subshell_shells}; do
+    trap_out="$( cd "${WORK}" && export PATH="${STUB_PATH}${PATH}" && rm -rf "${STATE}" && mkdir -p "${STATE}" \
+        && "${shell_mode%%:*}" -c "${subshell_body}" _ "${REPO_ROOT}/bin/ai_agent_universal_wrapper.bash" \
+            "${REPO_ROOT}/bin/ai_wrapper_data/macos_sandbox_exec.bash" "${shell_mode#*:}" )"
+    assert_contains "${trap_out}" "SUBSHELL_1_DONE" "${shell_mode}: subshell with its own EXIT trap completes"
+    assert_contains "${trap_out}" "OWN_TRAP=[]${NL}SUBSHELL_2_DONE" "${shell_mode}: subshell without its own EXIT trap: none left after the launch"
+    assert_contains "${trap_out}" "SUBST=[]" "${shell_mode}: command substitution completes"
+    assert_not_contains "${trap_out}" "PARENT_TRAP_RAN" "${shell_mode}: parent's EXIT trap not run by the subshell"
+    # bash >= 4 tells its own trap from an inherited one: restored and run.
+    if [[ "${shell_mode}" == bash:bashpid && "$(bash -c 'echo "${BASH_VERSINFO[0]}"')" -ge 4 ]]; then
+        assert_contains "${trap_out}" "OWN_TRAP_SET=[trap -- 'echo SUBSHELL_TRAP_RAN' EXIT]${NL}SUBSHELL_TRAP_RAN${NL}SUBSHELL_1_DONE" \
+            "${shell_mode}: subshell's own EXIT trap restored after the launch and runs"
+    fi
+done
 # Killed during the session: the EXIT trap stops the proxy.
 kill_out="$( cd "${WORK}" && export PATH="${STUB_PATH}${PATH}" && rm -rf "${STATE}" && mkdir -p "${STATE}" \
     && bash -c 'source "$1"; source "$2"; AI_SANDBOX_DEBUG=1 _run_sandboxed_agent_impl sh -- -- -c "kill -TERM $$; sleep 2"' \

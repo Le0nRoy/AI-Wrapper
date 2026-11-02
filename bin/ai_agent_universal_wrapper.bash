@@ -352,11 +352,16 @@ _sandbox_start_network_proxy() {
 # so run) when the subshell exits. Resetting a pseudo-signal that shows no
 # trap changes nothing but ends that listing. When every candidate shows a
 # trap, the source cannot be told: report none (never run a parent's trap).
+# bash 3.2 (macOS /bin/bash) keeps listing the parent's traps after any
+# reset, so in a subshell there it always reports none: a subshell's own
+# EXIT trap is then cleared, not restored, after the launch.
 _sandbox_read_own_exit_trap() {
     _AI_SANDBOX_OWN_EXIT_TRAP=""
-    # bash 3.2 (macOS) has no BASHPID: a command substitution's exec'd sh
-    # is a child of this shell, so its PPID is this shell's PID.
-    if [[ "${BASHPID:-$(exec sh -c 'echo "${PPID}"')}" != "$$" ]]; then
+    if [[ -z "${BASHPID:-}" ]]; then
+        # bash 3.2 has no BASHPID: a command substitution's exec'd sh is a
+        # child of this shell, so its PPID is this shell's PID.
+        [[ "$(exec sh -c 'echo "${PPID}"')" != "$$" ]] && return 0
+    elif [[ "${BASHPID}" != "$$" ]]; then
         local probe
         for probe in RETURN ERR DEBUG ""; do
             [[ -z "${probe}" ]] && return 0
