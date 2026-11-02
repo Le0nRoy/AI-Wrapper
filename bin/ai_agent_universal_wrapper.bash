@@ -346,6 +346,25 @@ _sandbox_start_network_proxy() {
     return 0
 }
 
+# Sets _AI_SANDBOX_OWN_EXIT_TRAP to this shell's own EXIT trap ("" if
+# none). A subshell's `trap -p` also lists the parent's traps until the
+# subshell changes any trap, and a parent's trap must not be restored (and
+# so run) when the subshell exits. Resetting a pseudo-signal that shows no
+# trap changes nothing but ends that listing. When every candidate shows a
+# trap, the source cannot be told: report none (never run a parent's trap).
+_sandbox_read_own_exit_trap() {
+    _AI_SANDBOX_OWN_EXIT_TRAP=""
+    if [[ "${BASHPID}" != "$$" ]]; then
+        local probe
+        for probe in RETURN ERR DEBUG ""; do
+            [[ -z "${probe}" ]] && return 0
+            [[ -z "$(trap -p "${probe}")" ]] && break
+        done
+        trap - "${probe}"
+    fi
+    _AI_SANDBOX_OWN_EXIT_TRAP="$(trap -p EXIT)"
+}
+
 # Stops the proxy started by _sandbox_start_network_proxy (SIGTERM, SIGKILL
 # if it has not exited within the poll budget), reports how many requests
 # the network policy refused (with AI_SANDBOX_DEBUG=1, the proxy's log
@@ -1218,7 +1237,8 @@ _run_sandboxed_agent_linux() {
         fi
         # Stops the proxy if the shell exits or is killed (SIGHUP, SIGTERM)
         # during the session; restored after the launch below.
-        previous_exit_trap="$(trap -p EXIT)"
+        _sandbox_read_own_exit_trap
+        previous_exit_trap="${_AI_SANDBOX_OWN_EXIT_TRAP}"
         # shellcheck disable=SC2064  # the tag is expanded (and quoted) now
         trap "_sandbox_stop_network_proxy $(printf '%q' "${agent_name}")" EXIT
         bwrap_args+=(
@@ -1246,9 +1266,8 @@ _run_sandboxed_agent_linux() {
     [[ -n "${tty_filter_fd}" ]] && exec {tty_filter_fd}<&-
     if [[ "${allow_unrestricted_net}" != "1" ]]; then
         _sandbox_stop_network_proxy "${agent_name}"
-        # Hand the EXIT trap back. In a subshell `trap -p` also reports the
-        # parent's trap, which must not run here: clear it instead.
-        if [[ "${BASHPID}" == "$$" && -n "${previous_exit_trap}" ]]; then
+        # Hand this shell's own EXIT trap back (none: clear ours).
+        if [[ -n "${previous_exit_trap}" ]]; then
             eval "${previous_exit_trap}"
         else
             trap - EXIT

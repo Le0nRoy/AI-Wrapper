@@ -223,6 +223,20 @@ trap_out="$( cd "${WORK}" && export PATH="${STUB_DIR}:${PATH}" && _load_linux &&
 assert_contains "${trap_out}" "trap -- 'echo CALLER_TRAP_RAN' EXIT" "caller's EXIT trap restored after the launch"
 assert_contains "${trap_out}" "CALLER_TRAP_RAN" "caller's EXIT trap still runs"
 
+# In a subshell: its own EXIT trap is restored and runs; a trap it only
+# inherited (here the parent's) is not run when the subshell exits.
+trap_out="$( cd "${WORK}" && export PATH="${STUB_DIR}:${PATH}" && rm -rf "${STATE}" && mkdir -p "${STATE}" \
+    && bash -c 'source "$1"; _AI_SANDBOX_PROC_SYS="$2"; trap "echo PARENT_TRAP_RAN" EXIT
+        ( trap "echo SUBSHELL_TRAP_RAN" EXIT; _run_sandboxed_agent_linux true -- -- 2>/dev/null; trap -p EXIT )
+        echo SUBSHELL_1_DONE
+        ( _run_sandboxed_agent_linux true -- -- 2>/dev/null; echo "OWN_TRAP=[$(trap -p EXIT)]" )
+        echo SUBSHELL_2_DONE; trap - EXIT' \
+        _ "${REPO_ROOT}/bin/ai_agent_universal_wrapper.bash" "${PROC_SYS}" )"
+assert_contains "${trap_out}" "trap -- 'echo SUBSHELL_TRAP_RAN' EXIT${NL}SUBSHELL_TRAP_RAN${NL}SUBSHELL_1_DONE" \
+    "subshell's own EXIT trap restored after the launch and runs"
+assert_contains "${trap_out}" "OWN_TRAP=[]${NL}SUBSHELL_2_DONE" "subshell without its own EXIT trap: none left after the launch"
+assert_not_contains "${trap_out}" "PARENT_TRAP_RAN" "parent's EXIT trap not run by the subshell"
+
 # ---------------------------------------------------------------------------
 echo "-- AI_SANDBOX_ALLOW_UNRESTRICTED_NET=1: host network, no proxy"
 _stub "" AI_SANDBOX_ALLOW_UNRESTRICTED_NET=1
