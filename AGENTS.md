@@ -14,7 +14,7 @@ These rules apply to **Claude Code** (and any other AI agents) working on **any 
 | Resource | Location |
 |----------|----------|
 | User-level skills | `~/.agents/skills/` (copied into every wrapped client's native skill directory by `setup_skills.bash`; named Claude, Codex, and Antigravity profiles are included, and each managed copy carries a `.setup_skills_managed` marker) |
-| Orchestrator prompt | `~/bin/ai_wrapper_data/orchestrator-prompt.md` |
+| Orchestrator prompt | `~/ai-wrapper/bin/ai_wrapper_data/orchestrator-prompt.md` |
 | Installed plugins | `~/.claude/settings.json` → `enabledPlugins` |
 | Plugin marketplace | `~/.claude/plugins/marketplaces/claude-plugins-official/plugins/` |
 | Sandbox settings / account switching | `s) Settings` in the wrapper's main menu — toggles `AI_SANDBOX_*` flags and the active `CLAUDE_ACCOUNT` / `CODEX_ACCOUNT` / `AGY_ACCOUNT` profile; persists per-workdir and per-agent |
@@ -228,7 +228,8 @@ Squash already done — you have 1 clean commit to review.
   targets; `.chezmoiignore` lists what is never deployed (`docs/`, `tests/`,
   `.github/`, `README.md`).
 - **Edit the source, not the target:** change files here, never the
-  deployed copies under `~/bin`, `~/.agents` or `~/`.
+  deployed copies under `~/ai-wrapper` (e.g. `~/ai-wrapper/bin`,
+  `~/ai-wrapper/.agents`) or `~/`.
 - **Deploy:** `chezmoi diff` to preview, `chezmoi apply` only when the user
   asks. Changes do not deploy until then. This repo may be a secondary
   source: `CHEZMOI_SOURCE_DIR="$HOME/.local/share/ai-wrapper" chezmoi diff`.

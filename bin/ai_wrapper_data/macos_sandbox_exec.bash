@@ -26,6 +26,133 @@ _regex_escape() {
     printf '%s' "${out}"
 }
 
+# Restricted network (#78): starts the host egress proxy
+# (_AI_SANDBOX_NET_PROXY_HELPER, see ai_agent_universal_wrapper.bash) on
+# 127.0.0.1 with an ephemeral port, its output in a fresh private (0700)
+# directory under BASE, and waits for its READY line. Seatbelt has no
+# network namespaces: the profile allows outbound TCP to that one localhost
+# port, so the client talks to the proxy directly (no in-sandbox relay).
+# The proxy runs in its own session and stops by itself if this shell dies
+# without cleaning up (--parent-pid). Sets _AI_SANDBOX_NET_PROXY_PID,
+# _AI_SANDBOX_NET_PROXY_DIR and _AI_SANDBOX_NET_PROXY_TCP_PORT; on failure
+# stops what it started (_sandbox_stop_network_proxy), sets
+# _AI_SANDBOX_NET_PROXY_ERROR and returns 1. Runs in the calling shell,
+# never in $(...): the proxy's parent must be the shell that launches the
+# sandbox. Args: BASE
+_sandbox_start_network_proxy_tcp() {
+    local base="${1:-/tmp}" python_bin dir shell_pid port="" polls=0 reason
+    _AI_SANDBOX_NET_PROXY_ERROR=""
+    _AI_SANDBOX_NET_PROXY_TCP_PORT=""
+    if ! python_bin="$(type -P "${_AI_SANDBOX_PYTHON}")"; then
+        _AI_SANDBOX_NET_PROXY_ERROR="${_AI_SANDBOX_PYTHON} not found on PATH"; return 1
+    fi
+    if [[ ! -r "${_AI_SANDBOX_NET_PROXY_HELPER}" ]]; then
+        _AI_SANDBOX_NET_PROXY_ERROR="helper ${_AI_SANDBOX_NET_PROXY_HELPER} is missing"; return 1
+    fi
+    if ! dir="$(mktemp -d "${base%/}/ai-sandbox-net.XXXXXXXX" 2>&1)"; then
+        _AI_SANDBOX_NET_PROXY_ERROR="cannot create a private directory under ${base}: ${dir}"; return 1
+    fi
+    if ! chmod 0700 "${dir}"; then
+        rm -rf -- "${dir}"
+        _AI_SANDBOX_NET_PROXY_ERROR="cannot make ${dir} private"; return 1
+    fi
+    _AI_SANDBOX_NET_PROXY_DIR="${dir}"
+    # Read before the fork: an async command's words expand in the child.
+    # bash 3.2 has no BASHPID; see _sandbox_read_own_exit_trap.
+    shell_pid="${BASHPID:-$(exec sh -c 'echo "${PPID}"')}"
+    "${python_bin}" -I "${_AI_SANDBOX_NET_PROXY_HELPER}" --host 127.0.0.1 --port 0 --parent-pid "${shell_pid}" \
+        >"${dir}/ready" 2>"${dir}/proxy.log" </dev/null &
+    _AI_SANDBOX_NET_PROXY_PID=$!
+    while [[ -z "${port}" ]]; do
+        port="$(sed -n 's/^READY tcp 127\.0\.0\.1:\([1-9][0-9]*\)$/\1/p' "${dir}/ready" 2>/dev/null)"
+        [[ -n "${port}" ]] && break
+        if ! kill -0 "${_AI_SANDBOX_NET_PROXY_PID}" 2>/dev/null; then
+            reason="$(cat -- "${dir}/proxy.log" 2>/dev/null)"
+            _sandbox_stop_network_proxy
+            _AI_SANDBOX_NET_PROXY_ERROR="the proxy exited during startup (${reason:-no output})"; return 1
+        fi
+        if (( polls++ >= _AI_SANDBOX_NET_MAX_POLLS )); then
+            reason="$(cat -- "${dir}/proxy.log" 2>/dev/null)"
+            _sandbox_stop_network_proxy
+            _AI_SANDBOX_NET_PROXY_ERROR="the proxy did not report READY in time (${reason:-no output})"; return 1
+        fi
+        sleep "${_AI_SANDBOX_NET_POLL_SECONDS}"
+    done
+    _AI_SANDBOX_NET_PROXY_TCP_PORT="${port}"
+    [[ "${AI_SANDBOX_DEBUG:-0}" == "1" ]] && echo_log "DEBUG" "network proxy pid=${_AI_SANDBOX_NET_PROXY_PID} port=${port} dir=${dir}"
+    return 0
+}
+
+# Custom-profile sanity check (WS3 / U-C, hardened by #67 / CC-4). Prints
+# why the SBPL body in $1 must not launch, or nothing when it passes:
+#   header        — no (version 1) or no (deny default) form
+#   allow-default — an allow rule whose operation list names `default`,
+#                   e.g. (allow default), (allow default (with report)),
+#                   (allow file-read* default); it neutralises (deny default)
+#   syntax        — a block comment (#|), datum comment (#;) or character
+#                   literal (#\) outside a string: the scanner below cannot
+#                   tell what they hide, so it fails closed
+# The whole body is scanned, with no line limit. String literals (including
+# #"regex" strings, with backslash escapes) are blanked and `;` comments
+# dropped, so a rule in a comment or string neither satisfies nor trips the
+# check, and a `;` inside a string does not hide the rest of its line. The
+# remaining text is case-folded and whitespace-flattened, so forms split
+# across lines or extra spaces still match. This is a token match, not an
+# SBPL evaluator: rules built at run time (define, string->symbol) are not
+# seen — AI_SANDBOX_PROFILE_TRUST_ME=1 remains the explicit escape hatch.
+_sandbox_profile_violation() {
+    local body="${1}" flat="" line rest code escapes in_string=0
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        rest="${line}"
+        while [[ -n "${rest}" ]]; do
+            if [[ "${in_string}" == "1" ]]; then
+                code="${rest%%\"*}"
+                # No closing quote on this line: the string continues.
+                [[ "${code}" == "${rest}" ]] && break
+                rest="${rest:${#code}+1}"
+                # A quote preceded by an odd run of backslashes is escaped.
+                escapes="${code##*[!\\]}"
+                (( ${#escapes} % 2 == 1 )) && continue
+                in_string=0
+                flat+=' "" '
+                continue
+            fi
+            code="${rest%%[\";]*}"
+            flat+="${code}"
+            rest="${rest:${#code}}"
+            if [[ "${code}" == *'#|'* || "${code}" == *'#\'* ]]; then
+                printf 'syntax\n'
+                return 0
+            fi
+            [[ -z "${rest}" ]] && break
+            if [[ "${rest}" == ';'* ]]; then
+                if [[ "${code}" == *'#' ]]; then
+                    printf 'syntax\n'
+                    return 0
+                fi
+                break
+            fi
+            rest="${rest:1}"
+            in_string=1
+        done
+        flat+=" "
+    done <<< "${body}"
+    flat="$(printf '%s' "${flat}" | tr '[:upper:]' '[:lower:]' | tr -s '[:space:]' ' ')"
+
+    local ws='[[:space:]]*' wsp='[[:space:]]+'
+    local version_re="\(${ws}version${wsp}1${ws}\)"
+    local deny_re="\(${ws}deny${wsp}default${ws}\)"
+    local allow_re="\(${ws}allow(${wsp}[^()\"[:space:]]+)*${wsp}default([[:space:]]|[()])"
+    if [[ ! "${flat}" =~ ${version_re} || ! "${flat}" =~ ${deny_re} ]]; then
+        printf 'header\n'
+        return 0
+    fi
+    if [[ "${flat}" =~ ${allow_re} ]]; then
+        printf 'allow-default\n'
+    fi
+    return 0
+}
+
 _run_sandboxed_agent_impl() {
     local cmd="${1}"
     shift
@@ -120,9 +247,11 @@ _run_sandboxed_agent_impl() {
     # AI_SANDBOX_EXTRA_{RW,RO}_DIRS: comma-separated absolute paths that
     # extend the per-call bind list without patching individual wrappers.
     # Populated by the interactive Settings sub-menu (str catalog entries
-    # in ai_wrapper_lib.bash) or set directly in the environment. Missing
-    # or non-directory entries WARN and are skipped rather than failing
-    # the launch.
+    # in ai_wrapper_lib.bash) or set directly in the environment. Entries
+    # are resolved by _sandbox_resolve_extra_dir (ai_agent_universal_wrapper
+    # .bash) before they are granted or classified: missing entries WARN
+    # and are skipped, entries that exist but do not resolve to a directory
+    # refuse the launch.
     # Entries accepted from AI_SANDBOX_EXTRA_{RW,RO}_DIRS, tracked separately
     # from binds_rw/binds_ro (which at this point already carry the
     # wrapper's own trusted binds parsed from --bind/--ro-bind above, e.g.
@@ -132,8 +261,9 @@ _run_sandboxed_agent_impl() {
     # also flag those trusted binds and refuse every launch.
     # Tilde is preserved verbatim in preset files; quoted [[ -d ]] does not
     # expand it, so use parameter substitution to expand a leading ~ to $HOME.
-    local -a _user_extra_bind_dirs=()
-    local _extra_dirs_ifs _d
+    # _user_extra_bind_dirs: resolved (granted); _user_extra_bind_names: as given.
+    local -a _user_extra_bind_dirs=() _user_extra_bind_names=()
+    local _extra_dirs_ifs _d _d_resolved _d_rc
     if [[ -n "${AI_SANDBOX_EXTRA_RW_DIRS:-}" ]]; then
         _extra_dirs_ifs="${IFS}"; IFS=','
         for _d in ${AI_SANDBOX_EXTRA_RW_DIRS}; do
@@ -141,13 +271,16 @@ _run_sandboxed_agent_impl() {
             _d="${_d%"${_d##*[![:space:]]}"}"
             [[ -z "${_d}" ]] && continue
             _d="${_d/#\~/${HOME}}"
-            if [[ -d "${_d}" ]]; then
-                binds_rw+=("${_d}")
-                _user_extra_bind_dirs+=("${_d}")
-                _sandbox_warn_extra_rw_git "${tag}" "${_d}"
-            else
-                echo_log "WARN" "[${tag}] AI_SANDBOX_EXTRA_RW_DIRS: skipping '${_d}' (not a directory)"
+            _d_resolved="$(_sandbox_resolve_extra_dir "${tag}" AI_SANDBOX_EXTRA_RW_DIRS "${_d}")"; _d_rc=$?
+            (( _d_rc == 2 )) && continue
+            if (( _d_rc != 0 )); then
+                IFS="${_extra_dirs_ifs}"
+                return 1
             fi
+            binds_rw+=("${_d_resolved}")
+            _user_extra_bind_dirs+=("${_d_resolved}")
+            _user_extra_bind_names+=("${_d}")
+                _sandbox_warn_extra_rw_git "${tag}" "${_d_resolved}"
         done
         IFS="${_extra_dirs_ifs}"
     fi
@@ -158,12 +291,15 @@ _run_sandboxed_agent_impl() {
             _d="${_d%"${_d##*[![:space:]]}"}"
             [[ -z "${_d}" ]] && continue
             _d="${_d/#\~/${HOME}}"
-            if [[ -d "${_d}" ]]; then
-                binds_ro+=("${_d}")
-                _user_extra_bind_dirs+=("${_d}")
-            else
-                echo_log "WARN" "[${tag}] AI_SANDBOX_EXTRA_RO_DIRS: skipping '${_d}' (not a directory)"
+            _d_resolved="$(_sandbox_resolve_extra_dir "${tag}" AI_SANDBOX_EXTRA_RO_DIRS "${_d}")"; _d_rc=$?
+            (( _d_rc == 2 )) && continue
+            if (( _d_rc != 0 )); then
+                IFS="${_extra_dirs_ifs}"
+                return 1
             fi
+            binds_ro+=("${_d_resolved}")
+            _user_extra_bind_dirs+=("${_d_resolved}")
+            _user_extra_bind_names+=("${_d}")
         done
         IFS="${_extra_dirs_ifs}"
     fi
@@ -259,10 +395,11 @@ _run_sandboxed_agent_impl() {
     # wrapper's own trusted binds (~/.claude, ~/.claude.json, glab-cli
     # dirs, etc.) parsed earlier in this function.
     if [[ "${AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR:-}" != "1" ]]; then
-        local _sens_bind _sens_resolved
-        for _sens_bind in "${_user_extra_bind_dirs[@]+"${_user_extra_bind_dirs[@]}"}"; do
-            _sens_resolved="$(_realpath "${_sens_bind}" 2>/dev/null)" || _sens_resolved="${_sens_bind%/}"
-            case "$(_sandbox_sensitive_dir_kind "${_sens_resolved}" "${resolved_home}")" in
+        local _sens_bind _sens_resolved _sens_i
+        for (( _sens_i = 0; _sens_i < ${#_user_extra_bind_dirs[@]}; _sens_i++ )); do
+            _sens_bind="${_user_extra_bind_names[_sens_i]}"
+            _sens_resolved="${_user_extra_bind_dirs[_sens_i]}"
+            case "$(_sandbox_sensitive_pair_kind "${_sens_bind}" "${_sens_resolved}" "${HOME%/}" "${resolved_home}")" in
                 system)
                     echo_log "ERROR" "[${tag}] Refusing extra bind '${_sens_bind}' (top-level or system location). Remove it from AI_SANDBOX_EXTRA_RW_DIRS/AI_SANDBOX_EXTRA_RO_DIRS, or set AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 to override."
                     return 1
@@ -277,7 +414,7 @@ _run_sandboxed_agent_impl() {
                     ;;
             esac
         done
-        unset _sens_bind _sens_resolved
+        unset _sens_bind _sens_resolved _sens_i
     fi
 
     # WS3 / U-E: yellow-warn when WORKDIR is a direct $HOME child that
@@ -479,6 +616,15 @@ _run_sandboxed_agent_impl() {
     local block_localhost="${AI_SANDBOX_BLOCK_LOCALHOST:-0}"
     [[ "${block_localhost}" == "1" ]] || block_localhost=0
 
+    # Network (#78): restricted unless AI_SANDBOX_ALLOW_UNRESTRICTED_NET=1
+    # (any other value keeps the restriction). The SBPL profile branches on
+    # ALLOW_UNRESTRICTED_NET; the proxy is started just before the launch.
+    local allow_unrestricted_net="${AI_SANDBOX_ALLOW_UNRESTRICTED_NET:-0}"
+    [[ "${allow_unrestricted_net}" == "1" ]] || allow_unrestricted_net=0
+    if [[ "${allow_unrestricted_net}" == "1" ]]; then
+        echo_log "WARNING" "[${tag}] AI_SANDBOX_ALLOW_UNRESTRICTED_NET=1: the sandbox has open networking; the agent can reach services on this machine (localhost), your LAN and cloud metadata endpoints, and send traffic anywhere without the egress proxy."
+    fi
+
     # ALLOW_DOCKER gates the RW bind for the Docker / Colima sockets in the
     # SBPL profile. Default "0": the agent has no access to the local Docker
     # daemon. With a running daemon, RW on the socket is a full sandbox escape
@@ -488,6 +634,13 @@ _run_sandboxed_agent_impl() {
     # re-enable the sockets.
     local allow_docker="${AI_SANDBOX_ALLOW_DOCKER:-0}"
     [[ "${allow_docker}" == "1" ]] || allow_docker=0
+
+    # ALLOW_KEYCHAIN gates the ~/Library/Keychains file grant and the
+    # SecurityServer / securityd Mach lookups in the SBPL profile (#67 / M1).
+    # Default "0": the agent can neither open keychain files nor ask
+    # securityd for items. Any non-"1" value normalises to "0".
+    local allow_keychain="${AI_SANDBOX_ALLOW_KEYCHAIN:-0}"
+    [[ "${allow_keychain}" == "1" ]] || allow_keychain=0
 
     # Env scrubbing (Phase 1 of the sandbox-migration plan; closes U-A/U-B).
     # Without this, the agent inherits the parent shell's full environment,
@@ -676,43 +829,23 @@ _run_sandboxed_agent_impl() {
     # override pointing at a permissive profile like
     #   (version 1) (allow default)
     # would silently nullify the sandbox. The base SBPL contract is
-    # (version 1) followed by (deny default) — verify both are present
-    # somewhere in the first 80 non-comment, non-blank lines. If the
-    # check fails, refuse to launch unless the operator has explicitly
-    # set AI_SANDBOX_PROFILE_TRUST_ME=1 (red-banner opt-out).
-    #
-    # The check is intentionally cheap: a string-grep against the
-    # profile body, not a full SBPL parse. False positives are
-    # tolerable (the operator can set TRUST_ME=1) and false negatives
-    # ("profile has the right magic strings in a comment but no actual
-    # rule") are caught by the kernel parser downstream.
+    # (version 1) plus (deny default) and no broad default allowance; see
+    # _sandbox_profile_violation for what is matched. If the check fails,
+    # refuse to launch unless the operator has explicitly set
+    # AI_SANDBOX_PROFILE_TRUST_ME=1 (red-banner opt-out). False positives
+    # are tolerable (the operator can set TRUST_ME=1); a profile that has
+    # the right forms but does not parse is caught by the kernel parser.
     if [[ "${AI_SANDBOX_PROFILE_TRUST_ME:-0}" != "1" ]]; then
-        local _p_signal _p_version_seen=0 _p_deny_seen=0 _p_allow_default_seen=0 _p_line _p_inspected=0
-        while IFS= read -r _p_line; do
-            # Strip leading whitespace.
-            _p_signal="${_p_line#"${_p_line%%[![:space:]]*}"}"
-            # Skip blanks and SBPL comments (`;;`).
-            [[ -z "${_p_signal}" ]] && continue
-            [[ "${_p_signal}" == ';'* ]] && continue
-            _p_inspected=$((_p_inspected + 1))
-            [[ "${_p_signal}" == '(version 1)'* ]]   && _p_version_seen=1
-            [[ "${_p_signal}" == '(deny default)'* ]] && _p_deny_seen=1
-            # An `(allow default)` line — anywhere in the inspected window —
-            # neutralises the `(deny default)` fence that the rest of this
-            # block tries to enforce. The two strings can coexist in a
-            # profile that still passes the version/deny presence check, so
-            # we have to actively reject this case.
-            [[ "${_p_signal}" == '(allow default)'* ]] && _p_allow_default_seen=1
-            # Bail early; profile is invalid if version isn't first.
-            [[ ${_p_inspected} -ge 80 ]] && break
-        done <<< "${profile}"
-        if [[ "${_p_version_seen}" != "1" || "${_p_deny_seen}" != "1" ]]; then
-            echo_log "ERROR" "[${tag}] Sandbox profile ${profile_path} lacks (version 1) and/or (deny default) in the first 80 non-comment lines. A permissive profile silently neutralizes the sandbox; refusing to launch."
-            echo_log "ERROR" "[${tag}] If this profile is intentional, set AI_SANDBOX_PROFILE_TRUST_ME=1 to bypass this check. Red banner will be shown at menu launch."
-            return 1
-        fi
-        if [[ "${_p_allow_default_seen}" == "1" ]]; then
-            echo_log "ERROR" "[${tag}] Sandbox profile ${profile_path} contains an (allow default) rule in the first 80 non-comment lines. (allow default) neutralises (deny default) and leaves the sandbox fully permissive; refusing to launch."
+        local _p_violation; _p_violation="$(_sandbox_profile_violation "${profile}")"
+        case "${_p_violation}" in
+            header)
+                echo_log "ERROR" "[${tag}] Sandbox profile ${profile_path} lacks (version 1) and/or (deny default) outside comments and strings. A permissive profile silently neutralizes the sandbox; refusing to launch." ;;
+            allow-default)
+                echo_log "ERROR" "[${tag}] Sandbox profile ${profile_path} contains an (allow default) rule. (allow default) neutralises (deny default) and leaves the sandbox fully permissive; refusing to launch." ;;
+            syntax)
+                echo_log "ERROR" "[${tag}] Sandbox profile ${profile_path} uses a block comment (#|), datum comment (#;) or character literal (#\\) the safety check cannot verify; refusing to launch." ;;
+        esac
+        if [[ -n "${_p_violation}" ]]; then
             echo_log "ERROR" "[${tag}] If this profile is intentional, set AI_SANDBOX_PROFILE_TRUST_ME=1 to bypass this check. Red banner will be shown at menu launch."
             return 1
         fi
@@ -756,6 +889,39 @@ _run_sandboxed_agent_impl() {
         profile+="${extra_rules}"
     fi
 
+    # Restricted network: start the host proxy and point the client at it.
+    # The proxy variables replace any already in the allowlist and are set
+    # after AI_SANDBOX_PASS_ENV and the _extra_sandbox_setup hook, so no
+    # passthrough can point clients elsewhere (Seatbelt would refuse a
+    # direct connection anyway). The proxy's directory goes in the per-user
+    # temp dir (0700 parent, outside the shared /tmp). Fails closed: a proxy
+    # that cannot start refuses the launch.
+    local proxy_port=0 previous_exit_trap="" _proxy_var _proxy_kv
+    if [[ "${allow_unrestricted_net}" != "1" ]]; then
+        if ! _sandbox_start_network_proxy_tcp "${darwin_user_tmp}"; then
+            echo_log "ERROR" "[${tag}] Cannot start the sandbox network proxy: ${_AI_SANDBOX_NET_PROXY_ERROR}. Fix it, or set AI_SANDBOX_ALLOW_UNRESTRICTED_NET=1 to allow open networking without filtering."
+            return 1
+        fi
+        proxy_port="${_AI_SANDBOX_NET_PROXY_TCP_PORT}"
+        # Stops the proxy if the shell exits or is killed (SIGHUP, SIGTERM)
+        # during the session; restored after the launch below.
+        _sandbox_read_own_exit_trap
+        previous_exit_trap="${_AI_SANDBOX_OWN_EXIT_TRAP}"
+        # shellcheck disable=SC2064  # the tag is expanded (and quoted) now
+        trap "_sandbox_stop_network_proxy $(printf '%q' "${tag}")" EXIT
+        local -a _proxy_env=()
+        for _proxy_kv in "${env_allowlist[@]+"${env_allowlist[@]}"}"; do
+            case "${_proxy_kv%%=*}" in
+                http_proxy|https_proxy|HTTP_PROXY|HTTPS_PROXY|all_proxy|ALL_PROXY) continue ;;
+            esac
+            _proxy_env+=("${_proxy_kv}")
+        done
+        for _proxy_var in http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY; do
+            _proxy_env+=("${_proxy_var}=http://127.0.0.1:${proxy_port}")
+        done
+        env_allowlist=("${_proxy_env[@]}")
+    fi
+
     # Run the sandboxed process in a subshell so locals here don't leak into
     # the caller's shell. Rlimits used to be applied here in the same subshell;
     # all rlimit enforcement was dropped (see "Deferred: rlimits" in
@@ -787,7 +953,10 @@ _run_sandboxed_agent_impl() {
             -D "PASS_GITLAB=${pass_gitlab}"
             -D "ENABLE_SIGNPOST=${enable_signpost}"
             -D "BLOCK_LOCALHOST=${block_localhost}"
+            -D "ALLOW_UNRESTRICTED_NET=${allow_unrestricted_net}"
+            -D "PROXY_PORT=${proxy_port}"
             -D "ALLOW_DOCKER=${allow_docker}"
+            -D "ALLOW_KEYCHAIN=${allow_keychain}"
         )
         if [[ "${enable_signpost}" == "1" ]]; then
             sandbox_argv+=(-D "DARWIN_USER_SIGNPOST_DIR=${darwin_user_signpost}")
@@ -829,6 +998,15 @@ _run_sandboxed_agent_impl() {
         exec env -i "${env_allowlist[@]}" sandbox-exec "${sandbox_argv[@]}"
     )
     local exit_code=$?
+    if [[ "${allow_unrestricted_net}" != "1" ]]; then
+        _sandbox_stop_network_proxy "${tag}"
+        # Hand this shell's own EXIT trap back (none: clear ours).
+        if [[ -n "${previous_exit_trap}" ]]; then
+            eval "${previous_exit_trap}"
+        else
+            trap - EXIT
+        fi
+    fi
 
     case ${exit_code} in
         0)   ;;
@@ -868,85 +1046,6 @@ _check_workdir_breadth() {
     echo_log "WARN" "[${tag}] WORKDIR=${wd} is a direct \$HOME child outside the project-dir allowlist (Workspace/Projects/src/code/bin/work/dev/repos). The write fence grants RW on every file under it. cd one level deeper if that's broader than you intend."
     export AI_SANDBOX_WORKDIR_WARNING="${wd}"
     return 0
-}
-
-# Resolve a path canonically. macOS lacks GNU `readlink -f`; use perl as the
-# fallback that ships in the base system. Returns non-zero (and prints nothing)
-# if no resolver is available or the resolution fails — callers must check.
-# We deliberately don't synthesize an unresolved fallback: symlink-mismatched
-# paths silently break sandbox rules, which is worse than failing loudly.
-_realpath() {
-    local p="${1}" out
-    if command -v realpath >/dev/null 2>&1; then
-        if out="$(realpath "${p}" 2>/dev/null)" && [[ -n "${out}" ]]; then
-            [[ "${AI_SANDBOX_DEBUG:-0}" == "1" ]] && echo_log "DEBUG" "_realpath: branch=realpath path=${p}"
-            echo "${out}"
-            return 0
-        fi
-    fi
-    if command -v perl >/dev/null 2>&1; then
-        if out="$(perl -MCwd=abs_path -e 'my $r = abs_path($ARGV[0]); print $r if defined $r' "${p}" 2>/dev/null)" && [[ -n "${out}" ]]; then
-            [[ "${AI_SANDBOX_DEBUG:-0}" == "1" ]] && echo_log "DEBUG" "_realpath: branch=perl-abs_path path=${p}"
-            echo "${out}"
-            return 0
-        fi
-    fi
-    # Last-ditch: canonicalize via `cd … && pwd -P`. Works for directories
-    # directly; for files, follow any final-component symlinks via readlink
-    # (capped to a small depth to prevent loops) before resolving the parent
-    # and re-attaching the basename so symlinks in the directory chain are
-    # also resolved.
-    local parent base resolved_parent
-    if [[ -d "${p}" ]]; then
-        if out="$( cd "${p}" 2>/dev/null && pwd -P )" && [[ -n "${out}" ]]; then
-            [[ "${AI_SANDBOX_DEBUG:-0}" == "1" ]] && echo_log "DEBUG" "_realpath: branch=cd-pwd-dir path=${p}"
-            echo "${out}"
-            return 0
-        fi
-    elif [[ -e "${p}" || -L "${p}" ]]; then
-        local cur="${p}" target depth=0
-        # Cycle detection: the depth cap protects against unbounded
-        # recursion, but a tight loop (a → b → a) would otherwise spin up
-        # to 40 iterations and then silently return a non-canonical
-        # intermediate path. Track visited paths and bail the moment we
-        # revisit one. Bash 3.2-compatible: linear scan of a small array
-        # (cap is the depth limit, so ~40 entries max).
-        local -a seen=()
-        local _s_i
-        while [[ -L "${cur}" && ${depth} -lt 40 ]]; do
-            seen+=("${cur}")
-            target="$(readlink "${cur}" 2>/dev/null)" || break
-            [[ -z "${target}" ]] && break
-            if [[ "${target}" == /* ]]; then
-                cur="${target}"
-            else
-                cur="$(dirname -- "${cur}")/${target}"
-            fi
-            depth=$((depth + 1))
-            for (( _s_i = 0; _s_i < ${#seen[@]}; _s_i++ )); do
-                if [[ "${seen[$_s_i]}" == "${cur}" ]]; then
-                    [[ "${AI_SANDBOX_DEBUG:-0}" == "1" ]] && echo_log "DEBUG" "_realpath: symlink cycle detected path=${p} depth=${depth}"
-                    return 1
-                fi
-            done
-        done
-        # After following the chain, the target might itself be a directory.
-        if [[ -d "${cur}" ]]; then
-            if out="$( cd "${cur}" 2>/dev/null && pwd -P )" && [[ -n "${out}" ]]; then
-                [[ "${AI_SANDBOX_DEBUG:-0}" == "1" ]] && echo_log "DEBUG" "_realpath: branch=cd-pwd-symlink-walk-dir path=${p} depth=${depth}"
-                echo "${out}"
-                return 0
-            fi
-        fi
-        parent="$(dirname -- "${cur}")"
-        base="$(basename -- "${cur}")"
-        if resolved_parent="$( cd "${parent}" 2>/dev/null && pwd -P )" && [[ -n "${resolved_parent}" ]]; then
-            [[ "${AI_SANDBOX_DEBUG:-0}" == "1" ]] && echo_log "DEBUG" "_realpath: branch=cd-pwd-symlink-walk-file path=${p} depth=${depth}"
-            echo "${resolved_parent%/}/${base}"
-            return 0
-        fi
-    fi
-    return 1
 }
 
 # Reject paths containing characters that would break SBPL string literals or

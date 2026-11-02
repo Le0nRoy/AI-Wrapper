@@ -104,82 +104,15 @@ _wrapper_add_meta_bind() {
 }
 
 # ===== PORTABLE PATH-RESOLUTION HELPERS =====
-# _realpath / _check_workdir_breadth normally live in
+# _realpath lives in ai_agent_universal_wrapper.bash (sourced before this
+# file, see Prerequisites above). _check_workdir_breadth normally lives in
 # ai_wrapper_data/macos_sandbox_exec.bash, but that file is only sourced
 # lazily inside run_sandboxed_agent() when $(uname -s) == Darwin — it is
-# NOT available here, before the menu, on any OS. Both helpers are
-# OS-generic in their own implementation (realpath(1)/perl/pure-bash
-# fallback chain; plain string comparisons), so they are duplicated here
-# (structurally equivalent to macos_sandbox_exec.bash) rather than invented
-# differently, to keep behavior identical to whatever the macOS backend does
-# with the same inputs later in the run.
-_realpath() {
-    local p="${1}" out
-    if command -v realpath >/dev/null 2>&1; then
-        if out="$(realpath "${p}" 2>/dev/null)" && [[ -n "${out}" ]]; then
-            [[ "${AI_SANDBOX_DEBUG:-0}" == "1" ]] && echo_log "DEBUG" "_realpath: branch=realpath path=${p}"
-            echo "${out}"
-            return 0
-        fi
-    fi
-    if command -v perl >/dev/null 2>&1; then
-        if out="$(perl -MCwd=abs_path -e 'my $r = abs_path($ARGV[0]); print $r if defined $r' "${p}" 2>/dev/null)" && [[ -n "${out}" ]]; then
-            [[ "${AI_SANDBOX_DEBUG:-0}" == "1" ]] && echo_log "DEBUG" "_realpath: branch=perl-abs_path path=${p}"
-            echo "${out}"
-            return 0
-        fi
-    fi
-    # Last-ditch: canonicalize via `cd … && pwd -P`. Works for directories
-    # directly; for files, follow any final-component symlinks via readlink
-    # (capped to a small depth to prevent loops) before resolving the parent
-    # and re-attaching the basename so symlinks in the directory chain are
-    # also resolved.
-    local parent base resolved_parent
-    if [[ -d "${p}" ]]; then
-        if out="$( cd "${p}" 2>/dev/null && pwd -P )" && [[ -n "${out}" ]]; then
-            [[ "${AI_SANDBOX_DEBUG:-0}" == "1" ]] && echo_log "DEBUG" "_realpath: branch=cd-pwd-dir path=${p}"
-            echo "${out}"
-            return 0
-        fi
-    elif [[ -e "${p}" || -L "${p}" ]]; then
-        local cur="${p}" target depth=0
-        local -a seen=()
-        local _s_i
-        while [[ -L "${cur}" && ${depth} -lt 40 ]]; do
-            seen+=("${cur}")
-            target="$(readlink "${cur}" 2>/dev/null)" || break
-            [[ -z "${target}" ]] && break
-            if [[ "${target}" == /* ]]; then
-                cur="${target}"
-            else
-                cur="$(dirname -- "${cur}")/${target}"
-            fi
-            depth=$((depth + 1))
-            for (( _s_i = 0; _s_i < ${#seen[@]}; _s_i++ )); do
-                if [[ "${seen[$_s_i]}" == "${cur}" ]]; then
-                    [[ "${AI_SANDBOX_DEBUG:-0}" == "1" ]] && echo_log "DEBUG" "_realpath: symlink cycle detected path=${p} depth=${depth}"
-                    return 1
-                fi
-            done
-        done
-        if [[ -d "${cur}" ]]; then
-            if out="$( cd "${cur}" 2>/dev/null && pwd -P )" && [[ -n "${out}" ]]; then
-                [[ "${AI_SANDBOX_DEBUG:-0}" == "1" ]] && echo_log "DEBUG" "_realpath: branch=cd-pwd-symlink-walk-dir path=${p} depth=${depth}"
-                echo "${out}"
-                return 0
-            fi
-        fi
-        parent="$(dirname -- "${cur}")"
-        base="$(basename -- "${cur}")"
-        if resolved_parent="$( cd "${parent}" 2>/dev/null && pwd -P )" && [[ -n "${resolved_parent}" ]]; then
-            [[ "${AI_SANDBOX_DEBUG:-0}" == "1" ]] && echo_log "DEBUG" "_realpath: branch=cd-pwd-symlink-walk-file path=${p} depth=${depth}"
-            echo "${resolved_parent%/}/${base}"
-            return 0
-        fi
-    fi
-    return 1
-}
-
+# NOT available here, before the menu, on any OS. It is OS-generic (plain
+# string comparisons), so it is duplicated here (structurally equivalent to
+# macos_sandbox_exec.bash) rather than invented differently, to keep
+# behavior identical to whatever the macOS backend does with the same
+# inputs later in the run.
 # WS3 / U-E: emit a one-line WARN and set $AI_SANDBOX_WORKDIR_WARNING when
 # WORKDIR is a direct $HOME child outside the project-dir allowlist
 # (Workspace/Projects/src/code/bin/work/dev/repos and lowercase variants).
@@ -995,31 +928,85 @@ _wrapper_protect_workdir_git() {
     return 0
 }
 
+# Locations, relative to the resolved $HOME, that a symlinked agent config
+# path must not resolve to, into, or above (_wrapper_check_config_symlink):
+# credential stores the sandbox otherwise exposes only behind explicit
+# PASS_* opt-ins, files and dirs the host shell, git or session manager
+# runs or loads (an RW bind there is host code execution), and the paths
+# kept read-only by default (~/bin, the shared skill source; #62).
+# "Above" makes the broad roots holding them (~/.config, ~/.local,
+# ~/.local/share, ~/Library, ...) refusals too. A denylist: anything not
+# listed under $HOME stays accepted (relocated, dotpath and multi-account
+# profiles such as ~/.config/claude, ~/.claude-work, ~/profiles/codex).
+_WRAPPER_CONFIG_SYMLINK_DENIED=(
+    .ssh .gnupg .aws .azure .kube .docker .colima .podman
+    .netrc .npmrc .pypirc .git-credentials .password-store .gitconfig
+    .config/git .config/gh .config/gcloud .config/glab-cli .config/containers
+    .config/systemd .config/autostart .config/environment.d
+    .local/share/glab-cli .local/share/keyrings .local/bin
+    "Library/Application Support/glab-cli" Library/Keychains Library/LaunchAgents
+    .bashrc .bash_profile .bash_login .bash_logout .profile
+    .zshrc .zshenv .zprofile .zlogin .zlogout .config/fish
+    bin ai-wrapper/.agents
+)
+# Broad roots refused even when nothing listed above exists below them.
+_WRAPPER_CONFIG_SYMLINK_BROAD_ROOTS=(
+    .config .local .local/share .local/state .cache
+    Library "Library/Application Support"
+)
+
 # Guard for an agent config path (~/.claude, ~/.codex, ~/.<agent>-<name>,
-# ~/.claude-<name>.json) that the wrapper binds RW. If PATH is a symlink,
-# its target must resolve strictly under $HOME and outside the credential
-# locations the sandbox otherwise only exposes behind explicit PASS_*
-# opt-ins — a planted symlink must not turn the account bind into RW on
-# ~/.ssh, $HOME or /etc. Non-symlinks pass (callers check type/existence).
+# ~/.claude-<name>.json, ~/.copilot, Antigravity's profile config/) that
+# the wrapper binds RW. Applies when PATH is a symlink, or resolves
+# elsewhere than its spelling because an ancestor is one; other paths pass
+# (callers check type/existence and may create them).
+#   Mandatory validation: the symlink must resolve, without a loop, to an
+#   existing target (a dangling link would let touch/mkdir create the
+#   target before the bind).
+#   Authorization: the target must lie strictly under $HOME, not be $HOME
+#   or a broad root (_WRAPPER_CONFIG_SYMLINK_BROAD_ROOTS), and not sit in,
+#   at, or above a _WRAPPER_CONFIG_SYMLINK_DENIED location — a planted
+#   symlink must not turn the account bind into RW on ~/.ssh, ~/.bashrc,
+#   ~/.config or /etc.
 # Prints an ERROR and returns 1 on refusal. Args: PATH
 _wrapper_check_config_symlink() {
-    local p="${1}" resolved home cred
-    [[ -L "${p}" ]] || return 0
-    if ! resolved="$(_realpath "${p}")" || [[ -z "${resolved}" ]]; then
-        echo "ERROR: ${p} is a symlink whose target cannot be resolved. Inspect and remove before launching." >&2
-        return 1
-    fi
-    home="$(_realpath "${HOME}")" || home="${HOME%/}"
+    local p="${1%/}" resolved home raw_home expected entry kind=symlink
+    raw_home="${HOME%/}"
+    home="$(_realpath "${HOME}")" || home="${raw_home}"
     home="${home%/}"
-    if [[ -z "${home}" || "${resolved}" != "${home}"/* ]]; then
-        echo "ERROR: ${p} is a symlink pointing outside \$HOME (resolves to ${resolved}). Refusing — the bind would grant RW on the target." >&2
+    if [[ ! -L "${p}" ]]; then
+        [[ -e "${p}" ]] || return 0
+        resolved="$(_realpath "${p}")" || resolved=""
+        case "${p}" in
+            "${raw_home}"/*) expected="${home}/${p#"${raw_home}"/}" ;;
+            *) expected="${p}" ;;
+        esac
+        [[ -n "${resolved}" && "${resolved%/}" == "${expected}" ]] && return 0
+        kind="path behind a symlinked parent"
+    fi
+    if ! resolved="$(_realpath "${p}")" || [[ -z "${resolved}" ]]; then
+        echo "ERROR: ${p} is a ${kind} whose target cannot be resolved (symlink loop or unreadable). Inspect and remove before launching." >&2
         return 1
     fi
-    for cred in .ssh .gnupg .aws .kube .docker .colima .netrc .npmrc .pypirc \
-            .config/gcloud .config/glab-cli .local/share/glab-cli \
-            "Library/Application Support/glab-cli"; do
-        if [[ "${resolved}" == "${home}/${cred}" || "${resolved}" == "${home}/${cred}"/* ]]; then
-            echo "ERROR: ${p} is a symlink into a credential location (resolves to ${resolved}). Refusing — the bind would grant RW on it." >&2
+    resolved="${resolved%/}"
+    if [[ ! -e "${resolved}" ]]; then
+        echo "ERROR: ${p} is a ${kind} whose target does not exist (resolves to ${resolved}). Create the target or remove the link before launching." >&2
+        return 1
+    fi
+    if [[ -z "${home}" || "${resolved}" != "${home}"/* ]]; then
+        echo "ERROR: ${p} is a ${kind} pointing outside \$HOME (resolves to ${resolved}). Refusing — the bind would grant RW on the target." >&2
+        return 1
+    fi
+    for entry in "${_WRAPPER_CONFIG_SYMLINK_BROAD_ROOTS[@]}"; do
+        if [[ "${resolved}" == "${home}/${entry}" ]]; then
+            echo "ERROR: ${p} is a ${kind} to a broad directory (resolves to ${resolved}). Refusing — point it at a dedicated directory such as ${home}/${entry}/<agent>." >&2
+            return 1
+        fi
+    done
+    for entry in "${_WRAPPER_CONFIG_SYMLINK_DENIED[@]}"; do
+        if [[ "${resolved}" == "${home}/${entry}" || "${resolved}" == "${home}/${entry}"/* \
+                || "${home}/${entry}" == "${resolved}"/* ]]; then
+            echo "ERROR: ${p} is a ${kind} into or above a credential location or host-executed path (${home}/${entry}; resolves to ${resolved}). Refusing — the bind would grant RW on it." >&2
             return 1
         fi
     done
@@ -1100,10 +1087,12 @@ if [[ "${_wrapper_os}" == "Darwin" ]]; then
     _ai_sensitive_workdir_extra=", ~/Library"
     _ai_sensitive_workdir_system=", and binding those or a top-level system directory as extra RW/RO dirs; launching from a system directory stays refused on macOS"
     _ai_gitlab_bind_note="RO-binds ~/Library/Application Support/glab-cli"
+    _ai_docker_rootless_note=""
 else
     _ai_sensitive_workdir_extra=""
     _ai_sensitive_workdir_system=", or a top-level system directory, and binding such dirs as extra RW/RO dirs"
     _ai_gitlab_bind_note="RO-binds the XDG glab-cli config paths (~/.config/glab-cli, ~/.local/share/glab-cli)"
+    _ai_docker_rootless_note=" Also shares the rootless Docker and Podman sockets (\$XDG_RUNTIME_DIR/docker.sock, \$XDG_RUNTIME_DIR/podman/podman.sock) when they exist."
 fi
 
 # Order here is the display order in both views; categories are
@@ -1116,8 +1105,9 @@ _AI_SETTINGS_LIST=(
 
     # Additional settings (env vars, profiles)
     "AI_SANDBOX_PASS_ENV|str||red|Pass extra env vars by name|Comma-separated list of variable names to share (advanced)|additional"
-    "AI_SANDBOX_EXTRA_RW_DIRS|str||yellow|Extra read-write bind directories|Comma-separated absolute paths granted RW inside the sandbox (in addition to WORKDIR). Missing entries WARN and are skipped.|additional"
-    "AI_SANDBOX_EXTRA_RO_DIRS|str||yellow|Extra read-only bind directories|Comma-separated absolute paths granted RO inside the sandbox. Missing entries WARN and are skipped.|additional"
+    "AI_SANDBOX_EXTRA_RW_DIRS|str||yellow|Extra read-write bind directories|Comma-separated absolute paths granted RW inside the sandbox (in addition to WORKDIR), at their resolved path. Missing entries WARN and are skipped; an entry that does not resolve to a directory refuses the launch.|additional"
+    "AI_SANDBOX_EXTRA_RO_DIRS|str||yellow|Extra read-only bind directories|Comma-separated absolute paths granted RO inside the sandbox, at their resolved path. Missing entries WARN and are skipped; an entry that does not resolve to a directory refuses the launch.|additional"
+    "AI_SANDBOX_ALLOW_ANDROID|bool|0|yellow|Share ~/Android (read-write)|Binds ~/Android RW (Android SDK, emulator images, debug keystores). The agent can change SDK tools the host runs later. Off: ~/Android is not visible inside the sandbox.|additional|linux"
     "AI_SANDBOX_PROFILE|path||red|Custom sandbox profile override|Path to a custom SBPL file. Default: ai_wrapper_data/claude_wrapper.sb. Set only if you have a custom restrictions file.|additional|darwin"
     "AI_SANDBOX_PROFILE_TRUST_ME|bool|0|red|Skip safety check on custom profile|Bypasses the (version 1) + (deny default) validation. Set only if your profile intentionally relaxes the sandbox.|additional|darwin"
 
@@ -1125,6 +1115,11 @@ _AI_SETTINGS_LIST=(
     "AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR|bool|0|red|Allow launch from sensitive dirs|Permits launching from \$HOME itself, a dotfile dir directly under \$HOME${_ai_sensitive_workdir_extra}${_ai_sensitive_workdir_system} — the write fence then grants RW there, which likely exposes credentials|sensitive"
     "AI_SANDBOX_ALLOW_GIT_CONFIG|bool|0|red|Allow editing git config and hooks|Leaves WORKDIR's .git/config, hooks/, config.worktree and submodule config/hooks (also a linked worktree's own submodules) writable so git config, remote add and push -u work. The agent can then make host git run any command. Off: those edits and tracking-branch setup fail; commits, local branches and checkouts still work.|sensitive"
     "AI_SANDBOX_ALLOW_EXTERNAL_WORKTREES|bool|0|yellow|Allow git in worktrees of repos outside \$HOME|For a linked worktree whose repository's shared .git lies outside \$HOME (e.g. /Data/...), binds exactly that .git after the same link and path checks as \$HOME repos; its config, hooks/ and other worktrees stay read-only. System, temp and hidden locations are refused. This session only: never saved to or restored from the per-workdir preset.|sensitive"
+    "AI_SANDBOX_ALLOW_BIN_RW|bool|0|red|Allow writing ~/bin|Binds ~/bin RW instead of read-only. ~/bin is first on the sandbox PATH and on yours, so the agent can plant or replace programs you later run outside the sandbox. Off: ~/bin stays usable (read and run) but not writable.|sensitive|linux"
+    "AI_SANDBOX_ALLOW_AGENTS_SKILLS_RW|bool|0|red|Allow editing the shared agent-skill source|Binds ~/ai-wrapper/.agents RW instead of read-only. setup_skills copies it into every client's skill dir, so the agent can rewrite skills other clients and sessions load. Off: skills stay readable but not writable.|sensitive|linux"
+    "AI_SANDBOX_ALLOW_XDG_RUNTIME_RW|bool|0|red|Share the whole user runtime dir (read-write)|Binds your \$XDG_RUNTIME_DIR (usually /run/user/UID) RW after checking it is your own, non-shared directory. Every socket in it becomes reachable with your user ID — D-Bus session bus, systemd --user, keyring, display and audio servers, SSH/GPG agents, rootless Docker/Podman — whatever the SSH-agent and Docker settings say; what the agent can do depends on each service and may include running programs outside the sandbox. Off: the sandbox gets a private, empty runtime dir with only the sockets you enable.|sensitive|linux"
+    "AI_SANDBOX_ALLOW_NESTED_USERNS|bool|0|red|Allow nested user namespaces|Lets the agent create its own user namespaces inside the sandbox (needed by nested bubblewrap/Flatpak, Chromium or Playwright without --no-sandbox, and rootless container engines run inside the sandbox; Docker/Podman through a shared host socket work without it). Each namespace gives the agent namespace-root capabilities and more kernel attack surface. Off: creating a user namespace fails; the launch is refused if bubblewrap cannot enforce that.|sensitive|linux"
+    "AI_SANDBOX_ALLOW_TIOCSTI|bool|0|yellow|Allow terminal input injection (TIOCSTI)|Launches without the seccomp filter that blocks ioctl(TIOCSTI) and ioctl(TIOCLINUX). On kernels that still allow TIOCSTI the agent can then type commands into your terminal that run after the session ends. Off: the filter is built with python3 + libseccomp and the launch is refused if it cannot be; the terminal, /dev/tty, resize and Ctrl+C work as usual.|sensitive|linux"
     "AI_SANDBOX_ALLOW_RO_HOMEDIR|bool|0|yellow|Share home directory (read-only)|Agent can read everything in \$HOME except credentials|sensitive|darwin"
 
     # Credentials
@@ -1135,13 +1130,16 @@ _AI_SETTINGS_LIST=(
     "AI_SANDBOX_PASS_GH|bool|0|red|Share GitHub token|Passes GITHUB_TOKEN / GH_TOKEN; agent can push to your repos|credentials"
     "AI_SANDBOX_PASS_GITLAB|bool|0|red|Share GitLab token + glab config|Passes GITLAB_TOKEN / CI_JOB_TOKEN env vars AND ${_ai_gitlab_bind_note} so glab reads its on-disk token. Agent can push to your repos.|credentials"
     "AI_SANDBOX_PASS_OPENAI|bool|0|red|Share OpenAI credentials|Passes all OPENAI_* env vars (advanced)|credentials"
+    "AI_SANDBOX_ALLOW_KEYCHAIN|bool|0|red|Allow macOS Keychain access|Grants RW on ~/Library/Keychains and lookups of the SecurityServer / securityd keychain daemons. The agent can then read (and add or change) any keychain item whose access list lets the calling program in without a prompt. Off: keychain-backed logins (Claude Code keeps its OAuth login in the Keychain) fail inside the sandbox; pass the credential through an env var (e.g. CLAUDE_CODE_OAUTH_TOKEN) instead.|credentials|darwin"
 
     # Networking (localhost, local docker)
-    "AI_SANDBOX_BLOCK_LOCALHOST|bool|0|info|Block localhost network access|Denies network access to services running on your own machine|networking|darwin"
-    "AI_SANDBOX_ALLOW_DOCKER|bool|0|red|Mount Docker / Colima socket|RW on /var/run/docker.sock, ~/.colima, ~/.docker. With the daemon running this is a full sandbox escape: agent can launch privileged containers and obtain host root. Off by default — opt in only when the session needs docker.|networking"
+    "AI_SANDBOX_ALLOW_UNRESTRICTED_NET|bool|0|red|Allow unrestricted network access|Gives the sandbox open networking: the agent can reach services on this machine (localhost; on Linux also abstract UNIX sockets such as X11 or D-Bus), your LAN, Tailscale peers and cloud metadata endpoints, and connect anywhere without the egress proxy (also needed for SSH remotes and clients that ignore http(s)_proxy). Off: the sandbox cannot connect out directly (Linux: its own network namespace; macOS: Seatbelt denies IP networking); HTTP(S) goes through a host proxy that refuses loopback, LAN and link-local / cloud metadata destinations.|networking"
+    "AI_SANDBOX_BLOCK_LOCALHOST|bool|0|info|Block localhost network access|Denies network access to services running on your own machine. Only matters with AI_SANDBOX_ALLOW_UNRESTRICTED_NET=1: the default restricted network already blocks localhost.|networking|darwin"
+    "AI_SANDBOX_ALLOW_DOCKER|bool|0|red|Mount Docker / Colima socket|RW on /var/run/docker.sock, ~/.colima, ~/.docker. With the daemon running this is a full sandbox escape: agent can launch privileged containers and obtain host root. Off by default — opt in only when the session needs docker.${_ai_docker_rootless_note}|networking"
+    "AI_SANDBOX_PASS_TAILSCALE|bool|0|red|Share Tailscale daemon socket|RO-binds /run/tailscale/tailscaled.sock. The read-only bind only stops the socket file being replaced; it does not make the Tailscale API read-only. tailscaled authorises requests by your user ID, so the agent can do whatever tailscaled lets your user do (e.g. change settings or connect to peers, if you are the operator). Off: no socket in the sandbox.|networking|linux"
     "AI_SANDBOX_PASS_DOCKER|bool|0|red|Share Docker client env vars + ~/.docker|Passes DOCKER_HOST, DOCKER_CONFIG, DOCKER_CERT_PATH, DOCKER_BUILDKIT and RO-grants ~/.docker (registry auth tokens). Pair with 'Mount Docker / Colima socket' to actually talk to the daemon.|networking"
 )
-unset _ai_sensitive_workdir_extra _ai_sensitive_workdir_system _ai_gitlab_bind_note
+unset _ai_sensitive_workdir_extra _ai_sensitive_workdir_system _ai_gitlab_bind_note _ai_docker_rootless_note
 
 # OS-scope filtering: drop catalog rows whose trailing OS_SCOPE field
 # doesn't match the current OS, so a setting with no backend on this OS
@@ -1190,13 +1188,6 @@ _setting_is_session_only() {
     esac
     return 1
 }
-
-# AI_SANDBOX_ALLOW_GIT_CONFIG given explicitly at launch (even =0) wins
-# over the per-workdir preset, so a one-off `AI_SANDBOX_ALLOW_GIT_CONFIG=0`
-# cannot be undone by a saved relaxed value. Captured at source time,
-# before _preset_autoload exports anything.
-_AI_GIT_CONFIG_SET_AT_LAUNCH=0
-[[ -n "${AI_SANDBOX_ALLOW_GIT_CONFIG+set}" ]] && _AI_GIT_CONFIG_SET_AT_LAUNCH=1
 
 # Parse one catalog entry into globals: _set_name _set_type _set_default
 # _set_severity _set_headline _set_detail _set_category _set_os_scope.
@@ -1276,19 +1267,18 @@ _setting_state_color() {
 
 # Echo the current value of a setting (after default-substitution). For
 # bools, anything other than "1" is normalised to "0" — matching how the
-# wrapper itself interprets these vars elsewhere.
+# wrapper itself interprets these vars elsewhere. An empty str/path takes
+# the catalog default (e.g. CLAUDE_ACCOUNT -> "private"); most str/path
+# defaults are empty, so empty stays empty for them. Agent libs must not
+# export such defaults at source time: _preset_autoload treats any set
+# variable as caller-set and would skip the saved value.
 _setting_current_value() {
     local name="${1}" type="${2}" default="${3}" cur
     cur="${!name:-}"
-    case "${type}" in
-        bool)
-            [[ -z "${cur}" ]] && cur="${default}"
-            [[ "${cur}" == "1" ]] || cur="0"
-            ;;
-        str|path)
-            # No default substitution for non-bool (empty is meaningful).
-            ;;
-    esac
+    [[ -z "${cur}" ]] && cur="${default}"
+    if [[ "${type}" == "bool" && "${cur}" != "1" ]]; then
+        cur="0"
+    fi
     printf '%s' "${cur}"
 }
 
@@ -1536,6 +1526,13 @@ _preset_autosave() {
 # from the Claude wrapper). Sets AI_WRAPPER_PRESET_AUTOLOADED_FROM=<path>
 # when >=1 setting was applied so show_header can render the dim
 # "restored from" banner line.
+#
+# The launch environment wins: a key already set in the caller's
+# environment (even to an empty string) is left untouched, so a one-off
+# `AI_SANDBOX_PASS_AWS=0 claude_wrapper` cannot be undone by a saved
+# relaxed value. Must run once, before the menu, so only launch-time
+# values count as caller-set. Restoring a non-default red or yellow
+# setting WARNs on stderr so scripted launches see what was relaxed.
 _preset_autoload() {
     local path entry line key val catalog_type applied=0 legacy=0
     path="$(_preset_autosave_path)" || { _preset_mark_unavailable; return 1; }
@@ -1575,6 +1572,7 @@ _preset_autoload() {
                 break
             fi
         done
+        # _set_* now describe the matched entry (when catalog_type is set).
         if [[ -z "${catalog_type}" ]]; then
             (( legacy )) && continue
             echo "  WARN: _preset_autoload: unknown setting: ${key}" >/dev/tty
@@ -1592,11 +1590,9 @@ _preset_autoload() {
                 # No further validation — accept-any-string contract.
                 ;;
         esac
-        if [[ "${key}" == "AI_SANDBOX_ALLOW_GIT_CONFIG" ]]; then
-            (( _AI_GIT_CONFIG_SET_AT_LAUNCH )) && continue
-            # stderr, not /dev/tty: scripted launches must see it too.
-            [[ "${val}" == "1" ]] && echo "  WARN: [${AI_AGENT_COMMAND:-ai-wrapper}] Restored AI_SANDBOX_ALLOW_GIT_CONFIG=1 from the saved preset: git config and hooks in this workdir will be writable by the agent (set AI_SANDBOX_ALLOW_GIT_CONFIG=0 at launch or toggle it in s) Settings to protect them)." >&2
-        fi
+        # Caller environment precedence (set, even if empty).
+        [[ -n "${!key+x}" ]] && continue
+        _preset_warn_restored "${key}" "${val}"
         export "${key}=${val}"
         applied=$((applied + 1))
     done < "${path}"
@@ -1607,6 +1603,23 @@ _preset_autoload() {
         export AI_WRAPPER_PRESET_AUTOLOADED_FROM="${path}"
     fi
     return 0
+}
+
+# WARN on stderr (not /dev/tty: scripted launches must see it too) when
+# _preset_autoload restores KEY=VAL for a red or yellow setting at a
+# non-default value. Reads the _set_* globals of KEY's catalog entry.
+_preset_warn_restored() {
+    local key="${1}" val="${2}" tag="[${AI_AGENT_COMMAND:-ai-wrapper}]"
+    case "${_set_severity}" in
+        red|yellow) ;;
+        *) return 0 ;;
+    esac
+    [[ -z "${val}" || "${val}" == "${_set_default}" ]] && return 0
+    if [[ "${key}" == "AI_SANDBOX_ALLOW_GIT_CONFIG" ]]; then
+        echo "  WARN: ${tag} Restored AI_SANDBOX_ALLOW_GIT_CONFIG=1 from the saved preset: git config and hooks in this workdir will be writable by the agent (set AI_SANDBOX_ALLOW_GIT_CONFIG=0 at launch or toggle it in s) Settings to protect them)." >&2
+        return 0
+    fi
+    echo "  WARN: ${tag} Restored ${key}=${val} from the saved preset (${_set_severity}: ${_set_headline}); set ${key} at launch or change it in s) Settings to override." >&2
 }
 
 # Remove this agent's per-workdir preset file and clear the

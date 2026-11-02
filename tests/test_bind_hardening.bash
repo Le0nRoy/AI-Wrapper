@@ -1,4 +1,5 @@
 #!/bin/bash
+# shellcheck disable=SC2088,SC2163  # "~/x" is display text in test names; export "$@" takes NAME=VALUE pairs
 # Regression tests for wrapper-side RW binds whose source path can be
 # influenced by untrusted input:
 #   - the git-worktree common-dir bind (_wrapper_bind_git_common_dir): the
@@ -11,6 +12,11 @@
 #   - per-workdir preset values flowing into binds (CODEX_ACCOUNT,
 #     AI_SANDBOX_EXTRA_RW_DIRS)
 #   - the shared sensitive-dir classifier _sandbox_sensitive_dir_kind
+#   - paths resolved before classification (#65): WORKDIR reached through
+#     a symlink and AI_SANDBOX_EXTRA_{RW,RO}_DIRS entries (Linux argv via a
+#     stub bwrap), and the config-symlink policy (dangling links, broad
+#     roots, credential stores, shell startup files; relocated and
+#     multi-account profiles still accepted)
 # See tests/test_sandbox_common.bash for the FAKE_HOME rationale.
 set -uo pipefail
 
@@ -671,6 +677,198 @@ if [[ "${OS}" == "Linux" ]] && command -v bwrap >/dev/null 2>&1; then
     out="$(cd "${FAKE_HOME}/work" && PATH="${FAKE_HOME}/bin:${PATH}" \
         bash "${REPO_ROOT}/bin/executable_claude_wrapper.bash" x </dev/null 2>&1)"
     assert_contains "${out}" "RAN" "claude: control — regular ~/.claude.json still launches"
+fi
+
+# ---------------------------------------------------------------------------
+echo "-- path resolution helpers (#65)"
+RES_ID="$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+R="${FAKE_HOME}/res-${RES_ID}"
+mkdir -p "${R}/real" "${FAKE_HOME}/.ssh"
+ln -s "${R}/real" "${R}/link"
+ln -s "${R}/missing" "${R}/dangling"
+ln -s "${R}/loop-b" "${R}/loop-a"; ln -s "${R}/loop-a" "${R}/loop-b"
+ln -s "${FAKE_HOME}/.ssh" "${R}/to-ssh"
+: >"${R}/file"
+_resolve_extra() { ( _load codex; _sandbox_resolve_extra_dir t AI_SANDBOX_EXTRA_RW_DIRS "${1}" ) 2>/dev/null; }
+assert_eq "$( ( source "${REPO_ROOT}/bin/ai_agent_universal_wrapper.bash"; _realpath "${R}/link" ) )" "${R}/real" \
+    "_realpath is defined by the universal wrapper alone"
+out="$(_resolve_extra "${R}/link")"; rc=$?
+assert_eq "${rc}:${out}" "0:${R}/real" "extra dir: symlink resolves to its target"
+out="$(_resolve_extra "${R}/real/..")"; rc=$?
+assert_eq "${rc}:${out}" "0:${R}" "extra dir: '..' is resolved away"
+out="$(_resolve_extra "${R}/to-ssh")"; rc=$?
+assert_eq "${rc}:${out}" "0:${FAKE_HOME}/.ssh" "extra dir: symlink into ~/.ssh resolves to ~/.ssh (classified later)"
+_resolve_extra "${R}/nope" >/dev/null; rc=$?
+assert_eq "${rc}" "2" "extra dir: a missing entry is skipped (rc 2)"
+for bad in dangling loop-a file; do
+    _resolve_extra "${R}/${bad}" >/dev/null; rc=$?
+    assert_eq "${rc}" "1" "extra dir: ${bad} entry fails closed (rc 1)"
+done
+
+# ---------------------------------------------------------------------------
+echo "-- config symlink policy (#65)"
+_cfg_check() { ( _load codex; _wrapper_check_config_symlink "${1}" ) 2>&1; }
+C="${FAKE_HOME}/cfg-${RES_ID}"
+mkdir -p "${C}" "${FAKE_HOME}/.config/gh" "${FAKE_HOME}/.config/systemd/user" \
+    "${FAKE_HOME}/.local/share" "${FAKE_HOME}/.password-store" "${FAKE_HOME}/bin" \
+    "${FAKE_HOME}/ai-wrapper/.agents/skills" "${FAKE_HOME}/.config/claude" \
+    "${FAKE_HOME}/.local/share/gemini" "${FAKE_HOME}/profiles/work" "${FAKE_HOME}/dotfiles"
+: >"${FAKE_HOME}/.gitconfig"; : >"${FAKE_HOME}/.bashrc"; : >"${FAKE_HOME}/dotfiles/claude.json"
+_cfg_reject() {  # LINK_NAME TARGET LABEL [EXPECTED_SUBSTRING]
+    ln -sfn "${2}" "${C}/${1}"
+    out="$(_cfg_check "${C}/${1}")"; rc=$?
+    assert_eq "${rc}" "1" "config symlink to ${3} is refused"
+    [[ -z "${4:-}" ]] || assert_contains "${out}" "${4}" "... (${4})"
+}
+_cfg_accept() {  # LINK_NAME TARGET LABEL
+    ln -sfn "${2}" "${C}/${1}"
+    out="$(_cfg_check "${C}/${1}")"; rc=$?
+    assert_eq "${rc}" "0" "config symlink to ${3} is accepted"
+}
+_cfg_reject dangling "${FAKE_HOME}/not-there-${RES_ID}" "a missing target (dangling)" "does not exist"
+ln -sfn "${C}/loop2" "${C}/loop1"; ln -sfn "${C}/loop1" "${C}/loop2"
+out="$(_cfg_check "${C}/loop1")"; rc=$?
+assert_eq "${rc}" "1" "config symlink loop is refused"
+_cfg_reject home "${FAKE_HOME}" "\$HOME itself" "outside"
+_cfg_reject etc /etc "/etc" "outside"
+_cfg_reject config "${FAKE_HOME}/.config" "~/.config (broad root)"
+_cfg_reject local "${FAKE_HOME}/.local" "~/.local (broad root)"
+_cfg_reject share "${FAKE_HOME}/.local/share" "~/.local/share (broad root)"
+_cfg_reject bin "${FAKE_HOME}/bin" "~/bin (read-only by default, #62)"
+_cfg_reject aiw "${FAKE_HOME}/ai-wrapper" "~/ai-wrapper (above the skill source)"
+_cfg_reject gh "${FAKE_HOME}/.config/gh" "~/.config/gh" "credential location"
+_cfg_reject pass "${FAKE_HOME}/.password-store" "~/.password-store" "credential location"
+_cfg_reject sysd "${FAKE_HOME}/.config/systemd/user" "~/.config/systemd/user"
+_cfg_reject gitconfig "${FAKE_HOME}/.gitconfig" "~/.gitconfig"
+_cfg_reject bashrc "${FAKE_HOME}/.bashrc" "~/.bashrc"
+_cfg_reject ssh "${FAKE_HOME}/.ssh" "~/.ssh" "credential location"
+_cfg_accept work "${FAKE_HOME}/profiles/work" "~/profiles/work (multi-account profile)"
+_cfg_accept cclaude "${FAKE_HOME}/.config/claude" "~/.config/claude (relocated dotpath)"
+_cfg_accept gem "${FAKE_HOME}/.local/share/gemini" "~/.local/share/gemini (relocated dotpath)"
+_cfg_accept json "${FAKE_HOME}/dotfiles/claude.json" "~/dotfiles/claude.json (relocated file)"
+out="$(_cfg_check "${FAKE_HOME}/profiles/work")"; rc=$?
+assert_eq "${rc}" "0" "a plain (non-symlink) config dir passes"
+out="$(_cfg_check "${C}/absent-${RES_ID}")"; rc=$?
+assert_eq "${rc}" "0" "a missing (non-symlink) config path passes (callers create it)"
+ln -sfn "${FAKE_HOME}/.ssh" "${C}/parent"
+mkdir -p "${FAKE_HOME}/.ssh/agentcfg"
+out="$(_cfg_check "${C}/parent/agentcfg")"; rc=$?
+assert_eq "${rc}" "1" "config path behind a symlinked parent into ~/.ssh is refused"
+assert_contains "${out}" "symlinked parent" "... naming the symlinked parent"
+rm -rf "${FAKE_HOME}/.ssh/agentcfg"
+
+# ---------------------------------------------------------------------------
+echo "-- Linux bwrap argv: paths resolved before classification (#65)"
+if [[ "${OS}" == "Linux" ]]; then
+    STUB_DIR="${OUTSIDE}/stub-bwrap"
+    ARGV_FILE="${STUB_DIR}/argv"
+    mkdir -p "${STUB_DIR}"
+    cat >"${STUB_DIR}/bwrap" <<STUB
+#!/bin/bash
+printf '%s\n' "\$@" >"${ARGV_FILE}"
+STUB
+    printf '#!/bin/bash\necho "kernel.unprivileged_userns_clone = 1"\n' >"${STUB_DIR}/sysctl"
+    chmod +x "${STUB_DIR}/bwrap" "${STUB_DIR}/sysctl"
+    # Run the Linux backend from DIR through the stubs. Sets out (stderr),
+    # rc and argv (one entry per line). Extra NAME=VALUE env in "$@".
+    _linux_run() {
+        local dir="${1}"; shift
+        rm -f "${ARGV_FILE}"
+        out="$( cd "${dir}" && export PATH="${STUB_DIR}:${PATH}" "$@" \
+            && source "${REPO_ROOT}/bin/ai_agent_universal_wrapper.bash" \
+            && _run_sandboxed_agent_linux true -- -- 2>&1 >/dev/null )"; rc=$?
+        argv="$(cat "${ARGV_FILE}" 2>/dev/null)"
+    }
+    _has_seq() { [[ "${NL}${1}${NL}" == *"${NL}${2}${NL}"* ]]; }
+    _yes() { if "$@"; then echo yes; else echo no; fi; }
+    W="${FAKE_HOME}/wd-${RES_ID}"
+    mkdir -p "${W}/real-proj"
+    ln -s "${FAKE_HOME}/.ssh" "${W}/to-ssh"
+    ln -s /etc "${W}/to-etc"
+    ln -s "${FAKE_HOME}" "${W}/to-home"
+    ln -s "${W}/real-proj" "${W}/proj-link"
+
+    for link in to-ssh to-etc to-home; do
+        _linux_run "${W}/${link}" _NOOP=1
+        assert_eq "${rc}" "1" "WORKDIR via symlink ${link} is refused"
+        assert_contains "${out}" "Refusing to sandbox with WORKDIR" "... by the sensitive-WORKDIR guard (${link})"
+        assert_eq "${argv}" "" "... before bwrap runs (${link})"
+    done
+    _linux_run "${W}/to-ssh" AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1
+    assert_eq "${rc}" "0" "AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 still overrides a symlinked sensitive WORKDIR"
+
+    _linux_run "${W}/proj-link" _NOOP=1
+    assert_eq "${rc}" "0" "WORKDIR via a symlink to a project dir launches"
+    assert_eq "$(_yes _has_seq "${argv}" "--bind${NL}${W}/real-proj${NL}${W}/real-proj")" yes \
+        "... binding the resolved path"
+    assert_eq "$(_yes _has_seq "${argv}" "--bind${NL}${W}/real-proj${NL}${W}/proj-link")" yes \
+        "... also mounted at the logical path"
+    assert_eq "$(_yes _has_seq "${argv}" "--chdir${NL}${W}/proj-link")" yes "... and --chdir to the logical cwd"
+    assert_eq "$(_yes _has_seq "${argv}" "--bind${NL}${W}/proj-link${NL}${W}/proj-link")" no \
+        "... never binding the unresolved symlink as the source"
+
+    _linux_run "${W}/real-proj" _NOOP=1
+    assert_eq "$(_yes _has_seq "${argv}" "--bind${NL}${W}/real-proj${NL}${W}/real-proj")" yes \
+        "plain WORKDIR: bound once at its own path"
+    assert_eq "$(printf '%s\n' "${argv}" | grep -cx -- "${W}/real-proj")" "3" \
+        "plain WORKDIR: no second (logical) mount"
+
+    for entry in "${W}/to-ssh" "${W}/real-proj/../to-home" "${W}/real-proj/../../.ssh" "${W}/to-etc"; do
+        for var in AI_SANDBOX_EXTRA_RW_DIRS AI_SANDBOX_EXTRA_RO_DIRS; do
+            _linux_run "${W}/real-proj" "${var}=${entry}"
+            assert_eq "${rc}" "1" "${var}=${entry#"${FAKE_HOME}"/} is refused after resolution"
+            assert_contains "${out}" "Refusing extra bind" "... by the extra-bind guard"
+        done
+    done
+    _linux_run "${W}/real-proj" "AI_SANDBOX_EXTRA_RW_DIRS=${W}/to-ssh" AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1
+    assert_eq "${rc}" "0" "AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 still overrides a symlinked sensitive extra dir"
+    assert_eq "$(_yes _has_seq "${argv}" "--bind${NL}${FAKE_HOME}/.ssh${NL}${FAKE_HOME}/.ssh")" yes \
+        "... and binds the resolved target"
+
+    mkdir -p "${W}/data-real"; ln -s "${W}/data-real" "${W}/data-link"
+    _linux_run "${W}/real-proj" "AI_SANDBOX_EXTRA_RW_DIRS=${W}/data-link" "AI_SANDBOX_EXTRA_RO_DIRS=${W}/data-link/"
+    assert_eq "${rc}" "0" "benign symlinked extra dirs launch"
+    assert_eq "$(_yes _has_seq "${argv}" "--bind${NL}${W}/data-real${NL}${W}/data-real")" yes "... RW bound at the resolved path"
+    assert_eq "$(_yes _has_seq "${argv}" "--ro-bind${NL}${W}/data-real${NL}${W}/data-real")" yes "... RO bound at the resolved path"
+    assert_not_contains "${argv}" "${W}/data-link" "... the symlink itself is never a bind source"
+
+    _linux_run "${W}/real-proj" "AI_SANDBOX_EXTRA_RW_DIRS=${W}/missing-${RES_ID},${W}/data-real"
+    assert_eq "${rc}" "0" "a missing extra dir is skipped, the launch continues"
+    assert_contains "${out}" "does not exist" "... with a WARNING"
+    ln -s "${W}/gone-${RES_ID}" "${W}/dangling"
+    : >"${W}/plain-file"
+    for bad in dangling plain-file; do
+        for var in AI_SANDBOX_EXTRA_RW_DIRS AI_SANDBOX_EXTRA_RO_DIRS; do
+            _linux_run "${W}/real-proj" "${var}=${W}/${bad}" AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1
+            assert_eq "${rc}" "1" "${var}=${bad} fails closed, even with the sensitivity override"
+            assert_contains "${out}" "does not resolve to a directory" "... naming the invalid entry (${bad}, ${var})"
+        done
+    done
+
+    echo "-- claude wrapper binds resolved config sources (#65)"
+    mkdir -p "${FAKE_HOME}/profiles/claude-w" "${W}/claude-work"
+    : >"${FAKE_HOME}/dotfiles/claude-w.json"
+    ln -sfn "${FAKE_HOME}/profiles/claude-w" "${FAKE_HOME}/.claude-w${RES_ID}"
+    ln -sfn "${FAKE_HOME}/dotfiles/claude-w.json" "${FAKE_HOME}/.claude-w${RES_ID}.json"
+    printf '#!/bin/bash\necho RAN\n' >"${FAKE_HOME}/bin/claude"; chmod +x "${FAKE_HOME}/bin/claude"
+    rm -f "${ARGV_FILE}"
+    out="$(cd "${W}/claude-work" && PATH="${STUB_DIR}:${FAKE_HOME}/bin:${PATH}" CLAUDE_ACCOUNT="w${RES_ID}" \
+        bash "${REPO_ROOT}/bin/executable_claude_wrapper.bash" x </dev/null 2>&1)"; rc=$?
+    argv="$(cat "${ARGV_FILE}" 2>/dev/null)"
+    assert_eq "${rc}" "0" "claude: symlinked named profile and .json launch"
+    assert_eq "$(_yes _has_seq "${argv}" "--bind${NL}${FAKE_HOME}/profiles/claude-w${NL}${FAKE_HOME}/.claude")" yes \
+        "claude: profile dir bound from its resolved path"
+    assert_eq "$(_yes _has_seq "${argv}" "--bind${NL}${FAKE_HOME}/dotfiles/claude-w.json${NL}${FAKE_HOME}/.claude.json")" yes \
+        "claude: profile .json bound from its resolved path"
+    ln -sfn "${FAKE_HOME}/.bashrc" "${FAKE_HOME}/.claude-w${RES_ID}.json"
+    rm -f "${ARGV_FILE}"
+    out="$(cd "${W}/claude-work" && PATH="${STUB_DIR}:${FAKE_HOME}/bin:${PATH}" CLAUDE_ACCOUNT="w${RES_ID}" \
+        bash "${REPO_ROOT}/bin/executable_claude_wrapper.bash" x </dev/null 2>&1)"; rc=$?
+    assert_eq "${rc}" "1" "claude: profile .json symlinked to ~/.bashrc is refused"
+    assert_eq "$(cat "${ARGV_FILE}" 2>/dev/null)" "" "... before bwrap runs"
+    rm -f "${FAKE_HOME}/.claude-w${RES_ID}" "${FAKE_HOME}/.claude-w${RES_ID}.json"
+else
+    echo "  skip - bwrap argv checks are Linux-only"
 fi
 
 # ---------------------------------------------------------------------------

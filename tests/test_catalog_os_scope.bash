@@ -17,6 +17,18 @@ DARWIN_ONLY_KEYS=(
     AI_SANDBOX_DRYRUN
     AI_SANDBOX_ALLOW_RO_HOMEDIR
     AI_SANDBOX_BLOCK_LOCALHOST
+    AI_SANDBOX_ALLOW_KEYCHAIN
+)
+# Linux bubblewrap host-path gates (#62); the macOS backend never binds
+# these paths, so the controls are hidden there.
+LINUX_ONLY_KEYS=(
+    AI_SANDBOX_ALLOW_BIN_RW
+    AI_SANDBOX_ALLOW_AGENTS_SKILLS_RW
+    AI_SANDBOX_ALLOW_ANDROID
+    AI_SANDBOX_PASS_TAILSCALE
+    AI_SANDBOX_ALLOW_XDG_RUNTIME_RW
+    AI_SANDBOX_ALLOW_NESTED_USERNS
+    AI_SANDBOX_ALLOW_TIOCSTI
 )
 # A representative sample of settings implemented on both backends.
 CROSS_PLATFORM_KEYS=(
@@ -24,6 +36,7 @@ CROSS_PLATFORM_KEYS=(
     AI_SANDBOX_PASS_GITLAB
     AI_SANDBOX_PASS_SSH_AGENT
     AI_SANDBOX_ALLOW_DOCKER
+    AI_SANDBOX_ALLOW_UNRESTRICTED_NET
 )
 
 # $1: darwin|linux -- dump the catalog as it would render on that OS, one
@@ -51,6 +64,71 @@ for key in "${DARWIN_ONLY_KEYS[@]}"; do
     assert_not_contains "${linux_catalog}" "${key}|" "${key} hidden on Linux (no backend there)"
     assert_contains "${darwin_catalog}" "${key}|" "${key} shown on macOS"
 done
+
+for key in "${LINUX_ONLY_KEYS[@]}"; do
+    assert_contains "${linux_catalog}" "${key}|bool|0|" "${key} shown on Linux, default 0"
+    assert_not_contains "${darwin_catalog}" "${key}|" "${key} hidden on macOS (no backend there)"
+done
+
+# Kind support was removed (#62): no Kind-specific setting or wording.
+assert_not_contains "${linux_catalog}" "ALLOW_KIND" "no Kind setting on Linux"
+assert_not_contains "${linux_catalog}" "kind_dot_kube" "no kind_dot_kube wording on Linux"
+# The combined kind + kubectl installer is gone too, with its README row.
+assert_eq "$([[ -e "${REPO_ROOT}/bin/executable_setup_kind.bash" ]] && echo present || echo absent)" absent \
+    "Kind installer source removed"
+assert_not_contains "$(cat "${REPO_ROOT}/README.md")" "setup_kind" "README does not list the Kind installer"
+assert_contains "${linux_catalog}" "AI_SANDBOX_PASS_TAILSCALE|bool|0|red|" "Tailscale control is red severity"
+tailscale_row="$(grep '^AI_SANDBOX_PASS_TAILSCALE|' <<<"${linux_catalog}")"
+assert_contains "${tailscale_row}" "does not make the Tailscale API read-only" "Tailscale help disclaims a read-only API"
+
+# Broad runtime-dir override (#63): red, and its help names what it exposes.
+assert_contains "${linux_catalog}" "AI_SANDBOX_ALLOW_XDG_RUNTIME_RW|bool|0|red|" "runtime-dir override is red severity"
+runtime_row="$(grep '^AI_SANDBOX_ALLOW_XDG_RUNTIME_RW|' <<<"${linux_catalog}")"
+assert_contains "${runtime_row}" "D-Bus session bus" "runtime-dir help names the session bus"
+assert_contains "${runtime_row}" "Off: the sandbox gets a private, empty runtime dir" "runtime-dir help describes the default"
+runtime_scope="$(source "${REPO_ROOT}/bin/ai_wrapper_data/ai_wrapper_lib.bash" >/dev/null 2>&1
+    if _setting_is_session_only AI_SANDBOX_ALLOW_XDG_RUNTIME_RW; then echo session; else echo preset; fi)"
+assert_eq "${runtime_scope}" preset "runtime-dir override is an ordinary preset setting"
+# Rootless container sockets are a Linux-only part of ALLOW_DOCKER.
+assert_contains "$(grep '^AI_SANDBOX_ALLOW_DOCKER|' <<<"${linux_catalog}")" "podman/podman.sock" \
+    "Linux ALLOW_DOCKER help names the rootless Podman socket"
+assert_not_contains "$(grep '^AI_SANDBOX_ALLOW_DOCKER|' <<<"${darwin_catalog}")" "XDG_RUNTIME_DIR" \
+    "macOS ALLOW_DOCKER help has no Linux runtime-dir wording"
+# Keychain gate (#67): red, off by default, help names both access paths.
+assert_contains "${darwin_catalog}" "AI_SANDBOX_ALLOW_KEYCHAIN|bool|0|red|" "Keychain control is red severity, default 0"
+keychain_row="$(grep '^AI_SANDBOX_ALLOW_KEYCHAIN|' <<<"${darwin_catalog}")"
+assert_contains "${keychain_row}" "/Library/Keychains" "Keychain help names the file path"
+assert_contains "${keychain_row}" "securityd" "Keychain help names the daemon path"
+assert_contains "${keychain_row}" "|credentials|darwin" "Keychain control sits in the credentials category"
+
+# Process isolation opt-outs (#64): nested userns red, TIOCSTI yellow,
+# both ordinary preset settings whose help names what turning them on costs.
+assert_contains "${linux_catalog}" "AI_SANDBOX_ALLOW_NESTED_USERNS|bool|0|red|" "nested-userns opt-out is red severity"
+assert_contains "${linux_catalog}" "AI_SANDBOX_ALLOW_TIOCSTI|bool|0|yellow|" "TIOCSTI opt-out is yellow severity"
+nested_row="$(grep '^AI_SANDBOX_ALLOW_NESTED_USERNS|' <<<"${linux_catalog}")"
+assert_contains "${nested_row}" "Chromium" "nested-userns help names the in-sandbox Chromium need"
+assert_contains "${nested_row}" "shared host socket work without it" "nested-userns help: host-socket Docker/Podman unaffected"
+tiocsti_row="$(grep '^AI_SANDBOX_ALLOW_TIOCSTI|' <<<"${linux_catalog}")"
+assert_contains "${tiocsti_row}" "python3 + libseccomp" "TIOCSTI help names the prerequisite"
+assert_contains "${tiocsti_row}" "launch is refused" "TIOCSTI help: missing support refuses, not skips"
+for key in AI_SANDBOX_ALLOW_NESTED_USERNS AI_SANDBOX_ALLOW_TIOCSTI; do
+    key_scope="$(source "${REPO_ROOT}/bin/ai_wrapper_data/ai_wrapper_lib.bash" >/dev/null 2>&1
+        if _setting_is_session_only "${key}"; then echo session; else echo preset; fi)"
+    assert_eq "${key_scope}" preset "${key} is an ordinary preset setting"
+done
+
+# Network isolation opt-out (#77 Linux, #78 macOS): red, networking on
+# both OSes, ordinary preset setting
+# (a restored preset triggers the risky-setting warning).
+assert_contains "${linux_catalog}" "AI_SANDBOX_ALLOW_UNRESTRICTED_NET|bool|0|red|" "unrestricted-net opt-out is red severity"
+net_row="$(grep '^AI_SANDBOX_ALLOW_UNRESTRICTED_NET|' <<<"${linux_catalog}")"
+assert_eq "${net_row##*|}" "networking" "unrestricted-net control sits in the networking category, on every OS"
+assert_contains "${net_row}" "Seatbelt" "unrestricted-net help covers the macOS backend"
+assert_contains "${net_row}" "cloud metadata" "unrestricted-net help names what it exposes"
+assert_contains "${net_row}" "egress proxy" "unrestricted-net help names the default path"
+net_scope="$(source "${REPO_ROOT}/bin/ai_wrapper_data/ai_wrapper_lib.bash" >/dev/null 2>&1
+    if _setting_is_session_only AI_SANDBOX_ALLOW_UNRESTRICTED_NET; then echo session; else echo preset; fi)"
+assert_eq "${net_scope}" preset "AI_SANDBOX_ALLOW_UNRESTRICTED_NET is an ordinary preset setting"
 
 for key in "${CROSS_PLATFORM_KEYS[@]}"; do
     assert_contains "${linux_catalog}" "${key}|" "${key} shown on Linux"
