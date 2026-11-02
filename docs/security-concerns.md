@@ -589,6 +589,91 @@ Three gaps in the bwrap backend:
   input, resize, Ctrl+C, cleanup). Results from one kernel/arch are not
   claims about others.
 
+### S-λ — paths classified before resolution; broad config-symlink targets (RESOLVED, 2026-11, #65)
+
+Three gaps (CC-1..CC-3):
+
+- **CC-1.** The bwrap backend classified the logical `$(pwd)` with
+  `_sandbox_sensitive_dir_kind` and bound it as given. Launching from
+  `~/proj -> ~/.ssh` (or `-> /etc`, `-> $HOME`) passed the guard, and
+  bwrap followed the link and bound the target read-write.
+- **CC-2.** `AI_SANDBOX_EXTRA_{RW,RO}_DIRS` entries were only trimmed
+  and `~`-expanded on both backends. On Linux a symlink, `..`
+  (`~/proj/../.ssh`) or a spelling such as `//etc` slipped past the
+  string classifier; macOS resolved for the check but fell back to the
+  raw string when resolution failed.
+- **CC-3.** `_wrapper_check_config_symlink` (B-κ) only refused targets
+  outside `$HOME` and a short credential list. An agent config symlink to
+  `$HOME/`, `~/.config`, `~/.local`, `~/bin`, `~/.config/gh`,
+  `~/.password-store`, `~/.gitconfig` or `~/.bashrc` was accepted and
+  bound RW. A dangling link was accepted too (`touch` / `mkdir -p` could
+  then create its target). `claude_wrapper` bound the unresolved path.
+
+**Resolution.**
+
+- `_realpath` is defined once, in `ai_agent_universal_wrapper.bash`
+  (the copies in `ai_wrapper_lib.bash` and `macos_sandbox_exec.bash` are
+  gone; both are sourced after it).
+- *WORKDIR (Linux).* The cwd is resolved; an unresolvable cwd refuses
+  the launch. `_sandbox_sensitive_pair_kind` classifies the resolved path
+  against the resolved `$HOME` and the logical path against the raw
+  `$HOME` (so `~/.config` relocated to a data disk is still refused). The
+  resolved path is bound at itself and, when the cwd came through a
+  symlink, also at the logical path, and `--chdir` uses the logical path.
+  The git metadata overlays already cover both paths
+  (`_wrapper_git_ro_bind` / `_wrapper_git_pin`).
+- *Extra dirs (both backends).* `_sandbox_resolve_extra_dir` resolves
+  each entry before it is classified or granted. A missing entry is
+  skipped with a WARNING, as before (a preset from another machine stays
+  usable and nothing is granted). An entry that exists but does not
+  resolve to a directory (dangling symlink, loop, unreadable component,
+  regular file) refuses the launch; `AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1`
+  does not change that. Grants use the resolved path. The sensitivity
+  guard checks both forms, and the override works as before.
+- *Config symlinks.* `_wrapper_check_config_symlink` separates two kinds
+  of check. **Mandatory validation:** the link must resolve, without a
+  loop, to an existing target. **Authorization:** the target must be
+  strictly under `$HOME`. It must not be a broad root (`~/.config`,
+  `~/.local`, `~/.local/share`, `~/.local/state`, `~/.cache`,
+  `~/Library`, `~/Library/Application Support`). It must not lie in, at
+  or above an entry of `_WRAPPER_CONFIG_SYMLINK_DENIED`:
+  - credential stores: `.ssh`, `.gnupg`, `.aws`, `.azure`, `.kube`,
+    `.docker`, `.colima`, `.podman`, `.netrc`, `.npmrc`, `.pypirc`,
+    `.git-credentials`, `.password-store`, gh / gcloud / glab config,
+    keyrings and Keychains;
+  - host-executed config: `.gitconfig`, `.config/git`, shell startup
+    files, `.config/systemd`, `.config/autostart`,
+    `.config/environment.d`, `.local/bin`, `Library/LaunchAgents`;
+  - the #62 read-only paths `~/bin` and `~/ai-wrapper/.agents`.
+
+  A config path whose ancestor is a symlink, so that it resolves
+  elsewhere than it is spelled, gets the same check. Relocated and
+  multi-account profiles (`~/.claude-<name>`, `~/.config/claude`,
+  `~/.local/share/gemini`, `~/profiles/...`, `~/dotfiles/claude.json`)
+  are still accepted. `claude_wrapper` binds the resolved `~/.claude*`
+  dir and `.json`, as Codex, Antigravity and Copilot already did.
+
+**Residual / owner choices.**
+- The config-symlink policy is a denylist. A credential store not listed
+  under `$HOME` is still an accepted target. A strict allowlist (only
+  agent namespaces and non-dot paths) would close that but could reject
+  existing setups, so it is left to the owner. Targets outside `$HOME`
+  stay refused with no opt-in.
+- Extra dirs are granted only at their resolved path. On Linux a
+  symlinked entry such as `~/data -> /mnt/data` is visible inside the
+  sandbox as `/mnt/data`, not `~/data`. A logical alias would add a
+  writable path that the git overlays do not cover.
+- Missing extra-dir entries are still skipped, not refused (compatibility
+  with presets shared across machines). Making them fatal is an owner
+  choice.
+- Mounting at the logical WORKDIR path needs its parent to be creatable
+  in the sandbox, as before this change. A cwd behind a symlink under a
+  read-only mount (`~/bin/link`) fails the bwrap launch loudly.
+- Coverage: `tests/test_bind_hardening.bash` (helper units, config
+  policy matrix, Linux argv through a stub bwrap, claude resolved
+  binds) and `tests/test_extra_bind_dirs.bash` (native refusals and
+  grants through the real sandbox, CI `smoke-linux` / `smoke-macos`).
+
 ## Local bugs / brittleness
 
 ### B-α — `mkdir -p ~/.claude` follows symlinks (RESOLVED, 2026-05-24, WS3)
@@ -1040,7 +1125,10 @@ resolving outside `$HOME` or into a credential location (`~/.ssh`,
 `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.docker`, `~/.colima`, `~/.netrc`,
 `~/.npmrc`, `~/.pypirc`, gcloud and glab config). The `~/.claude.json`
 check runs before `touch`, so a dangling symlink target is never
-created. The Codex wrapper binds the resolved path.
+created. The Codex wrapper binds the resolved path. Widened in #65
+(S-λ): dangling links, broad roots, shell / git / session startup
+files and paths behind a symlinked parent are refused too, and
+`claude_wrapper` binds resolved paths.
 
 ### B-μ — AGY host-side Python and profile file operations (MITIGATED, 2026-10, #44)
 

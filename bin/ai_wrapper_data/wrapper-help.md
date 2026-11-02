@@ -38,7 +38,12 @@ The sandbox bounds *writes* — it does not bound *reads* or *network*. Be aware
   from `$HOME` or a HOME dotfile dir, and to accept such dirs or top-level
   system dirs in `AI_SANDBOX_EXTRA_RW_DIRS` / `AI_SANDBOX_EXTRA_RO_DIRS`.
   Use only when you're deliberately editing one of those locations and
-  accept the wider write fence.
+  accept the wider write fence. The cwd and each extra-dir entry are
+  judged after resolving symlinks and `..`, so a symlink into one of these
+  locations is refused the same way; extra dirs are granted at their
+  resolved path. A missing extra-dir entry is skipped with a warning; one
+  that exists but does not resolve to a directory (dangling symlink,
+  loop, file) refuses the launch, and this override does not change that.
 <!-- os:linux -->
   Also overrides the refusal to launch from a top-level system directory
   (`/`, `/etc`, `/tmp`, `/home`, ...).
