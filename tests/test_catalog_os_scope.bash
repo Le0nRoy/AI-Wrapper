@@ -29,7 +29,6 @@ LINUX_ONLY_KEYS=(
     AI_SANDBOX_ALLOW_XDG_RUNTIME_RW
     AI_SANDBOX_ALLOW_NESTED_USERNS
     AI_SANDBOX_ALLOW_TIOCSTI
-    AI_SANDBOX_ALLOW_UNRESTRICTED_NET
 )
 # A representative sample of settings implemented on both backends.
 CROSS_PLATFORM_KEYS=(
@@ -37,6 +36,7 @@ CROSS_PLATFORM_KEYS=(
     AI_SANDBOX_PASS_GITLAB
     AI_SANDBOX_PASS_SSH_AGENT
     AI_SANDBOX_ALLOW_DOCKER
+    AI_SANDBOX_ALLOW_UNRESTRICTED_NET
 )
 
 # $1: darwin|linux -- dump the catalog as it would render on that OS, one
@@ -117,11 +117,13 @@ for key in AI_SANDBOX_ALLOW_NESTED_USERNS AI_SANDBOX_ALLOW_TIOCSTI; do
     assert_eq "${key_scope}" preset "${key} is an ordinary preset setting"
 done
 
-# Network isolation opt-out (#77): red, networking, ordinary preset setting
+# Network isolation opt-out (#77 Linux, #78 macOS): red, networking on
+# both OSes, ordinary preset setting
 # (a restored preset triggers the risky-setting warning).
 assert_contains "${linux_catalog}" "AI_SANDBOX_ALLOW_UNRESTRICTED_NET|bool|0|red|" "unrestricted-net opt-out is red severity"
 net_row="$(grep '^AI_SANDBOX_ALLOW_UNRESTRICTED_NET|' <<<"${linux_catalog}")"
-assert_contains "${net_row}" "|networking|linux" "unrestricted-net control sits in the networking category"
+assert_eq "${net_row##*|}" "networking" "unrestricted-net control sits in the networking category, on every OS"
+assert_contains "${net_row}" "Seatbelt" "unrestricted-net help covers the macOS backend"
 assert_contains "${net_row}" "cloud metadata" "unrestricted-net help names what it exposes"
 assert_contains "${net_row}" "egress proxy" "unrestricted-net help names the default path"
 net_scope="$(source "${REPO_ROOT}/bin/ai_wrapper_data/ai_wrapper_lib.bash" >/dev/null 2>&1
