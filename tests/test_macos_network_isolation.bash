@@ -350,7 +350,7 @@ sub attempt {
 }
 attempt("LOOPBACK", "127.0.0.1", $port);
 attempt("EGRESS", "1.1.1.1", 443);
-my $proxy = $ENV{https_proxy} // '';
+my $proxy = $ENV{https_proxy} // 'None';
 print "HTTPS_PROXY_ENV=$proxy\n";
 if ($proxy =~ m{^http://([^:/]+):(\d+)}) {
     my $s = IO::Socket::INET->new(PeerAddr => $1, PeerPort => $2, Proto => 'tcp', Timeout => 5)
@@ -376,7 +376,7 @@ assert_eq "$(_yes test -e "$(_proxy_dir)")" no "native default: proxy dir remove
 
 out="$(_native AI_SANDBOX_ALLOW_UNRESTRICTED_NET=1)"
 assert_contains "${out}" "LOOPBACK_REACHED HOST_HELLO" "native UNRESTRICTED_NET=1: host loopback reachable (control)"
-assert_contains "${out}" "HTTPS_PROXY_ENV=${NL}" "native UNRESTRICTED_NET=1: no proxy variable"
+assert_contains "${out}" "HTTPS_PROXY_ENV=None" "native UNRESTRICTED_NET=1: no proxy variable"
 
 assert_no_live_client_reached
 tests_summary_and_exit
