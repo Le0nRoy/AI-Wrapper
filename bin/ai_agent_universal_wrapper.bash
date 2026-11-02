@@ -41,6 +41,87 @@ _sandbox_pass_env_add() {
     export AI_SANDBOX_PASS_ENV="${pass_env}"
 }
 
+# Resolve a path canonically. The single definition for both backends and
+# the wrapper libs (ai_wrapper_lib.bash, macos_sandbox_exec.bash), which
+# are always sourced after this file. macOS lacks GNU `readlink -f`; use
+# perl as the fallback that ships in the base system. Returns non-zero (and prints nothing)
+# if no resolver is available or the resolution fails — callers must check.
+# We deliberately don't synthesize an unresolved fallback: symlink-mismatched
+# paths silently break sandbox rules, which is worse than failing loudly.
+_realpath() {
+    local p="${1}" out
+    if command -v realpath >/dev/null 2>&1; then
+        if out="$(realpath "${p}" 2>/dev/null)" && [[ -n "${out}" ]]; then
+            [[ "${AI_SANDBOX_DEBUG:-0}" == "1" ]] && echo_log "DEBUG" "_realpath: branch=realpath path=${p}"
+            echo "${out}"
+            return 0
+        fi
+    fi
+    if command -v perl >/dev/null 2>&1; then
+        if out="$(perl -MCwd=abs_path -e 'my $r = abs_path($ARGV[0]); print $r if defined $r' "${p}" 2>/dev/null)" && [[ -n "${out}" ]]; then
+            [[ "${AI_SANDBOX_DEBUG:-0}" == "1" ]] && echo_log "DEBUG" "_realpath: branch=perl-abs_path path=${p}"
+            echo "${out}"
+            return 0
+        fi
+    fi
+    # Last-ditch: canonicalize via `cd … && pwd -P`. Works for directories
+    # directly; for files, follow any final-component symlinks via readlink
+    # (capped to a small depth to prevent loops) before resolving the parent
+    # and re-attaching the basename so symlinks in the directory chain are
+    # also resolved.
+    local parent base resolved_parent
+    if [[ -d "${p}" ]]; then
+        if out="$( cd "${p}" 2>/dev/null && pwd -P )" && [[ -n "${out}" ]]; then
+            [[ "${AI_SANDBOX_DEBUG:-0}" == "1" ]] && echo_log "DEBUG" "_realpath: branch=cd-pwd-dir path=${p}"
+            echo "${out}"
+            return 0
+        fi
+    elif [[ -e "${p}" || -L "${p}" ]]; then
+        local cur="${p}" target depth=0
+        # Cycle detection: the depth cap protects against unbounded
+        # recursion, but a tight loop (a → b → a) would otherwise spin up
+        # to 40 iterations and then silently return a non-canonical
+        # intermediate path. Track visited paths and bail the moment we
+        # revisit one. Bash 3.2-compatible: linear scan of a small array
+        # (cap is the depth limit, so ~40 entries max).
+        local -a seen=()
+        local _s_i
+        while [[ -L "${cur}" && ${depth} -lt 40 ]]; do
+            seen+=("${cur}")
+            target="$(readlink "${cur}" 2>/dev/null)" || break
+            [[ -z "${target}" ]] && break
+            if [[ "${target}" == /* ]]; then
+                cur="${target}"
+            else
+                cur="$(dirname -- "${cur}")/${target}"
+            fi
+            depth=$((depth + 1))
+            for (( _s_i = 0; _s_i < ${#seen[@]}; _s_i++ )); do
+                if [[ "${seen[$_s_i]}" == "${cur}" ]]; then
+                    [[ "${AI_SANDBOX_DEBUG:-0}" == "1" ]] && echo_log "DEBUG" "_realpath: symlink cycle detected path=${p} depth=${depth}"
+                    return 1
+                fi
+            done
+        done
+        # After following the chain, the target might itself be a directory.
+        if [[ -d "${cur}" ]]; then
+            if out="$( cd "${cur}" 2>/dev/null && pwd -P )" && [[ -n "${out}" ]]; then
+                [[ "${AI_SANDBOX_DEBUG:-0}" == "1" ]] && echo_log "DEBUG" "_realpath: branch=cd-pwd-symlink-walk-dir path=${p} depth=${depth}"
+                echo "${out}"
+                return 0
+            fi
+        fi
+        parent="$(dirname -- "${cur}")"
+        base="$(basename -- "${cur}")"
+        if resolved_parent="$( cd "${parent}" 2>/dev/null && pwd -P )" && [[ -n "${resolved_parent}" ]]; then
+            [[ "${AI_SANDBOX_DEBUG:-0}" == "1" ]] && echo_log "DEBUG" "_realpath: branch=cd-pwd-symlink-walk-file path=${p} depth=${depth}"
+            echo "${resolved_parent%/}/${base}"
+            return 0
+        fi
+    fi
+    return 1
+}
+
 # Classify a directory path against the sandbox's sensitive-location
 # rules. Prints one of:
 #   system  - "" / a filesystem root or top-level system location
@@ -80,6 +161,44 @@ _sandbox_sensitive_dir_kind() {
             if [[ "$(uname -s)" == "Darwin" ]]; then echo dotfile; return 0; fi ;;
     esac
     return 1
+}
+
+# Classify a path both as given (LOGICAL, against the raw HOME) and as
+# resolved (RESOLVED, against the resolved HOME) and print the first
+# sensitive kind found, resolved first; prints nothing and returns 1 when
+# neither is sensitive. The resolved form catches a symlink or ".." that
+# leads into a sensitive location; the logical form keeps refusing a path
+# spelled as one (e.g. ~/.config symlinked to a data disk still holds the
+# credentials ~/.config would). Args: LOGICAL RESOLVED HOME RESOLVED_HOME
+_sandbox_sensitive_pair_kind() {
+    _sandbox_sensitive_dir_kind "${2}" "${4}" || _sandbox_sensitive_dir_kind "${1}" "${3}"
+}
+
+# Resolve one AI_SANDBOX_EXTRA_{RW,RO}_DIRS entry (trimmed, ~ expanded) to
+# the canonical directory that gets bound and classified.
+#   0 - prints the resolved directory
+#   2 - nothing exists at ENTRY: WARNING, the caller skips it (a preset
+#       naming a path from another machine stays usable; nothing is granted)
+#   1 - ENTRY exists but does not resolve to a directory (dangling symlink,
+#       symlink loop, unreadable component, non-directory): ERROR, the
+#       caller refuses the launch. Not covered by
+#       AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR.
+# Args: AGENT_TAG VAR_NAME ENTRY
+_sandbox_resolve_extra_dir() {
+    local tag="${1}" var="${2}" entry="${3}" resolved
+    if [[ ! -e "${entry}" && ! -L "${entry}" ]]; then
+        echo_log "WARNING" "[${tag}] ${var}: skipping '${entry}' (does not exist)"
+        return 2
+    fi
+    if ! resolved="$(_realpath "${entry}")" || [[ -z "${resolved}" || ! -d "${resolved}" ]]; then
+        echo_log "ERROR" "[${tag}] ${var}: '${entry}' does not resolve to a directory (dangling symlink, symlink loop, unreadable path or not a directory). Fix or remove the entry."
+        return 1
+    fi
+    [[ "${resolved}" == "/" ]] || resolved="${resolved%/}"
+    if [[ "${resolved}" != "${entry}" && "${resolved}" != "${entry%/}" ]]; then
+        echo_log "INFO" "[${tag}] ${var}: '${entry}' resolves to ${resolved}; the sandbox binds it there."
+    fi
+    printf '%s\n' "${resolved}"
 }
 
 # Warn when an accepted AI_SANDBOX_EXTRA_RW_DIRS entry DIR is a git dir or
@@ -376,10 +495,13 @@ _run_sandboxed_agent_linux() {
     # AI_SANDBOX_EXTRA_{RW,RO}_DIRS: comma-separated absolute paths that
     # extend the per-call bind list without patching individual wrappers.
     # Populated by the interactive Settings sub-menu (str catalog entries
-    # in ai_wrapper_lib.bash) or set directly in the environment. Missing
-    # or non-directory entries WARN and are skipped rather than failing
-    # the launch — a preset that references a path present on the
-    # user's other machine should stay usable here.
+    # in ai_wrapper_lib.bash) or set directly in the environment. Each
+    # entry is resolved (_sandbox_resolve_extra_dir) before it is bound or
+    # classified, so a symlink or ".." cannot carry a sensitive target past
+    # the guard below. Missing entries WARN and are skipped — a preset that
+    # references a path present on the user's other machine should stay
+    # usable here; an entry that exists but does not resolve to a
+    # directory refuses the launch.
     # Entries accepted from AI_SANDBOX_EXTRA_{RW,RO}_DIRS, tracked separately
     # from extra_bwrap_flags (which also carries the wrapper's own trusted
     # binds, e.g. ~/.claude via WRAPPER_FLAGS). The sensitivity guard below
@@ -387,8 +509,11 @@ _run_sandboxed_agent_linux() {
     # wholesale would also flag those trusted binds and refuse to launch.
     # Tilde is preserved verbatim in preset files; quoted [[ -d ]] does not
     # expand it, so use parameter substitution to expand a leading ~ to $HOME.
-    local -a _user_extra_bind_dirs=() _user_extra_bwrap_flags=()
-    local _extra_dirs_ifs _d
+    # _user_extra_bind_dirs holds the resolved directories (what is bound),
+    # _user_extra_bind_names the entries as given (classified too, see
+    # _sandbox_sensitive_pair_kind, and named in refusals).
+    local -a _user_extra_bind_dirs=() _user_extra_bind_names=() _user_extra_bwrap_flags=()
+    local _extra_dirs_ifs _d _d_resolved _d_rc
     if [[ -n "${AI_SANDBOX_EXTRA_RW_DIRS:-}" ]]; then
         _extra_dirs_ifs="${IFS}"; IFS=','
         for _d in ${AI_SANDBOX_EXTRA_RW_DIRS}; do
@@ -396,13 +521,13 @@ _run_sandboxed_agent_linux() {
             _d="${_d%"${_d##*[![:space:]]}"}"
             [[ -z "${_d}" ]] && continue
             _d="${_d/#\~/${HOME}}"
-            if [[ -d "${_d}" ]]; then
-                _user_extra_bwrap_flags+=(--bind "${_d}" "${_d}")
-                _user_extra_bind_dirs+=("${_d}")
-                _sandbox_warn_extra_rw_git "${agent_name}" "${_d}"
-            else
-                echo_log "WARNING" "[$agent_name] AI_SANDBOX_EXTRA_RW_DIRS: skipping '${_d}' (not a directory)"
-            fi
+            _d_resolved="$(_sandbox_resolve_extra_dir "${agent_name}" AI_SANDBOX_EXTRA_RW_DIRS "${_d}")"; _d_rc=$?
+            (( _d_rc == 2 )) && continue
+            (( _d_rc == 0 )) || exit 1
+            _user_extra_bwrap_flags+=(--bind "${_d_resolved}" "${_d_resolved}")
+            _user_extra_bind_dirs+=("${_d_resolved}")
+            _user_extra_bind_names+=("${_d}")
+            _sandbox_warn_extra_rw_git "${agent_name}" "${_d_resolved}"
         done
         IFS="${_extra_dirs_ifs}"
     fi
@@ -413,12 +538,12 @@ _run_sandboxed_agent_linux() {
             _d="${_d%"${_d##*[![:space:]]}"}"
             [[ -z "${_d}" ]] && continue
             _d="${_d/#\~/${HOME}}"
-            if [[ -d "${_d}" ]]; then
-                extra_bwrap_flags+=(--ro-bind "${_d}" "${_d}")
-                _user_extra_bind_dirs+=("${_d}")
-            else
-                echo_log "WARNING" "[$agent_name] AI_SANDBOX_EXTRA_RO_DIRS: skipping '${_d}' (not a directory)"
-            fi
+            _d_resolved="$(_sandbox_resolve_extra_dir "${agent_name}" AI_SANDBOX_EXTRA_RO_DIRS "${_d}")"; _d_rc=$?
+            (( _d_rc == 2 )) && continue
+            (( _d_rc == 0 )) || exit 1
+            extra_bwrap_flags+=(--ro-bind "${_d_resolved}" "${_d_resolved}")
+            _user_extra_bind_dirs+=("${_d_resolved}")
+            _user_extra_bind_names+=("${_d}")
         done
         IFS="${_extra_dirs_ifs}"
     fi
@@ -448,6 +573,23 @@ _run_sandboxed_agent_linux() {
         exit 1
     fi
 
+    # Classify and bind the canonical WORKDIR, not the logical $(pwd): a cwd
+    # reached through a symlink (~/proj -> /etc, ~/proj -> ~/.ssh) or a
+    # symlinked ancestor would otherwise pass the string guard below while
+    # bwrap follows the link and binds the sensitive target read-write.
+    # HOME is resolved the same way so the comparisons hold when $HOME
+    # itself sits behind a symlink.
+    local resolved_workdir resolved_home
+    if ! resolved_workdir="$(_realpath "${WORKDIR}")" || [[ -z "${resolved_workdir}" || ! -d "${resolved_workdir}" ]]; then
+        echo_log "ERROR" "[$agent_name] Cannot resolve the working directory ${WORKDIR}; refusing to launch."
+        exit 1
+    fi
+    [[ "${resolved_workdir}" == "/" ]] || resolved_workdir="${resolved_workdir%/}"
+    resolved_home="$(_realpath "${HOME_DIR}")" || resolved_home="${HOME_DIR%/}"
+    resolved_home="${resolved_home%/}"
+    local workdir_label="${resolved_workdir}"
+    [[ "${WORKDIR}" == "${resolved_workdir}" ]] || workdir_label="${resolved_workdir} (via ${WORKDIR})"
+
     # Refuse to sandbox with a WORKDIR that's a system root, $HOME itself, or
     # a dotfile dir directly under $HOME: the WORKDIR bind above grants RW on
     # (subpath WORKDIR) unconditionally, so a too-broad cwd neutralises the
@@ -459,17 +601,17 @@ _run_sandboxed_agent_linux() {
     # Bypass with AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 when intentional.
     if [[ "${allow_sensitive_workdir}" != "1" ]]; then
         local home_normalized="${HOME_DIR%/}"
-        case "$(_sandbox_sensitive_dir_kind "${WORKDIR}" "${home_normalized}")" in
+        case "$(_sandbox_sensitive_pair_kind "${WORKDIR}" "${resolved_workdir}" "${home_normalized}" "${resolved_home}")" in
             system)
-                echo_log "ERROR" "[$agent_name] Refusing to sandbox with WORKDIR=${WORKDIR} (top-level or system location). cd into a project directory first, or set AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 to override."
+                echo_log "ERROR" "[$agent_name] Refusing to sandbox with WORKDIR=${workdir_label} (top-level or system location). cd into a project directory first, or set AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 to override."
                 exit 1
                 ;;
             home)
-                echo_log "ERROR" "[$agent_name] Refusing to sandbox with WORKDIR=\$HOME (${WORKDIR}); that would grant RW on the entire home directory. cd into a subdirectory first, or set AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 to override."
+                echo_log "ERROR" "[$agent_name] Refusing to sandbox with WORKDIR=\$HOME (${workdir_label}); that would grant RW on the entire home directory. cd into a subdirectory first, or set AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 to override."
                 exit 1
                 ;;
             dotfile)
-                echo_log "ERROR" "[$agent_name] Refusing to sandbox with WORKDIR=${WORKDIR} (a dotfile directory directly under \$HOME — granting RW here likely exposes credentials). cd into a non-sensitive project directory, or set AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 to override."
+                echo_log "ERROR" "[$agent_name] Refusing to sandbox with WORKDIR=${workdir_label} (a dotfile directory directly under \$HOME — granting RW here likely exposes credentials). cd into a non-sensitive project directory, or set AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 to override."
                 exit 1
                 ;;
         esac
@@ -481,18 +623,22 @@ _run_sandboxed_agent_linux() {
         # guard above was specifically designed to refuse. Scoped to
         # _user_extra_bind_dirs (not extra_bwrap_flags) so it never sees the
         # wrapper's own trusted binds (~/.claude, ~/.claude.json, etc.).
-        for _d in "${_user_extra_bind_dirs[@]+"${_user_extra_bind_dirs[@]}"}"; do
-            case "$(_sandbox_sensitive_dir_kind "${_d}" "${home_normalized}")" in
+        local _d_i _d_label
+        for (( _d_i = 0; _d_i < ${#_user_extra_bind_dirs[@]}; _d_i++ )); do
+            _d="${_user_extra_bind_names[_d_i]}"
+            _d_label="${_d}"
+            [[ "${_d%/}" == "${_user_extra_bind_dirs[_d_i]}" ]] || _d_label="${_d} -> ${_user_extra_bind_dirs[_d_i]}"
+            case "$(_sandbox_sensitive_pair_kind "${_d}" "${_user_extra_bind_dirs[_d_i]}" "${home_normalized}" "${resolved_home}")" in
                 system)
-                    echo_log "ERROR" "[$agent_name] Refusing extra bind '${_d}' (top-level or system location). Remove it from AI_SANDBOX_EXTRA_RW_DIRS/AI_SANDBOX_EXTRA_RO_DIRS, or set AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 to override."
+                    echo_log "ERROR" "[$agent_name] Refusing extra bind '${_d_label}' (top-level or system location). Remove it from AI_SANDBOX_EXTRA_RW_DIRS/AI_SANDBOX_EXTRA_RO_DIRS, or set AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 to override."
                     exit 1
                     ;;
                 home)
-                    echo_log "ERROR" "[$agent_name] Refusing extra bind '${_d}' (== \$HOME). Set AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 to override."
+                    echo_log "ERROR" "[$agent_name] Refusing extra bind '${_d_label}' (== \$HOME). Set AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 to override."
                     exit 1
                     ;;
                 dotfile)
-                    echo_log "ERROR" "[$agent_name] Refusing extra bind '${_d}' (under HOME dotfile dir — grants read/write on credentials). Set AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 to override."
+                    echo_log "ERROR" "[$agent_name] Refusing extra bind '${_d_label}' (under HOME dotfile dir — grants read/write on credentials). Set AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 to override."
                     exit 1
                     ;;
             esac
@@ -597,9 +743,14 @@ _run_sandboxed_agent_linux() {
         --proc /proc
         --dev /dev
         "${protected_home_binds[@]+"${protected_home_binds[@]}"}"
-        # Working directory (read-write)
-        --bind "${WORKDIR}" "${WORKDIR}"
+        # Working directory (read-write), from its resolved path
+        --bind "${resolved_workdir}" "${resolved_workdir}"
     )
+    # A cwd reached through a symlink is also mounted at the logical path,
+    # so --chdir below keeps the cwd tooling and the user expect. The git
+    # metadata overlays (_wrapper_git_ro_bind / _wrapper_git_pin) cover
+    # both paths.
+    [[ "${WORKDIR}" == "${resolved_workdir}" ]] || bwrap_args+=(--bind "${resolved_workdir}" "${WORKDIR}")
 
     # Nested user namespaces: by default the agent cannot create its own
     # (each one is fresh kernel attack surface and a way to gain namespace

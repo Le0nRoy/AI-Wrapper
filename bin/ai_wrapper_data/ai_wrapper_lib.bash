@@ -104,82 +104,15 @@ _wrapper_add_meta_bind() {
 }
 
 # ===== PORTABLE PATH-RESOLUTION HELPERS =====
-# _realpath / _check_workdir_breadth normally live in
+# _realpath lives in ai_agent_universal_wrapper.bash (sourced before this
+# file, see Prerequisites above). _check_workdir_breadth normally lives in
 # ai_wrapper_data/macos_sandbox_exec.bash, but that file is only sourced
 # lazily inside run_sandboxed_agent() when $(uname -s) == Darwin — it is
-# NOT available here, before the menu, on any OS. Both helpers are
-# OS-generic in their own implementation (realpath(1)/perl/pure-bash
-# fallback chain; plain string comparisons), so they are duplicated here
-# (structurally equivalent to macos_sandbox_exec.bash) rather than invented
-# differently, to keep behavior identical to whatever the macOS backend does
-# with the same inputs later in the run.
-_realpath() {
-    local p="${1}" out
-    if command -v realpath >/dev/null 2>&1; then
-        if out="$(realpath "${p}" 2>/dev/null)" && [[ -n "${out}" ]]; then
-            [[ "${AI_SANDBOX_DEBUG:-0}" == "1" ]] && echo_log "DEBUG" "_realpath: branch=realpath path=${p}"
-            echo "${out}"
-            return 0
-        fi
-    fi
-    if command -v perl >/dev/null 2>&1; then
-        if out="$(perl -MCwd=abs_path -e 'my $r = abs_path($ARGV[0]); print $r if defined $r' "${p}" 2>/dev/null)" && [[ -n "${out}" ]]; then
-            [[ "${AI_SANDBOX_DEBUG:-0}" == "1" ]] && echo_log "DEBUG" "_realpath: branch=perl-abs_path path=${p}"
-            echo "${out}"
-            return 0
-        fi
-    fi
-    # Last-ditch: canonicalize via `cd … && pwd -P`. Works for directories
-    # directly; for files, follow any final-component symlinks via readlink
-    # (capped to a small depth to prevent loops) before resolving the parent
-    # and re-attaching the basename so symlinks in the directory chain are
-    # also resolved.
-    local parent base resolved_parent
-    if [[ -d "${p}" ]]; then
-        if out="$( cd "${p}" 2>/dev/null && pwd -P )" && [[ -n "${out}" ]]; then
-            [[ "${AI_SANDBOX_DEBUG:-0}" == "1" ]] && echo_log "DEBUG" "_realpath: branch=cd-pwd-dir path=${p}"
-            echo "${out}"
-            return 0
-        fi
-    elif [[ -e "${p}" || -L "${p}" ]]; then
-        local cur="${p}" target depth=0
-        local -a seen=()
-        local _s_i
-        while [[ -L "${cur}" && ${depth} -lt 40 ]]; do
-            seen+=("${cur}")
-            target="$(readlink "${cur}" 2>/dev/null)" || break
-            [[ -z "${target}" ]] && break
-            if [[ "${target}" == /* ]]; then
-                cur="${target}"
-            else
-                cur="$(dirname -- "${cur}")/${target}"
-            fi
-            depth=$((depth + 1))
-            for (( _s_i = 0; _s_i < ${#seen[@]}; _s_i++ )); do
-                if [[ "${seen[$_s_i]}" == "${cur}" ]]; then
-                    [[ "${AI_SANDBOX_DEBUG:-0}" == "1" ]] && echo_log "DEBUG" "_realpath: symlink cycle detected path=${p} depth=${depth}"
-                    return 1
-                fi
-            done
-        done
-        if [[ -d "${cur}" ]]; then
-            if out="$( cd "${cur}" 2>/dev/null && pwd -P )" && [[ -n "${out}" ]]; then
-                [[ "${AI_SANDBOX_DEBUG:-0}" == "1" ]] && echo_log "DEBUG" "_realpath: branch=cd-pwd-symlink-walk-dir path=${p} depth=${depth}"
-                echo "${out}"
-                return 0
-            fi
-        fi
-        parent="$(dirname -- "${cur}")"
-        base="$(basename -- "${cur}")"
-        if resolved_parent="$( cd "${parent}" 2>/dev/null && pwd -P )" && [[ -n "${resolved_parent}" ]]; then
-            [[ "${AI_SANDBOX_DEBUG:-0}" == "1" ]] && echo_log "DEBUG" "_realpath: branch=cd-pwd-symlink-walk-file path=${p} depth=${depth}"
-            echo "${resolved_parent%/}/${base}"
-            return 0
-        fi
-    fi
-    return 1
-}
-
+# NOT available here, before the menu, on any OS. It is OS-generic (plain
+# string comparisons), so it is duplicated here (structurally equivalent to
+# macos_sandbox_exec.bash) rather than invented differently, to keep
+# behavior identical to whatever the macOS backend does with the same
+# inputs later in the run.
 # WS3 / U-E: emit a one-line WARN and set $AI_SANDBOX_WORKDIR_WARNING when
 # WORKDIR is a direct $HOME child outside the project-dir allowlist
 # (Workspace/Projects/src/code/bin/work/dev/repos and lowercase variants).
@@ -995,31 +928,85 @@ _wrapper_protect_workdir_git() {
     return 0
 }
 
+# Locations, relative to the resolved $HOME, that a symlinked agent config
+# path must not resolve to, into, or above (_wrapper_check_config_symlink):
+# credential stores the sandbox otherwise exposes only behind explicit
+# PASS_* opt-ins, files and dirs the host shell, git or session manager
+# runs or loads (an RW bind there is host code execution), and the paths
+# kept read-only by default (~/bin, the shared skill source; #62).
+# "Above" makes the broad roots holding them (~/.config, ~/.local,
+# ~/.local/share, ~/Library, ...) refusals too. A denylist: anything not
+# listed under $HOME stays accepted (relocated, dotpath and multi-account
+# profiles such as ~/.config/claude, ~/.claude-work, ~/profiles/codex).
+_WRAPPER_CONFIG_SYMLINK_DENIED=(
+    .ssh .gnupg .aws .azure .kube .docker .colima .podman
+    .netrc .npmrc .pypirc .git-credentials .password-store .gitconfig
+    .config/git .config/gh .config/gcloud .config/glab-cli .config/containers
+    .config/systemd .config/autostart .config/environment.d
+    .local/share/glab-cli .local/share/keyrings .local/bin
+    "Library/Application Support/glab-cli" Library/Keychains Library/LaunchAgents
+    .bashrc .bash_profile .bash_login .bash_logout .profile
+    .zshrc .zshenv .zprofile .zlogin .zlogout .config/fish
+    bin ai-wrapper/.agents
+)
+# Broad roots refused even when nothing listed above exists below them.
+_WRAPPER_CONFIG_SYMLINK_BROAD_ROOTS=(
+    .config .local .local/share .local/state .cache
+    Library "Library/Application Support"
+)
+
 # Guard for an agent config path (~/.claude, ~/.codex, ~/.<agent>-<name>,
-# ~/.claude-<name>.json) that the wrapper binds RW. If PATH is a symlink,
-# its target must resolve strictly under $HOME and outside the credential
-# locations the sandbox otherwise only exposes behind explicit PASS_*
-# opt-ins — a planted symlink must not turn the account bind into RW on
-# ~/.ssh, $HOME or /etc. Non-symlinks pass (callers check type/existence).
+# ~/.claude-<name>.json, ~/.copilot, Antigravity's profile config/) that
+# the wrapper binds RW. Applies when PATH is a symlink, or resolves
+# elsewhere than its spelling because an ancestor is one; other paths pass
+# (callers check type/existence and may create them).
+#   Mandatory validation: the symlink must resolve, without a loop, to an
+#   existing target (a dangling link would let touch/mkdir create the
+#   target before the bind).
+#   Authorization: the target must lie strictly under $HOME, not be $HOME
+#   or a broad root (_WRAPPER_CONFIG_SYMLINK_BROAD_ROOTS), and not sit in,
+#   at, or above a _WRAPPER_CONFIG_SYMLINK_DENIED location — a planted
+#   symlink must not turn the account bind into RW on ~/.ssh, ~/.bashrc,
+#   ~/.config or /etc.
 # Prints an ERROR and returns 1 on refusal. Args: PATH
 _wrapper_check_config_symlink() {
-    local p="${1}" resolved home cred
-    [[ -L "${p}" ]] || return 0
-    if ! resolved="$(_realpath "${p}")" || [[ -z "${resolved}" ]]; then
-        echo "ERROR: ${p} is a symlink whose target cannot be resolved. Inspect and remove before launching." >&2
-        return 1
-    fi
-    home="$(_realpath "${HOME}")" || home="${HOME%/}"
+    local p="${1%/}" resolved home raw_home expected entry kind=symlink
+    raw_home="${HOME%/}"
+    home="$(_realpath "${HOME}")" || home="${raw_home}"
     home="${home%/}"
-    if [[ -z "${home}" || "${resolved}" != "${home}"/* ]]; then
-        echo "ERROR: ${p} is a symlink pointing outside \$HOME (resolves to ${resolved}). Refusing — the bind would grant RW on the target." >&2
+    if [[ ! -L "${p}" ]]; then
+        [[ -e "${p}" ]] || return 0
+        resolved="$(_realpath "${p}")" || resolved=""
+        case "${p}" in
+            "${raw_home}"/*) expected="${home}/${p#"${raw_home}"/}" ;;
+            *) expected="${p}" ;;
+        esac
+        [[ -n "${resolved}" && "${resolved%/}" == "${expected}" ]] && return 0
+        kind="path behind a symlinked parent"
+    fi
+    if ! resolved="$(_realpath "${p}")" || [[ -z "${resolved}" ]]; then
+        echo "ERROR: ${p} is a ${kind} whose target cannot be resolved (symlink loop or unreadable). Inspect and remove before launching." >&2
         return 1
     fi
-    for cred in .ssh .gnupg .aws .kube .docker .colima .netrc .npmrc .pypirc \
-            .config/gcloud .config/glab-cli .local/share/glab-cli \
-            "Library/Application Support/glab-cli"; do
-        if [[ "${resolved}" == "${home}/${cred}" || "${resolved}" == "${home}/${cred}"/* ]]; then
-            echo "ERROR: ${p} is a symlink into a credential location (resolves to ${resolved}). Refusing — the bind would grant RW on it." >&2
+    resolved="${resolved%/}"
+    if [[ ! -e "${resolved}" ]]; then
+        echo "ERROR: ${p} is a ${kind} whose target does not exist (resolves to ${resolved}). Create the target or remove the link before launching." >&2
+        return 1
+    fi
+    if [[ -z "${home}" || "${resolved}" != "${home}"/* ]]; then
+        echo "ERROR: ${p} is a ${kind} pointing outside \$HOME (resolves to ${resolved}). Refusing — the bind would grant RW on the target." >&2
+        return 1
+    fi
+    for entry in "${_WRAPPER_CONFIG_SYMLINK_BROAD_ROOTS[@]}"; do
+        if [[ "${resolved}" == "${home}/${entry}" ]]; then
+            echo "ERROR: ${p} is a ${kind} to a broad directory (resolves to ${resolved}). Refusing — point it at a dedicated directory such as ${home}/${entry}/<agent>." >&2
+            return 1
+        fi
+    done
+    for entry in "${_WRAPPER_CONFIG_SYMLINK_DENIED[@]}"; do
+        if [[ "${resolved}" == "${home}/${entry}" || "${resolved}" == "${home}/${entry}"/* \
+                || "${home}/${entry}" == "${resolved}"/* ]]; then
+            echo "ERROR: ${p} is a ${kind} into or above a credential location or host-executed path (${home}/${entry}; resolves to ${resolved}). Refusing — the bind would grant RW on it." >&2
             return 1
         fi
     done
@@ -1118,8 +1105,8 @@ _AI_SETTINGS_LIST=(
 
     # Additional settings (env vars, profiles)
     "AI_SANDBOX_PASS_ENV|str||red|Pass extra env vars by name|Comma-separated list of variable names to share (advanced)|additional"
-    "AI_SANDBOX_EXTRA_RW_DIRS|str||yellow|Extra read-write bind directories|Comma-separated absolute paths granted RW inside the sandbox (in addition to WORKDIR). Missing entries WARN and are skipped.|additional"
-    "AI_SANDBOX_EXTRA_RO_DIRS|str||yellow|Extra read-only bind directories|Comma-separated absolute paths granted RO inside the sandbox. Missing entries WARN and are skipped.|additional"
+    "AI_SANDBOX_EXTRA_RW_DIRS|str||yellow|Extra read-write bind directories|Comma-separated absolute paths granted RW inside the sandbox (in addition to WORKDIR), at their resolved path. Missing entries WARN and are skipped; an entry that does not resolve to a directory refuses the launch.|additional"
+    "AI_SANDBOX_EXTRA_RO_DIRS|str||yellow|Extra read-only bind directories|Comma-separated absolute paths granted RO inside the sandbox, at their resolved path. Missing entries WARN and are skipped; an entry that does not resolve to a directory refuses the launch.|additional"
     "AI_SANDBOX_ALLOW_ANDROID|bool|0|yellow|Share ~/Android (read-write)|Binds ~/Android RW (Android SDK, emulator images, debug keystores). The agent can change SDK tools the host runs later. Off: ~/Android is not visible inside the sandbox.|additional|linux"
     "AI_SANDBOX_PROFILE|path||red|Custom sandbox profile override|Path to a custom SBPL file. Default: ai_wrapper_data/claude_wrapper.sb. Set only if you have a custom restrictions file.|additional|darwin"
     "AI_SANDBOX_PROFILE_TRUST_ME|bool|0|red|Skip safety check on custom profile|Bypasses the (version 1) + (deny default) validation. Set only if your profile intentionally relaxes the sandbox.|additional|darwin"
