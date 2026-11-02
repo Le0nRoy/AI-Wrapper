@@ -19,6 +19,13 @@ for test_file in tests/test_*.bash; do
     fi
 done
 
+# Python unit tests for helpers shipped in bin/ai_wrapper_data (offline).
+echo ""
+echo "### tests/test_network_proxy.py"
+if ! python3 -I -B tests/test_network_proxy.py; then
+    failed=1
+fi
+
 # Python unit tests for helpers shipped inside skills (offline, no credentials).
 for test_file in dot_agents/skills/*/scripts/test_*.py; do
     [[ -f "${test_file}" ]] || continue

@@ -64,6 +64,7 @@ that launch a real sandbox.
 | `test_preset_identity.bash` | fake home under `$HOME`, stub `sha256sum`/`shasum` dirs, preset files | bash, python3 | full | full |
 | `test_setup_skills.bash` | fake home under `$TMPDIR` | bash, coreutils | full | full |
 | `dot_agents/skills/tortuga/scripts/test_gh.py` | none (mocked `subprocess`) | python3 | full | full |
+| `test_network_proxy.py` | loopback mock upstreams and proxies on ephemeral ports, UNIX sockets under a temp dir in `/tmp`, proxy subprocesses (stopped by signal); fake resolver, no DNS or internet | python3 | full | full |
 | `test_sandbox_common.bash`, `test_extra_bind_dirs.bash` | launches the real sandbox, fake home | bwrap + userns, python3 + libseccomp / sandbox-exec | fails without bwrap, user namespaces or the filter prerequisites | full |
 | `test_sandbox_macos_only.bash` | sandbox-exec dry-run | sandbox-exec | exits 0 with a skip line | full |
 | `test_macos_credential_policy.bash` | fake home under `$HOME` with synthetic git credential files and a fake `*.keychain-db`; stub `getconf`/`sandbox-exec` off macOS; on CI or with `AI_WRAPPER_TEST_SYNTHETIC_KEYCHAIN=1` a throwaway keychain in the fake home (added to and removed from the user keychain search list) | bash; sandbox-exec and `security` for native probes | profile-check unit tests + rendered profile; native part skipped | full: native git-credential and Keychain denial (missing sandbox-exec fails) |
@@ -86,7 +87,7 @@ is the local equivalent. Keep both in sync when adding a test file.
 - `lint` (Linux, macOS): `bash -n` on every script; ShellCheck on Linux.
 - `logic-tests` (Linux, macOS): catalog, help-doc, setup-skills, Tortuga
   helper, live-client isolation canaries, agy host-side boundary, preset
-  identity.
+  identity, network proxy engine.
 - `smoke-linux`: bubblewrap installed; sandbox, extra-binds, isolation
   canaries (with e2e), codex, bind-hardening, external worktrees,
   WORKDIR git metadata, macOS RO-overlay and credential-policy rendering, agy, copilot, Linux
