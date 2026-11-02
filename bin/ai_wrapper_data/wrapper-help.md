@@ -365,8 +365,8 @@ switch between them without re-authenticating each time.
   file) via the same auto-save/auto-load mechanism as every other setting (see `c) Clear` below) — pick an
   account once per project and it's remembered on the next launch from
   that directory.
-- Non-interactive launches respect `CLAUDE_ACCOUNT=<name>` set in the
-  environment, or fall back to the workdir's saved preset.
+- `CLAUDE_ACCOUNT=<name>` set in the launch environment wins over the
+  workdir's saved preset; when unset, the saved account is used.
 
 Account switching relies on bind-mount remapping — the wrapper makes
 `~/.claude-<name>` appear as `~/.claude` inside the sandbox so the Claude
@@ -404,11 +404,22 @@ per-agent operation — no naming, no confirmation, no sub-menu required.
   `cursor`. One file per workdir and agent, so running the Claude and
   Codex wrappers in the same directory never clobbers the other's
   settings.
-- **Auto-load** — fires when the menu opens. Restores all settings
-  silently on a match; if the file does not exist (first run or after
-  a clear) the menu starts with catalog defaults. A dim
-  `(restored from <path>)` line appears in the header when settings
-  are in effect.
+- **Auto-load** — fires when the menu opens, and before a
+  non-interactive launch. Restores the saved settings; if the file does
+  not exist (first run or after a clear) the menu starts with catalog
+  defaults. A dim `(restored from <path>)` line appears in the header
+  when settings are in effect.
+- **Launch environment wins** — a setting already set in the environment
+  you launch with (even `=0` or empty) is never overwritten by the
+  preset, e.g. `AI_SANDBOX_PASS_AWS=0 claude_wrapper` keeps AWS off
+  even if the preset saved `1`. In an interactive launch the next
+  auto-save then stores that value for the workdir.
+- **Restore warnings** — restoring a red or yellow setting (credentials,
+  Docker socket, extra dirs, git config, ...) at a non-default value
+  prints `WARN: ... Restored KEY=VALUE from the saved preset` on
+  stderr, so scripted launches see what was relaxed. Session-only
+  settings such as `AI_SANDBOX_ALLOW_EXTERNAL_WORKTREES` are never
+  saved or restored.
 - **Upgrade from the shared file** — older releases wrote one shared
   `<hash>.env` per workdir for all agents. Until this agent has saved
   its own `<hash>-<agent>.env`, auto-load reads that legacy file
