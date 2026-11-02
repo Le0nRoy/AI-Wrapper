@@ -17,7 +17,13 @@ on stdout once bound; SIGINT/SIGTERM stop the listeners, remove the socket
 file and exit 0. Errors go to stderr (exit 1). Logs name destinations and
 outcomes only, never paths, queries, headers or payloads.
 
-Wrapper wiring is separate: #77 (Linux bwrap), #78 (macOS sandbox-exec).
+``--parent-pid PID`` (for wrappers that launch it in the background): the
+proxy starts a new session, so Ctrl+C in the launching terminal never
+reaches it, refuses to start unless PID is its parent, and stops like on
+SIGTERM once PID is no longer its parent (the wrapper died without
+cleaning up).
+
+Linux bwrap wiring: #77 (ai_agent_universal_wrapper.bash); macOS: #78.
 """
 
 import argparse
@@ -59,6 +65,7 @@ MAX_PORT = 65535
 RELAY_BUFFER_BYTES = 65536
 MAX_CHUNK_LINE_BYTES = 8192
 UNIX_SOCKET_UMASK = 0o177
+PARENT_POLL_INTERVAL_SECONDS = 1.0
 
 # Hop-by-hop request headers never forwarded upstream (RFC 9110 § 7.6.1);
 # Host is rewritten from the request URI, Expect is answered by the proxy.
@@ -468,6 +475,8 @@ def parse_args(argv):
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS,
                         help="upstream connect and idle timeout in seconds (default %(default)s)")
     parser.add_argument("--log-level", default="INFO", choices=("DEBUG", "INFO", "WARNING", "ERROR"))
+    parser.add_argument("--parent-pid", type=int,
+                        help="start a new session and stop once this PID is no longer the parent")
     args = parser.parse_args(argv)
     if args.socket is None and args.port is None:
         parser.error("give --socket and/or --port")
@@ -492,10 +501,27 @@ def build_servers(args, destination_filter):
     return servers
 
 
+def watch_parent(parent_pid, stop):
+    """Set ``stop`` once ``parent_pid`` is no longer this process's parent."""
+    while not stop.wait(PARENT_POLL_INTERVAL_SECONDS):
+        if os.getppid() != parent_pid:
+            LOG.warning("parent %d is gone, shutting down", parent_pid)
+            stop.set()
+
+
 def main(argv=None):
     args = parse_args(argv)
     logging.basicConfig(stream=sys.stderr, level=args.log_level,
                         format="ai_network_proxy: %(levelname)s %(message)s")
+    if args.parent_pid is not None:
+        if os.getppid() != args.parent_pid:
+            print("ai_network_proxy: %d is not the parent process" % args.parent_pid, file=sys.stderr)
+            return 1
+        try:
+            os.setsid()
+        except OSError as error:
+            print("ai_network_proxy: cannot start a new session: %s" % error, file=sys.stderr)
+            return 1
     try:
         servers = build_servers(args, DestinationFilter())
     except (OSError, ValueError) as error:
@@ -505,6 +531,8 @@ def main(argv=None):
     for signum in (signal.SIGINT, signal.SIGTERM):
         signal.signal(signum, lambda _signum, _frame: stop.set())
     threads = [threading.Thread(target=server.serve_forever, daemon=True) for server in servers]
+    if args.parent_pid is not None:
+        threading.Thread(target=watch_parent, args=(args.parent_pid, stop), daemon=True).start()
     try:
         for thread in threads:
             thread.start()
