@@ -354,7 +354,9 @@ _sandbox_start_network_proxy() {
 # trap, the source cannot be told: report none (never run a parent's trap).
 _sandbox_read_own_exit_trap() {
     _AI_SANDBOX_OWN_EXIT_TRAP=""
-    if [[ "${BASHPID}" != "$$" ]]; then
+    # bash 3.2 (macOS) has no BASHPID: a command substitution's exec'd sh
+    # is a child of this shell, so its PPID is this shell's PID.
+    if [[ "${BASHPID:-$(exec sh -c 'echo "${PPID}"')}" != "$$" ]]; then
         local probe
         for probe in RETURN ERR DEBUG ""; do
             [[ -z "${probe}" ]] && return 0
