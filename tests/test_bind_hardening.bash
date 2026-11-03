@@ -894,5 +894,180 @@ if [[ "${OS}" == "Linux" ]] && command -v bwrap >/dev/null 2>&1; then
 fi
 rm -f "${preset_path}"
 
+# ---------------------------------------------------------------------------
+echo "-- client persistent controls (_wrapper_protect_client_controls, #86)"
+CC="${FAKE_HOME}/.cc-client"
+CC_DST="${FAKE_HOME}/.cc-dst"
+CC_WD="${FAKE_HOME}/work-cc"
+mkdir -p "${CC}/skills/s1" "${CC}/plugins" "${CC}/sessions" "${CC_WD}/.inrepo" "${FAKE_HOME}/.ssh"
+echo '{}' >"${CC}/settings.json"
+echo x >"${CC}/plugins/config.json"
+echo x >"${CC}/my settings.json"
+echo x >"${CC}/skills/s1/SKILL.md"
+echo x >"${CC_WD}/.inrepo/settings.json"
+# Run the helper from CWD (default CC_WD) with _wrapper_os=OS; print rc,
+# then WRAPPER_FLAGS one word per line, then stderr.
+_cc() {
+    local os="${1}"; shift
+    ( cd "${CC_CWD:-${CC_WD}}" && _load codex && _wrapper_os="${os}" && WRAPPER_FLAGS=() || exit 99
+      _wrapper_protect_client_controls "$@"; echo "rc=$?"
+      printf '%s\n' "${WRAPPER_FLAGS[@]+"${WRAPPER_FLAGS[@]}"}" ) 2>&1
+}
+_bind3() { printf '%s\n%s\n%s\n' "${1}" "${2}" "${3}"; }
+
+out="$(_cc Linux t "${CC}" "" settings.json skills plugins/config.json hooks missing.json "my settings.json")"
+assert_contains "${out}" "rc=0" "controls: protection succeeds"
+assert_contains "${out}" "$(_bind3 --bind "${CC}" "${CC}")" "controls (Linux): profile base pinned"
+assert_contains "${out}" "$(_bind3 --bind "${CC}/plugins" "${CC}/plugins")" "controls (Linux): intermediate plugins/ pinned"
+assert_contains "${out}" "$(_bind3 --ro-bind "${CC}/settings.json" "${CC}/settings.json")" "controls (Linux): settings.json read-only"
+assert_contains "${out}" "$(_bind3 --ro-bind "${CC}/skills" "${CC}/skills")" "controls (Linux): skills/ read-only"
+assert_contains "${out}" "$(_bind3 --ro-bind "${CC}/plugins/config.json" "${CC}/plugins/config.json")" "controls (Linux): nested plugins/config.json read-only"
+assert_contains "${out}" "$(_bind3 --ro-bind "${CC}/my settings.json" "${CC}/my settings.json")" "controls (Linux): path with a space read-only"
+assert_not_contains "${out}" "hooks" "controls: absent hooks/ skipped"
+assert_not_contains "${out}" "missing.json" "controls: absent file skipped"
+assert_not_contains "${out}" "${CC}/sessions" "controls: mutable session state not touched"
+assert_not_contains "${out}" "WARN" "controls: no WARN by default"
+# bwrap: later mount wins, so every pin must precede every RO overlay.
+last_pin="$(printf '%s\n' "${out}" | grep -n -x -e '--bind' | tail -1 | cut -d: -f1)"
+first_ro="$(printf '%s\n' "${out}" | grep -n -x -e '--ro-bind' | head -1 | cut -d: -f1)"
+assert_eq "$(( ${last_pin:-999} < ${first_ro:-0} ))" "1" "controls (Linux): pins mounted before read-only overlays"
+assert_eq "$(printf '%s\n' "${out}" | grep -c -x -e "${CC}/plugins")" "2" "controls (Linux): plugins/ pinned once"
+
+out="$(_cc Linux t "${CC}" "")"
+assert_contains "${out}" "$(_bind3 --bind "${CC}" "${CC}")" "controls: empty list still pins the base"
+assert_not_contains "${out}" "--ro-bind" "controls: empty list adds no read-only overlay"
+
+out="$(_cc Linux t "${FAKE_HOME}/.cc-absent" "" settings.json)"
+assert_eq "${out}" "rc=0" "controls: absent profile base is a no-op"
+
+# Remapped named account (Linux): host profile appears at DST_BASE.
+out="$(_cc Linux t "${CC}" "${CC_DST}" settings.json plugins/config.json)"
+assert_contains "${out}" "$(_bind3 --bind "${CC}" "${CC_DST}")" "controls remapped: base pinned at its sandbox path"
+assert_contains "${out}" "$(_bind3 --bind "${CC}" "${CC}")" "controls remapped: base pinned at its host path"
+assert_contains "${out}" "$(_bind3 --bind "${CC}/plugins" "${CC_DST}/plugins")" "controls remapped: plugins/ pinned at its sandbox path"
+assert_contains "${out}" "$(_bind3 --ro-bind "${CC}/settings.json" "${CC_DST}/settings.json")" "controls remapped: settings.json read-only at its sandbox path"
+assert_contains "${out}" "$(_bind3 --ro-bind "${CC}/settings.json" "${CC}/settings.json")" "controls remapped: settings.json read-only at its host path"
+
+# Profile base reached through a symlink: sources are resolved, the
+# destination keeps the spelling the CLI uses.
+ln -sfn "${CC}" "${FAKE_HOME}/.cc-link"
+out="$(_cc Linux t "${FAKE_HOME}/.cc-link" "" settings.json)"
+assert_contains "${out}" "$(_bind3 --ro-bind "${CC}/settings.json" "${FAKE_HOME}/.cc-link/settings.json")" "controls via symlinked base: resolved source, CLI-visible destination"
+assert_contains "${out}" "$(_bind3 --ro-bind "${CC}/settings.json" "${CC}/settings.json")" "controls via symlinked base: resolved path covered too"
+rm -f "${FAKE_HOME}/.cc-link"
+
+# A symlinked control (or a symlinked parent of one) refuses the launch:
+# binding its target would expose or protect the wrong file.
+ln -sfn "${FAKE_HOME}/.ssh" "${CC}/agents"
+out="$(_cc Linux t "${CC}" "" settings.json agents)"
+assert_contains "${out}" "rc=1" "controls: symlinked control entry refuses the launch"
+assert_contains "${out}" "is a symlink" "... with an ERROR naming the cause"
+assert_not_contains "${out}" "${FAKE_HOME}/.ssh" "... and never binds the link target"
+rm -f "${CC}/agents"
+mkdir -p "${OUTSIDE}/plug"; echo x >"${OUTSIDE}/plug/config.json"
+ln -sfn "${OUTSIDE}/plug" "${CC}/linkdir"
+out="$(_cc Linux t "${CC}" "" linkdir/config.json)"
+assert_contains "${out}" "rc=1" "controls: control behind a symlinked parent refuses the launch"
+assert_not_contains "${out}" "--ro-bind" "... before any read-only overlay"
+rm -f "${CC}/linkdir"
+mkfifo "${CC}/fifo-control" 2>/dev/null && {
+    out="$(_cc Linux t "${CC}" "" fifo-control)"
+    assert_contains "${out}" "rc=1" "controls: control that is neither file nor directory refuses the launch"
+    rm -f "${CC}/fifo-control"
+}
+
+# WORKDIR overlap: controls inside WORKDIR stay editable (trusted
+# maintenance of the active repository); others are still protected.
+out="$(_cc Linux t "${CC_WD}/.inrepo" "" settings.json)"
+assert_not_contains "${out}" "--ro-bind" "controls inside WORKDIR: left writable"
+assert_contains "${out}" "rc=0" "controls inside WORKDIR: launch allowed"
+out="$(_cc Linux t "${CC}" "" settings.json "${CC_WD}/.inrepo/settings.json")"
+assert_not_contains "${out}" "${CC_WD}/.inrepo/settings.json" "absolute control inside WORKDIR: left writable"
+assert_contains "${out}" "$(_bind3 --ro-bind "${CC}/settings.json" "${CC}/settings.json")" "control outside WORKDIR: still read-only"
+out="$(CC_CWD="${CC}/skills/s1" _cc Linux t "${CC}" "" settings.json skills)"
+assert_not_contains "${out}" "--ro-bind${NL}${CC}/skills${NL}" "WORKDIR inside skills/: skills/ left writable"
+assert_contains "${out}" "WARN" "... with a WARN"
+assert_contains "${out}" "$(_bind3 --ro-bind "${CC}/settings.json" "${CC}/settings.json")" "WORKDIR inside skills/: settings.json still read-only"
+
+# Trusted-maintenance switch.
+out="$(AI_SANDBOX_ALLOW_SETTINGS=1 _cc Linux t "${CC}" "" settings.json skills)"
+assert_contains "${out}" "rc=0" "AI_SANDBOX_ALLOW_SETTINGS=1: launch allowed"
+assert_not_contains "${out}" "--ro-bind" "AI_SANDBOX_ALLOW_SETTINGS=1: no read-only overlay"
+assert_not_contains "${out}" "--bind" "AI_SANDBOX_ALLOW_SETTINGS=1: no pin"
+assert_contains "${out}" "WARN" "AI_SANDBOX_ALLOW_SETTINGS=1: WARN banner"
+assert_contains "${out}" "AI_SANDBOX_ALLOW_SETTINGS=1" "... naming the switch"
+out="$(AI_SANDBOX_ALLOW_SETTINGS=0 _cc Linux t "${CC}" "" settings.json)"
+assert_contains "${out}" "--ro-bind" "AI_SANDBOX_ALLOW_SETTINGS=0: protected"
+
+# Darwin flags are single-arg; DST_BASE is dropped.
+out="$(_cc Darwin t "${CC}" "${CC_DST}" settings.json skills plugins/config.json)"
+assert_contains "${out}" "--pin${NL}${CC}${NL}" "controls (Darwin): base pinned"
+assert_contains "${out}" "--pin${NL}${CC}/plugins${NL}" "controls (Darwin): plugins/ pinned"
+assert_contains "${out}" "--ro-bind${NL}${CC}/settings.json${NL}" "controls (Darwin): settings.json read-only"
+assert_contains "${out}" "--ro-bind${NL}${CC}/skills${NL}" "controls (Darwin): skills/ read-only"
+assert_not_contains "${out}" "${CC_DST}" "controls (Darwin): no remapped destination"
+assert_eq "$(printf '%s\n' "${out}" | grep -c -x -e "${CC}/settings.json")" "1" "controls (Darwin): each control listed once"
+
+# Native enforcement, when a sandbox backend is installed.
+cc_native=0
+if [[ "${OS}" == "Linux" ]] && command -v bwrap >/dev/null 2>&1; then
+    cc_native=1
+elif [[ "${OS}" == "Darwin" ]] && command -v sandbox-exec >/dev/null 2>&1; then
+    cc_native=1
+fi
+if [[ "${cc_native}" == "1" ]]; then
+    cc_flags=()
+    while IFS= read -r line; do cc_flags+=("${line}"); done < <(
+        cd "${CC_WD}" && _load codex && WRAPPER_FLAGS=() && _wrapper_add_bind "${CC}" \
+            && _wrapper_protect_client_controls t "${CC}" "" settings.json skills plugins/config.json \
+            && printf '%s\n' "${WRAPPER_FLAGS[@]}")
+    settings_before="$(cksum <"${CC}/settings.json")"
+    cc_probe="$(cat <<'PROBE'
+ren() { perl -e 'rename($ARGV[0], $ARGV[1]) or exit 1' "$@"; }
+probe() { n="$1"; shift; if ("$@") >/dev/null 2>&1; then echo "WROTE:$n"; else echo "DENIED:$n"; fi; }
+app() { echo evil >>"$1"; }
+repl() { echo evil >"$1.tmp" && ren "$1.tmp" "$1"; }
+c="$1"
+probe settings-append app "$c/settings.json"
+probe settings-replace repl "$c/settings.json"
+probe skill-edit app "$c/skills/s1/SKILL.md"
+probe skill-create mkdir "$c/skills/evil"
+probe skills-rename ren "$c/skills" "$c/skills.old"
+probe plugins-rename ren "$c/plugins" "$c/plugins.old"
+probe base-rename ren "$c" "$c.old"
+probe session-write app "$c/sessions/s.jsonl"
+rm -f "$c/settings.json.tmp"
+echo PROBES_DONE
+PROBE
+)"
+    out="$(cd "${CC_WD}" && _load codex && run_sandboxed_agent /bin/sh -- "${cc_flags[@]}" -- -c "${cc_probe}" _ "${CC}" 2>&1)"
+    echo "  (native controls probe output: ${out})"
+    assert_contains "${out}" "PROBES_DONE" "native controls probe ran"
+    for p in settings-append settings-replace skill-edit skill-create skills-rename plugins-rename base-rename; do
+        assert_contains "${out}" "DENIED:${p}" "native controls: ${p} denied"
+    done
+    assert_contains "${out}" "WROTE:session-write" "native controls: session state stays writable"
+    assert_eq "$(cksum <"${CC}/settings.json")" "${settings_before}" "native controls: host settings.json unchanged"
+    assert_eq "$([[ -d "${CC}/skills" && -d "${CC}/plugins" && ! -e "${CC}/skills/evil" ]] && echo 1)" "1" "native controls: host tree unchanged"
+else
+    echo "  skip - native controls probe needs bwrap (Linux) or sandbox-exec (macOS)"
+fi
+
+# Setting: catalog row and preset restore WARN.
+catalog="$( _load codex; printf '%s\n' "${_AI_SETTINGS_LIST[@]}" )"
+assert_contains "${catalog}" "AI_SANDBOX_ALLOW_SETTINGS|bool|0|red|" "catalog: AI_SANDBOX_ALLOW_SETTINGS bool, default 0, red"
+row="$(printf '%s\n' "${catalog}" | grep '^AI_SANDBOX_ALLOW_SETTINGS|')"
+assert_eq "${row##*|}" "sensitive" "catalog: AI_SANDBOX_ALLOW_SETTINGS under sensitive on every OS"
+_in_cc_preset() { ( cd "${CC_WD}" && _load codex && eval "${1}" ) 2>&1; }
+_in_cc_preset 'AI_SANDBOX_ALLOW_SETTINGS=1 _preset_autosave' >/dev/null
+out="$(_in_cc_preset '_preset_autoload; echo "VAL=${AI_SANDBOX_ALLOW_SETTINGS:-unset}"')"
+assert_contains "${out}" "VAL=1" "preset: AI_SANDBOX_ALLOW_SETTINGS=1 restored"
+assert_contains "${out}" "Restored AI_SANDBOX_ALLOW_SETTINGS=1" "preset: restoring it WARNs"
+out="$(export AI_SANDBOX_ALLOW_SETTINGS=0; _in_cc_preset '_preset_autoload; echo "VAL=${AI_SANDBOX_ALLOW_SETTINGS}"')"
+assert_contains "${out}" "VAL=0" "preset: launch value 0 wins over a saved 1"
+assert_not_contains "${out}" "Restored AI_SANDBOX_ALLOW_SETTINGS" "... without the restore WARN"
+_in_cc_preset '_preset_clear' >/dev/null
+rm -rf "${CC}" "${CC_WD}"
+
 assert_no_live_client_reached
 tests_summary_and_exit

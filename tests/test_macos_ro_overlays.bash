@@ -141,6 +141,43 @@ out="$( _load_backend; _append_pin_rules test "${FAKE_HOME}" "${FAKE_HOME}/area/
 assert_eq "${rc}" "1" "pin: unresolvable path fails closed"
 assert_contains "${out}" "Could not resolve --pin path" "... with the resolve error"
 
+echo "-- client persistent controls rendering (_wrapper_protect_client_controls, #86)"
+CC="${FAKE_HOME}/.cc-client"
+mkdir -p "${CC}/skills/s1" "${CC}/plugins" "${CC}/sessions" "${FAKE_HOME}/repos/cc-wd"
+echo '{}' >"${CC}/settings.json"
+echo x >"${CC}/plugins/config.json"
+# Darwin flags from the real helper, rendered as the backend would: RO
+# denies (base RW bind as the only RW path) plus pin rules.
+_cc_rules() {
+    ( cd "${FAKE_HOME}/repos/cc-wd" && _load_backend && _wrapper_os=Darwin && WRAPPER_FLAGS=() || exit 99
+      _wrapper_protect_client_controls t "${CC}" "" settings.json skills plugins/config.json hooks || exit 98
+      local -a ro=() pin=()
+      set -- "${WRAPPER_FLAGS[@]+"${WRAPPER_FLAGS[@]}"}"
+      while [[ $# -gt 0 ]]; do
+          case "${1}" in
+              --ro-bind) ro+=("${2}") ;;
+              --pin) pin+=("${2}") ;;
+          esac
+          shift 2
+      done
+      [[ ${#ro[@]} -gt 0 ]] && _append_ro_deny_rules test "${FAKE_HOME}" "${ro[@]}" -- "${CC}"
+      [[ ${#pin[@]} -gt 0 ]] && _append_pin_rules test "${FAKE_HOME}" "${pin[@]}"
+      true ) 2>&1
+}
+out="$(_cc_rules)"
+assert_contains "${out}" "(deny ${DENY_OPS} (literal \"${CC}/settings.json\"))" "controls: settings.json write-denied as a literal"
+assert_contains "${out}" "(deny ${DENY_OPS} (subpath \"${CC}/skills\"))" "controls: skills/ write-denied as a subpath"
+assert_contains "${out}" "(deny ${DENY_OPS} (literal \"${CC}/plugins/config.json\"))" "controls: nested plugins/config.json write-denied"
+assert_contains "${out}" "(deny file-write* (literal \"${CC}\")" "controls: profile base pinned"
+assert_contains "${out}" "(literal \"${CC}/plugins\")" "controls: intermediate plugins/ pinned"
+assert_not_contains "${out}" "${CC}/sessions" "controls: session state not denied"
+assert_not_contains "${out}" "${CC}/hooks" "controls: absent hooks/ not rendered"
+assert_not_contains "${out}" "(literal \"${FAKE_HOME}\")" "controls: pins stop below \$HOME"
+out="$(AI_SANDBOX_ALLOW_SETTINGS=1 _cc_rules)"
+assert_not_contains "${out}" "(deny" "AI_SANDBOX_ALLOW_SETTINGS=1: no deny rules for client controls"
+assert_contains "${out}" "AI_SANDBOX_ALLOW_SETTINGS=1" "AI_SANDBOX_ALLOW_SETTINGS=1: WARN banner"
+rm -rf "${CC}" "${FAKE_HOME}/repos/cc-wd"
+
 # ---------------------------------------------------------------------------
 echo "-- backend wiring (AI_SANDBOX_DRYRUN)"
 STUB_BIN="${FAKE_HOME}/stub-bin"
