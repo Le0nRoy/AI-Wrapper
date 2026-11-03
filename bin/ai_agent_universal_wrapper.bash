@@ -29,15 +29,20 @@ function echo_log() {
 # the sandbox's scrubbed environment.
 _sandbox_pass_env_add() {
     local name="${1}" entry pass_env="${AI_SANDBOX_PASS_ENV:-}"
+    if [[ -z "${pass_env}" ]]; then
+        export AI_SANDBOX_PASS_ENV="${name}"
+        return 0
+    fi
     local -a pass_env_vars=()
     IFS=',' read -r -a pass_env_vars <<<"${pass_env}"
-    for entry in "${pass_env_vars[@]}"; do
+    # Empty-safe form: bash < 4.4 (macOS /bin/bash 3.2) treats "${arr[@]}"
+    # of an empty array as unbound under `set -u`.
+    for entry in "${pass_env_vars[@]+"${pass_env_vars[@]}"}"; do
         entry="${entry#"${entry%%[![:space:]]*}"}"
         entry="${entry%"${entry##*[![:space:]]}"}"
         [[ "${entry}" == "${name}" ]] && return 0
     done
-    [[ -n "${pass_env}" ]] && pass_env+=","
-    pass_env+="${name}"
+    pass_env+=",${name}"
     export AI_SANDBOX_PASS_ENV="${pass_env}"
 }
 

@@ -1133,7 +1133,7 @@ _wrapper_protect_client_controls() {
     for p in "${unique[@]}"; do
         _wrapper_client_control_bind _wrapper_add_pin "${base}${p:+/${p}}" "${dst_base}${p:+/${p}}"
     done
-    for i in "${!ro_src[@]}"; do
+    for i in ${ro_src[@]+"${!ro_src[@]}"}; do
         _wrapper_client_control_bind _wrapper_add_ro_bind "${ro_src[i]}" "${ro_dst[i]}"
     done
     return 0
