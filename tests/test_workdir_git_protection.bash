@@ -10,7 +10,7 @@
 #   2. AI_SANDBOX_ALLOW_GIT_CONFIG catalog / preset / launch-override
 #      precedence — any OS;
 #   3. refusal propagation through every wrapper (claude, codex, agy,
-#      copilot, cursor-agent): a symlinked hooks/ stops the launch before
+#      copilot): a symlinked hooks/ stops the launch before
 #      the client runs — any OS, no sandbox needed;
 #   4. native enforcement through the codex wrapper (bwrap on Linux,
 #      sandbox-exec on macOS; a missing backend is a failure, not a skip):
@@ -515,7 +515,7 @@ ln -s "${R}/refuse-inner.saved" "${VN}/.git/modules/ns/inner"
 VW="${R}/refuse-wt"
 git_q -C "${VN}" worktree add "${VW}" -b refuse-wt
 canary_before="$(ls -A "${R}/refuse-inner.saved")"
-for client in claude codex agy copilot cursor_agent; do
+for client in claude codex agy copilot; do
     out="$(cd "${V}" && bash "${REPO_ROOT}/bin/executable_${client}_wrapper.bash" x </dev/null 2>&1)"; rc=$?
     assert_eq "${rc}" "1" "${client}: symlinked hooks/ exits 1"
     assert_contains "${out}" "is a symlink" "${client}: ... with the refusal ERROR"
@@ -524,8 +524,6 @@ for client in claude codex agy copilot cursor_agent; do
     assert_eq "${rc}" "1" "${client}: symlinked nested submodule namespace exits 1"
     assert_contains "${out}" "is a symlink" "${client}: ... with the refusal ERROR"
     assert_not_contains "${out}" "LIVE_CLIENT_TRAP" "${client}: ... before the client runs"
-    # cursor-agent never binds a worktree's common dir (nothing to refuse).
-    [[ "${client}" == "cursor_agent" ]] && continue
     out="$(cd "${VW}" && bash "${REPO_ROOT}/bin/executable_${client}_wrapper.bash" x </dev/null 2>&1)"; rc=$?
     assert_eq "${rc}" "1" "${client}: symlinked submodule namespace in a worktree's common dir exits 1"
     assert_contains "${out}" "is a symlink" "${client}: ... with the refusal ERROR"

@@ -49,7 +49,6 @@ destinations=(
     ".claude/skills"
     ".codex/skills"
     ".gemini/config/skills"
-    ".cursor/skills"
     ".copilot/skills"
     ".claude-work/skills"
     ".codex-work/skills"
@@ -78,7 +77,8 @@ done
 [[ -f "${ARCHIVE}/.claude_skills/writing-plans/SKILL.md" ]] || fail "retired managed copy not archived"
 [[ "$(cat "${FAKE_HOME}/.codex/skills/writing-plans/SKILL.md")" == mine ]] || fail "unmanaged same-name skill touched"
 [[ "$(cat "${FAKE_HOME}/.claude/skills/user-skill/SKILL.md")" == mine ]] || fail "unrelated user skill touched"
-[[ -e "${FAKE_HOME}/.cursor/skills/writing-plans" ]] && fail "retired skill copied to a new client"
+# Cursor support is retired (#43): a fresh setup must not create ~/.cursor.
+[[ -e "${FAKE_HOME}/.cursor" ]] && fail "setup created retired Cursor client directory"
 checks=$((checks + 7))
 
 # Obstructed archive: a regular file where the source bucket should be makes

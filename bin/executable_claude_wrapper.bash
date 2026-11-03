@@ -76,7 +76,7 @@ check_agent_binary
 # _wrapper_add_meta_bind / _wrapper_os) and the portable path-resolution
 # helpers (_realpath / _check_workdir_breadth) now live in the shared
 # ai_wrapper_data/ai_wrapper_lib.bash — sourced above via
-# ai_wrapper_data/claude_wrapper_lib.bash — so Codex and Cursor get them too
+# ai_wrapper_data/claude_wrapper_lib.bash — so the other wrappers get them too
 # instead of hardcoding Linux-shaped 2-arg bind flags.
 
 WRAPPER_FLAGS=()

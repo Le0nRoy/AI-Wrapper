@@ -24,7 +24,6 @@ SKILLS_DSTS=(
     "${HOME}/.claude/skills"
     "${HOME}/.codex/skills"
     "${HOME}/.gemini/config/skills"
-    "${HOME}/.cursor/skills"
     "${HOME}/.copilot/skills"
 )
 
@@ -62,7 +61,7 @@ print_help() {
     cat <<'EOF'
 Copy the skills deployed to ~/ai-wrapper/.agents/skills/ into
 the native skill directories for Claude Code, Codex, Antigravity CLI,
-Cursor Agent, and GitHub Copilot CLI. Existing named account profiles are
+and GitHub Copilot CLI. Existing named account profiles are
 included. A marker file (.setup_skills_managed)
 inside each copy records its source path so future runs can refresh the copy
 in place without clobbering user-managed directories. Retired shared skills
