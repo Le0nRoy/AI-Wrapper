@@ -484,13 +484,14 @@ assert_contains "${out}" "must both be set" "... naming the missing half"
 
 # Account switching: an approval saved while using one account is not
 # reused after switching to another account whose settings.json links to
-# the same file.
+# the same file. Pinned to the Linux backend: macOS refuses named profiles
+# before the settings check (#46).
 mkdir -p "${FAKE_HOME}/.gemini-first/antigravity-cli" "${FAKE_HOME}/.gemini-second/antigravity-cli"
 _valid_settings "${WORK}" >"${dot}/settings.json"
 ln -sf "${dot}/settings.json" "${FAKE_HOME}/.gemini-first/antigravity-cli/settings.json"
 ln -sf "${dot}/settings.json" "${FAKE_HOME}/.gemini-second/antigravity-cli/settings.json"
 _bind_acct() {
-    ( cd "${WORK}" && _load && WRAPPER_FLAGS=() && AGY_ACCOUNT="${1}" \
+    ( cd "${WORK}" && _load && _wrapper_os=Linux && WRAPPER_FLAGS=() && AGY_ACCOUNT="${1}" \
         AGY_SETTINGS_TRUSTED_PROFILE="${FAKE_HOME}/.gemini-first" \
         AGY_SETTINGS_TRUSTED_TARGET="${dot}/settings.json" _bind_agy_account ) 2>&1
 }

@@ -66,9 +66,11 @@ The wrapper makes `~/.codex-<name>` appear as `~/.codex` inside the sandbox
 <!-- os:darwin -->
 
 **macOS limitation:** sandbox-exec has no bind-mount remapping, so a named
-profile is granted at its real path (`~/.codex-<name>`) while Codex still
-reads `~/.codex`, which is then not granted. Account switching is fully
-functional on Linux only (same limitation as the Claude wrapper).
+profile cannot appear as `~/.codex`. The wrapper refuses a named
+`CODEX_ACCOUNT` on macOS (from the environment, a saved preset or the
+Settings menu) with an error before any directory is created or Codex
+starts. Use `CODEX_ACCOUNT=private` (or leave it unset) on macOS; named
+account profiles work on Linux only (same as the Claude wrapper).
 <!-- os:end -->
 
 ## Also shared with the Claude wrapper

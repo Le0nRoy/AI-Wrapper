@@ -66,7 +66,7 @@ _agent_system_prompt_args() {
 # home dir, so there is no separate top-level file to bind (unlike
 # ~/.claude.json). Persisted per-workdir by the preset mechanism.
 _AI_SETTINGS_LIST+=(
-    "CODEX_ACCOUNT|str|private|info|Account profile|Which ~/.codex-<name>/ credential profile to use. 'private' = default ~/.codex. Type a profile name, or 'private' to reset.|account"
+    "CODEX_ACCOUNT|str|private|info|Account profile|Which ~/.codex-<name>/ credential profile to use. 'private' = default ~/.codex. Type a profile name, or 'private' to reset. Named profiles are Linux-only; macOS refuses them at launch.|account"
 )
 
 # No source-time `export CODEX_ACCOUNT=private`: _preset_autoload treats a set
@@ -100,6 +100,7 @@ _bind_codex_account() {
             echo "ERROR: Invalid CODEX_ACCOUNT '${account}': must contain only letters, digits, hyphens, underscores" >&2
             exit 1
         fi
+        _wrapper_check_account_supported "${account}" "CODEX_ACCOUNT" || exit 1
         codex_dir="${HOME}/.codex-${account}"
         if [[ ! -d "${codex_dir}" ]]; then
             echo "ERROR: Account profile directory not found: ${codex_dir}" >&2

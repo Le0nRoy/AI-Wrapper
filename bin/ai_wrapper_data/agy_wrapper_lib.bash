@@ -32,7 +32,7 @@ source "${WRAPPER_DATA_DIR}/ai_wrapper_lib.bash"
 # databases, settings, and global skills inside ~/.gemini, so no separate
 # top-level file bind is needed. Persisted per-workdir by the preset mechanism.
 _AI_SETTINGS_LIST+=(
-    "AGY_ACCOUNT|str|private|info|Account profile|Which ~/.gemini-<name>/ credential profile to use. 'private' = default ~/.gemini. Type a profile name, or 'private' to reset.|account"
+    "AGY_ACCOUNT|str|private|info|Account profile|Which ~/.gemini-<name>/ credential profile to use. 'private' = default ~/.gemini. Type a profile name, or 'private' to reset. Named profiles are Linux-only; macOS refuses them at launch.|account"
 )
 
 # No source-time `export AGY_ACCOUNT=private`: _preset_autoload treats a set
@@ -1580,6 +1580,7 @@ _bind_agy_account() {
             echo "ERROR: Invalid AGY_ACCOUNT '${account}': must contain only letters, digits, hyphens, underscores" >&2
             exit 1
         fi
+        _wrapper_check_account_supported "${account}" "AGY_ACCOUNT" || exit 1
         gemini_dir="${HOME}/.gemini-${account}"
         if [[ ! -d "${gemini_dir}" ]]; then
             echo "ERROR: Account profile directory not found: ${gemini_dir}" >&2
