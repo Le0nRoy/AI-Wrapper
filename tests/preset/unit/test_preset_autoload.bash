@@ -54,7 +54,8 @@ else
 fi
 clean_scratch
 
-# UNIT-AUTOLOAD-03: restores bool=0 explicitly (not unsets).
+# UNIT-AUTOLOAD-03: restores bool=0 explicitly when the caller left it unset,
+# and keeps an explicit launch value over the saved one (CC-6 precedence).
 mk_scratch; guard_home
 unset XDG_CONFIG_HOME
 export XDG_CONFIG_HOME="${TEST_SCRATCH}/config"
@@ -62,15 +63,15 @@ clear_catalog_env
 source_lib
 path="$(_preset_autosave_path)"
 mkdir -p "$(dirname "${path}")"
-printf '# workdir: %s\nAI_SANDBOX_DRYRUN=0\n' "$(pwd -P)" > "${path}"
-# Pre-set to 1 so we can verify autoload sets it back to 0
-export AI_SANDBOX_DRYRUN=1
+printf '# workdir: %s\n%s=0\n' "$(pwd -P)" "${CANARY_BOOL}" > "${path}"
+ok=1
+unset "${CANARY_BOOL}"
 _preset_autoload
-if assert_eq "UNIT-AUTOLOAD-03" "0" "${AI_SANDBOX_DRYRUN:-}"; then
-    PASS=$((PASS+1)); echo "PASS UNIT-AUTOLOAD-03"
-else
-    FAIL=$((FAIL+1))
-fi
+assert_eq "UNIT-AUTOLOAD-03-restore" "0" "${!CANARY_BOOL-unset}" || ok=0
+export "${CANARY_BOOL}=1"
+_preset_autoload
+assert_eq "UNIT-AUTOLOAD-03-launch" "1" "${!CANARY_BOOL:-}" || ok=0
+if (( ok == 1 )); then PASS=$((PASS+1)); echo "PASS UNIT-AUTOLOAD-03"; else FAIL=$((FAIL+1)); fi
 clean_scratch
 
 # UNIT-AUTOLOAD-04: rejects unknown keys with WARN, does not abort.
@@ -235,6 +236,77 @@ if [[ -d "${XDG_CONFIG_HOME}/ai-wrapper" ]]; then
     _fail "UNIT-AUTOLOAD-11" "preset dir created despite invalid agent id"; ok=0
 fi
 if (( ok == 1 )); then PASS=$((PASS+1)); echo "PASS UNIT-AUTOLOAD-11"; else FAIL=$((FAIL+1)); fi
+clean_scratch
+
+# UNIT-AUTOLOAD-12: caller environment wins over the preset for bool, str
+# (including a set-but-empty value) and leaves no restore WARN for those keys.
+mk_scratch; guard_home
+unset XDG_CONFIG_HOME
+export XDG_CONFIG_HOME="${TEST_SCRATCH}/config"
+clear_catalog_env
+source_lib
+path="$(_preset_autosave_path)"
+mkdir -p "$(dirname "${path}")"
+printf '%s=1\n%s=SAVED_VAR\nAI_SANDBOX_EXTRA_RW_DIRS=/tmp\n' "${CANARY_BOOL}" "${CANARY_STR}" > "${path}"
+export "${CANARY_BOOL}=0" "${CANARY_STR}=" AI_SANDBOX_EXTRA_RW_DIRS=/opt
+unset AI_WRAPPER_PRESET_AUTOLOADED_FROM
+err_file="${TEST_SCRATCH}/stderr"
+_preset_autoload 2>"${err_file}"
+err="$(cat "${err_file}")"
+ok=1
+assert_eq "UNIT-AUTOLOAD-12-bool" "0" "${!CANARY_BOOL}" || ok=0
+assert_eq "UNIT-AUTOLOAD-12-empty-str" "" "${!CANARY_STR-unset}" || ok=0
+assert_eq "UNIT-AUTOLOAD-12-str" "/opt" "${AI_SANDBOX_EXTRA_RW_DIRS}" || ok=0
+assert_unmatch "UNIT-AUTOLOAD-12-warn" "Restored" "${err}" || ok=0
+assert_eq "UNIT-AUTOLOAD-12-from" "" "${AI_WRAPPER_PRESET_AUTOLOADED_FROM:-}" || ok=0
+if (( ok == 1 )); then PASS=$((PASS+1)); echo "PASS UNIT-AUTOLOAD-12"; else FAIL=$((FAIL+1)); fi
+clean_scratch
+
+# UNIT-AUTOLOAD-13: restoring a non-default red or yellow setting WARNs on
+# stderr (visible to scripted launches); default values and info settings
+# restore silently.
+mk_scratch; guard_home
+unset XDG_CONFIG_HOME
+export XDG_CONFIG_HOME="${TEST_SCRATCH}/config"
+clear_catalog_env
+source_lib
+path="$(_preset_autosave_path)"
+mkdir -p "$(dirname "${path}")"
+printf '%s=1\n%s=0\nAI_SANDBOX_ALLOW_DOCKER=1\nAI_SANDBOX_EXTRA_RW_DIRS=/tmp\nAI_SANDBOX_EXTRA_RO_DIRS=\nAI_SANDBOX_DEBUG=1\n' \
+    "${CANARY_BOOL}" "${CANARY_BOOL_2}" > "${path}"
+err_file="${TEST_SCRATCH}/stderr"
+_preset_autoload 2>"${err_file}"
+err="$(cat "${err_file}")"
+ok=1
+assert_eq "UNIT-AUTOLOAD-13-applied" "1" "${!CANARY_BOOL:-}" || ok=0
+assert_match "UNIT-AUTOLOAD-13-red" "Restored ${CANARY_BOOL}=1 from the saved preset" "${err}" || ok=0
+assert_match "UNIT-AUTOLOAD-13-red-2" "Restored AI_SANDBOX_ALLOW_DOCKER=1 from the saved preset" "${err}" || ok=0
+assert_match "UNIT-AUTOLOAD-13-yellow" "Restored AI_SANDBOX_EXTRA_RW_DIRS=/tmp from the saved preset" "${err}" || ok=0
+assert_unmatch "UNIT-AUTOLOAD-13-default-bool" "${CANARY_BOOL_2}" "${err}" || ok=0
+assert_unmatch "UNIT-AUTOLOAD-13-default-str" "AI_SANDBOX_EXTRA_RO_DIRS" "${err}" || ok=0
+assert_unmatch "UNIT-AUTOLOAD-13-info" "AI_SANDBOX_DEBUG" "${err}" || ok=0
+if (( ok == 1 )); then PASS=$((PASS+1)); echo "PASS UNIT-AUTOLOAD-13"; else FAIL=$((FAIL+1)); fi
+clean_scratch
+
+# UNIT-AUTOLOAD-14: session-only AI_SANDBOX_ALLOW_EXTERNAL_WORKTREES (#13)
+# is never loaded from the preset, even when the caller left it unset.
+mk_scratch; guard_home
+unset XDG_CONFIG_HOME
+export XDG_CONFIG_HOME="${TEST_SCRATCH}/config"
+clear_catalog_env
+source_lib
+path="$(_preset_autosave_path)"
+mkdir -p "$(dirname "${path}")"
+printf 'AI_SANDBOX_ALLOW_EXTERNAL_WORKTREES=1\n' > "${path}"
+unset AI_SANDBOX_ALLOW_EXTERNAL_WORKTREES
+err_file="${TEST_SCRATCH}/stderr"
+_preset_autoload 2>"${err_file}"
+err="$(cat "${err_file}")"
+ok=1
+assert_eq "UNIT-AUTOLOAD-14" "unset" "${AI_SANDBOX_ALLOW_EXTERNAL_WORKTREES-unset}" || ok=0
+assert_match "UNIT-AUTOLOAD-14-warn" "Ignoring AI_SANDBOX_ALLOW_EXTERNAL_WORKTREES" "${err}" || ok=0
+assert_unmatch "UNIT-AUTOLOAD-14-restored" "Restored" "${err}" || ok=0
+if (( ok == 1 )); then PASS=$((PASS+1)); echo "PASS UNIT-AUTOLOAD-14"; else FAIL=$((FAIL+1)); fi
 clean_scratch
 
 printf 'SUMMARY %s pass=%d fail=%d skip=%d\n' "$(basename "${BASH_SOURCE[0]}")" "${PASS}" "${FAIL}" "${SKIP}"

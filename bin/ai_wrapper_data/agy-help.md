@@ -25,6 +25,13 @@ prioritizing the current working directory. From the picker you can:
 - Select a conversation by number (`1`-`N`, `Enter` for `1`) or UUID prefix to
   launch `agy --dangerously-skip-permissions --conversation=<id>`.
 - Press `r` (or `r <num> [new title]`) to rename a saved conversation in place.
+  The new title is written to the database and to `brain/<id>/.wrapper_title`
+  (which the picker shows first). If the rename fails (permissions, a lock
+  held by another wrapper for over 10 s, the title file changed by a running
+  agy), the picker says so, names the path, and nothing is reported as
+  renamed; fix the cause and press `r` again. A title written by a running
+  agy at the very instant of the rename can still be lost (see
+  `docs/security-concerns.md`, B-μ).
 - Press `d` (or `d <num>[,<num>...]`, e.g. `d 1,3`) to delete one or more saved
   conversations (and their `brain/` artifacts and child subagent entries) with
   confirmation. A single invalid token aborts the batch without deleting
@@ -32,6 +39,11 @@ prioritizing the current working directory. From the picker you can:
   If `conversation_summaries.db` is locked, the delete waits up to
   `AGY_DB_BUSY_TIMEOUT_MS` (default 1000 ms) and then fails without touching
   any artifacts.
+- Listing, rename and delete stay inside the selected profile: a symlinked
+  `antigravity-cli/`, `brain/`, `conversations/`, database or `.wrapper_title`
+  is refused (nothing is changed). A symlinked conversation artifact is
+  deleted by unlinking the link itself; its target is never touched. A
+  missing database is never created. These host-side steps need `python3`.
 - Press `c` to resume the most recent conversation via `--continue`, or `q` to
   cancel.
 
@@ -58,12 +70,26 @@ confines filesystem writes to `WORKDIR`, `~/.gemini`, and `/tmp`, the wrapper
 grants `agy` full autonomy inside the sandbox boundary:
 
 - Passes `--dangerously-skip-permissions` on the command line.
-- Ensures `<profile>/antigravity-cli/settings.json` has
+- Passes session-only settings with `--settings '<JSON>'`:
   `toolPermission: "always-proceed"`, `artifactReviewPolicy: "always-proceed"`,
   `allowNonWorkspaceAccess: true`, `enableTerminalSandbox: false` (avoiding
-  nested-sandbox conflicts inside the outer `ai-wrapper` sandbox), and adds
-  the resolved working directory to `trustedWorkspaces`. Existing user
-  preferences in `settings.json` (theme, vim mode, etc.) are preserved.
+  nested-sandbox conflicts inside the outer `ai-wrapper` sandbox), and the
+  resolved working directory in `trustedWorkspaces`.
+
+`agy` applies these for that run only and never saves them. The wrapper
+never reads, creates or edits `<profile>/antigravity-cli/settings.json`:
+your own settings there still apply to keys the wrapper does not pass,
+and `agy` launched outside the wrapper keeps your normal permission
+prompts. Sessions in different working directories can run in parallel;
+each trusts only its own directory.
+
+The profile's persistent controls (that `settings.json`, hooks, MCP
+config, rules, workflows, plugins, skills and prompt files; see
+`AI_SANDBOX_ALLOW_SETTINGS` in the general help) are read-only inside the
+sandbox. A symlinked one (e.g. a dotfiles-managed `settings.json`) refuses
+the launch, because the link itself could still be replaced: make it a
+regular file, or set `AI_SANDBOX_ALLOW_SETTINGS=1` to leave the controls
+writable.
 
 ## Account switching
 
@@ -90,9 +116,11 @@ The wrapper makes `~/.gemini-<name>` appear as `~/.gemini` inside the sandbox
 <!-- os:darwin -->
 
 **macOS limitation:** sandbox-exec has no bind-mount remapping, so a named
-profile is granted at its real path (`~/.gemini-<name>`) while Antigravity
-still reads `~/.gemini`, which is then not granted. Account switching is fully
-functional on Linux only (same limitation as the Claude and Codex wrappers).
+profile cannot appear as `~/.gemini`. The wrapper refuses a named
+`AGY_ACCOUNT` on macOS (from the environment, a saved preset or the
+Settings menu) with an error before skills are synced or Antigravity
+starts. Use `AGY_ACCOUNT=private` (or leave it unset) on macOS; named account profiles work on Linux only (same as the
+Claude and Codex wrappers).
 <!-- os:end -->
 
 ## Also shared with the Claude and Codex wrappers

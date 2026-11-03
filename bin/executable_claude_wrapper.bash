@@ -33,7 +33,6 @@ set -u -o pipefail
 : "${XDG_RUNTIME_DIR:=}"
 : "${COLORTERM:=}"
 : "${TERM_PROGRAM:=}"
-: "${KIND_EXPERIMENTAL_PROVIDER:=}"
 
 source "$(dirname "${BASH_SOURCE[0]}")/ai_agent_universal_wrapper.bash"
 
@@ -77,116 +76,19 @@ check_agent_binary
 # _wrapper_add_meta_bind / _wrapper_os) and the portable path-resolution
 # helpers (_realpath / _check_workdir_breadth) now live in the shared
 # ai_wrapper_data/ai_wrapper_lib.bash — sourced above via
-# ai_wrapper_data/claude_wrapper_lib.bash — so Codex and Cursor get them too
+# ai_wrapper_data/claude_wrapper_lib.bash — so the other wrappers get them too
 # instead of hardcoding Linux-shaped 2-arg bind flags.
 
 WRAPPER_FLAGS=()
 
-# Resolve CLAUDE_ACCOUNT (from a persisted preset or a Settings-menu edit)
-# to the credential dir/file to bind, and append the binds to
-# WRAPPER_FLAGS. Must run AFTER _preset_autoload and any menu interaction
-# — CLAUDE_ACCOUNT isn't authoritative until then. Called from both the
-# interactive path (after show_main_menu) and the non-interactive path
-# (after _preset_autoload, before dispatch) — see bottom of this file.
-_bind_claude_account() {
-    local account="${CLAUDE_ACCOUNT:-private}"
-    [[ "${account}" == "private" ]] && account=""
-
-    local claude_dir claude_json_src
-    if [[ -n "${account}" ]]; then
-        if [[ ! "${account}" =~ ^[a-zA-Z0-9_-]+$ ]]; then
-            echo "ERROR: Invalid CLAUDE_ACCOUNT '${account}': must contain only letters, digits, hyphens, underscores" >&2
-            exit 1
-        fi
-        claude_dir="${HOME}/.claude-${account}"
-        if [[ ! -d "${claude_dir}" ]]; then
-            echo "ERROR: Account profile directory not found: ${claude_dir}" >&2
-            echo "Available profiles: $(_claude_list_account_profiles | tr '\n' ' ')" >&2
-            exit 1
-        fi
-        if [[ -f "${HOME}/.claude-${account}.json" ]]; then
-            claude_json_src="${HOME}/.claude-${account}.json"
-        else
-            claude_json_src="${HOME}/.claude.json"
-        fi
-        AI_WRAPPER_AGENT_NAME="Claude CLI [${account}]"
-    else
-        claude_dir="${HOME}/.claude"
-        claude_json_src="${HOME}/.claude.json"
-
-        # WS3 / B-alpha: symlink-safety guard. Refuse if ~/.claude exists as
-        # a non-directory (a stray file from a botched migration) or as a
-        # symlink whose target escapes $HOME. A rogue symlink would cause
-        # `mkdir -p` to follow it, then the subsequent bind would grant RW
-        # on the symlink target's real location — silently moving the
-        # write fence somewhere unintended. Only applies to the private
-        # (default) account — a named account's directory must already
-        # exist as a real directory (checked above).
-        if [[ -L "${claude_dir}" ]]; then
-            local _resolved_claude_dir
-            if ! _resolved_claude_dir="$(_realpath "${claude_dir}")" || [[ -z "${_resolved_claude_dir}" ]]; then
-                echo "ERROR: ${claude_dir} is a symlink whose target cannot be resolved. Inspect and remove before launching." >&2
-                exit 1
-            fi
-            case "${_resolved_claude_dir}" in
-                "${HOME}"/*) ;;
-                *)
-                    echo "ERROR: ${claude_dir} is a symlink pointing outside \$HOME (resolves to ${_resolved_claude_dir}). Refusing — the bind would grant RW on the target." >&2
-                    exit 1
-                    ;;
-            esac
-        elif [[ -e "${claude_dir}" && ! -d "${claude_dir}" ]]; then
-            echo "ERROR: ${claude_dir} exists but is not a directory or symlink. Move or remove it before launching." >&2
-            exit 1
-        fi
-
-        # Ensure ~/.claude exists before binding: the universal wrapper
-        # requires bind sources to exist, so a fresh machine (no prior
-        # Claude run) would otherwise hard-fail here instead of letting
-        # Claude initialize the directory itself.
-        _wrapper_check_config_symlink "${claude_dir}" || exit 1
-        if ! mkdir -p "${claude_dir}"; then
-            echo "ERROR: failed to create ${claude_dir}" >&2
-            exit 1
-        fi
-
-        # Ensure ~/.claude.json exists before binding. Claude's atomic-write
-        # pattern is `write .claude.json.tmp.<...> -> rename .claude.json`;
-        # binding a nonexistent destination would leave that rename with
-        # nothing to land on. If the path exists but isn't a regular file,
-        # refuse rather than silently binding a misshapen path.
-        # Check a symlinked ~/.claude.json BEFORE touch follows it.
-        _wrapper_check_config_symlink "${claude_json_src}" || exit 1
-        if [[ -e "${claude_json_src}" && ! -f "${claude_json_src}" ]]; then
-            echo "ERROR: ${claude_json_src} exists but is not a regular file. Move or remove it before launching." >&2
-            exit 1
-        fi
-        if ! touch "${claude_json_src}" 2>/dev/null; then
-            if [[ ! -f "${claude_json_src}" ]]; then
-                echo "ERROR: failed to create ${claude_json_src}; sandbox cannot bind a nonexistent file." >&2
-                exit 1
-            fi
-            echo "WARN: could not update ${claude_json_src} mtime; continuing because the file exists." >&2
-        fi
-    fi
-
-    # Shared symlink-target guard (ai_wrapper_lib.bash): refuses a
-    # symlinked profile dir / .claude.json whose target is outside $HOME or
-    # inside a credential location. Covers the named-account paths, the
-    # ~/.claude.json file, and credential-dir targets of ~/.claude, none of
-    # which the checks above caught.
-    _wrapper_check_config_symlink "${claude_dir}" || exit 1
-    _wrapper_check_config_symlink "${claude_json_src}" || exit 1
-
-    _wrapper_add_bind "${claude_dir}" "${HOME}/.claude"
-    _wrapper_add_bind "${claude_json_src}" "${HOME}/.claude.json"
-}
+# The ~/.claude / ~/.claude.json binds and the read-only persistent
+# controls are added after the menu by _bind_claude_account
+# (ai_wrapper_data/claude_wrapper_lib.bash; CLAUDE_ACCOUNT may change there).
 
 # Git worktree common-dir bind (shared .git outside WORKDIR) and the
-# post-menu glab bind (_apply_post_menu_binds, called below) live in the
-# shared ai_wrapper_data/ai_wrapper_lib.bash so the Codex wrapper gets the
-# same behavior. See the comments there.
-_wrapper_bind_git_common_dir
+# glab bind run after the menu in _apply_post_menu_binds (called below),
+# shared with the other wrappers via ai_wrapper_data/ai_wrapper_lib.bash.
+# See the comments there.
 
 # Claude CLI flags — full autonomy *within the sandbox boundary*.
 # The sandbox (bwrap args / SBPL profile) is the permission fence here:
@@ -220,7 +122,7 @@ if [[ $# -eq 0 && -t 0 && -t 1 ]]; then
     # menu so flips made in the Settings sub-menu (account switch,
     # PASS_GITLAB) actually reach WRAPPER_FLAGS.
     _bind_claude_account
-    _apply_post_menu_binds
+    _apply_post_menu_binds || exit 1
 
     # Plugin post-menu hook: downstream extensions (loaded via
     # AI_WRAPPER_EXTRA_PROFILE) can mutate AGENT_FLAGS / AI_SANDBOX_PROFILE /
@@ -251,10 +153,10 @@ fi
 # catalog defaults.
 _preset_autoload
 _bind_claude_account
-_apply_post_menu_binds
+_apply_post_menu_binds || exit 1
 # Non-interactive plugin hook: same contract as the interactive path above
 # so scripted invocations pick up plugin post-menu mutations too.
 if declare -f _extra_post_menu_setup >/dev/null 2>&1; then
     _extra_post_menu_setup
 fi
-run_sandboxed_agent "${AI_AGENT_COMMAND}" -- "${WRAPPER_FLAGS[@]}" -- "${AGENT_FLAGS[@]}" "$@"
+run_sandboxed_agent "${AI_AGENT_COMMAND}" -- "${WRAPPER_FLAGS[@]+"${WRAPPER_FLAGS[@]}"}" -- "${AGENT_FLAGS[@]+"${AGENT_FLAGS[@]}"}" "$@"

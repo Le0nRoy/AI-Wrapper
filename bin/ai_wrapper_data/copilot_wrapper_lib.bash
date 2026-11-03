@@ -56,12 +56,32 @@ _copilot_bind_config_path() {
     _wrapper_add_bind "${src}" "${p}"
 }
 
-# Keep Copilot runtime state in its standard home paths. Returns 1 when any
-# path is refused.
+# ===== PERSISTENT CONTROLS (#48 / #87) =====
+# Paths under ~/.copilot that every later Copilot session loads: config.json
+# (trusted folders, allowed URLs), settings.json (incl. user-level hooks),
+# MCP servers, global instructions, custom agents, hooks, plugins and
+# skills. Kept read-only when present at launch. Session state stays
+# writable: session-state/, history, logs (~/.local/share/copilot) and the
+# editor-plugin OAuth tokens in ~/.config/github-copilot (hosts.json,
+# apps.json); only that dir's config.json is a control.
+_COPILOT_CLIENT_CONTROLS=(
+    config.json settings.json mcp-config.json
+    copilot-instructions.md AGENTS.md
+    agents hooks installed-plugins plugins skills
+)
+_COPILOT_GH_CLIENT_CONTROLS=(config.json)
+
+# Keep Copilot runtime state in its standard home paths, with the persistent
+# controls read-only. Must run after the menu (AI_SANDBOX_ALLOW_SETTINGS is
+# a menu setting). Returns 1 when any path is refused.
 _copilot_bind_config_dirs() {
     _copilot_bind_config_path "${HOME}/.copilot" required || return 1
     _copilot_bind_config_path "${HOME}/.config/github-copilot" || return 1
     _copilot_bind_config_path "${HOME}/.local/share/copilot" || return 1
+    _wrapper_protect_client_controls "copilot" "${HOME}/.copilot" "${HOME}/.copilot" \
+        "${_COPILOT_CLIENT_CONTROLS[@]}" || return 1
+    _wrapper_protect_client_controls "copilot" "${HOME}/.config/github-copilot" \
+        "${HOME}/.config/github-copilot" "${_COPILOT_GH_CLIENT_CONTROLS[@]}" || return 1
 }
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then

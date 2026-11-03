@@ -26,6 +26,21 @@ source "${WRAPPER_DATA_DIR}/ai_wrapper_lib.bash"
 
 # ===== ORCHESTRATION PROMPT INJECTION =====
 
+# Replace every occurrence of $2 with $3 in the variable named $1.
+# Deliberately not `${var//pat/rep}`: the replacement's quote and
+# backslash handling differs across bash versions — 3.2 (macOS /bin/bash)
+# keeps double quotes in a double-quoted replacement literally, 4.3+
+# removes them, and 5.2's patsub_replacement turns an unquoted `\\` into
+# `\`. Prefix/suffix removal with a quoted pattern is literal everywhere.
+_toml_replace_all() {
+    local rest="${!1}" out=""
+    while [[ "${rest}" == *"${2}"* ]]; do
+        out="${out}${rest%%"${2}"*}${3}"
+        rest="${rest#*"${2}"}"
+    done
+    printf -v "${1}" '%s' "${out}${rest}"
+}
+
 # Encode $1 as a TOML basic string (double-quoted, with escapes) on stdout.
 # codex parses the value of `-c key=value` as TOML and silently falls back
 # to the raw string when parsing fails — relying on that fallback would
@@ -35,18 +50,18 @@ source "${WRAPPER_DATA_DIR}/ai_wrapper_lib.bash"
 # other C0 control plus DEL as \uXXXX. Bash strings cannot contain NUL.
 _toml_basic_string() {
     local s="${1}" bs='\' code ch esc
-    s="${s//"${bs}"/"${bs}${bs}"}"
-    s="${s//\"/"${bs}\""}"
-    s="${s//$'\b'/"${bs}b"}"
-    s="${s//$'\t'/"${bs}t"}"
-    s="${s//$'\n'/"${bs}n"}"
-    s="${s//$'\f'/"${bs}f"}"
-    s="${s//$'\r'/"${bs}r"}"
+    _toml_replace_all s "${bs}" "${bs}${bs}"
+    _toml_replace_all s '"' "${bs}\""
+    _toml_replace_all s $'\b' "${bs}b"
+    _toml_replace_all s $'\t' "${bs}t"
+    _toml_replace_all s $'\n' "${bs}n"
+    _toml_replace_all s $'\f' "${bs}f"
+    _toml_replace_all s $'\r' "${bs}r"
     for code in 1 2 3 4 5 6 7 11 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 127; do
         printf -v ch "\\x$(printf '%02x' "${code}")"
         [[ "${s}" == *"${ch}"* ]] || continue
         printf -v esc '%su%04X' "${bs}" "${code}"
-        s="${s//"${ch}"/"${esc}"}"
+        _toml_replace_all s "${ch}" "${esc}"
     done
     printf '"%s"' "${s}"
 }
@@ -66,13 +81,13 @@ _agent_system_prompt_args() {
 # home dir, so there is no separate top-level file to bind (unlike
 # ~/.claude.json). Persisted per-workdir by the preset mechanism.
 _AI_SETTINGS_LIST+=(
-    "CODEX_ACCOUNT|str|private|info|Account profile|Which ~/.codex-<name>/ credential profile to use. 'private' = default ~/.codex. Type a profile name, or 'private' to reset.|account"
+    "CODEX_ACCOUNT|str|private|info|Account profile|Which ~/.codex-<name>/ credential profile to use. 'private' = default ~/.codex. Type a profile name, or 'private' to reset. Named profiles are Linux-only; macOS refuses them at launch.|account"
 )
 
-# Export the default so the settings table shows "private" rather than
-# "<unset>" (str entries don't substitute DEFAULT). See the matching
-# comment in claude_wrapper_lib.bash.
-export CODEX_ACCOUNT="${CODEX_ACCOUNT:-private}"
+# No source-time `export CODEX_ACCOUNT=private`: _preset_autoload treats a set
+# variable as caller-set and would skip a saved account. The settings table
+# shows "private" for unset via _setting_current_value's catalog default.
+
 
 # List available account profile names (suffixes of ~/.codex-<name>/),
 # one per line.
@@ -86,8 +101,21 @@ _codex_list_account_profiles() {
     done
 }
 
+# ===== PERSISTENT CONTROLS (#48 / #87) =====
+# Paths under the profile dir that every later Codex session loads:
+# config.toml (model, MCP servers, notify commands, project trust),
+# hooks, global instructions, exec-policy rules, custom prompts, agents,
+# plugins and skills. _bind_codex_account keeps the ones present at launch
+# read-only via _wrapper_protect_client_controls. Session state stays
+# writable: auth.json, history.jsonl, sessions/, log/, cache.
+_CODEX_CLIENT_CONTROLS=(
+    config.toml config.json hooks.json
+    AGENTS.md AGENTS.override.md
+    agents hooks plugins prompts rules skills
+)
+
 # Resolve CODEX_ACCOUNT to the profile dir and append its bind (at
-# ~/.codex) to WRAPPER_FLAGS. Must run AFTER _preset_autoload and the menu
+# ~/.codex) and the read-only persistent controls to WRAPPER_FLAGS. Must run AFTER _preset_autoload and the menu
 # — CODEX_ACCOUNT isn't authoritative until then. Exits on invalid input,
 # same contract as _bind_claude_account in executable_claude_wrapper.bash.
 _bind_codex_account() {
@@ -100,6 +128,7 @@ _bind_codex_account() {
             echo "ERROR: Invalid CODEX_ACCOUNT '${account}': must contain only letters, digits, hyphens, underscores" >&2
             exit 1
         fi
+        _wrapper_check_account_supported "${account}" "CODEX_ACCOUNT" || exit 1
         codex_dir="${HOME}/.codex-${account}"
         if [[ ! -d "${codex_dir}" ]]; then
             echo "ERROR: Account profile directory not found: ${codex_dir}" >&2
@@ -136,6 +165,8 @@ _bind_codex_account() {
     local bind_src
     bind_src="$(_realpath "${codex_dir}")" || bind_src="${codex_dir}"
     _wrapper_add_bind "${bind_src}" "${HOME}/.codex"
+    _wrapper_protect_client_controls "codex" "${bind_src}" "${HOME}/.codex" \
+        "${_CODEX_CLIENT_CONTROLS[@]}" || exit 1
 }
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then

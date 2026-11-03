@@ -40,17 +40,19 @@ this section records the disposition.
   and any `npm_config_*authToken*` / `*authtoken*` / `*_auth` name).
 - **3.I → `AI_SANDBOX_ALLOW_DOCKER` env knob.** New **S-η** entry in
   the threat model. SBPL Docker / Colima / `~/.docker` rules are now
-  wrapped in `(when (equal? (param "ALLOW_DOCKER") "1") …)`. Default
-  remains `1` (preserves the working-out-of-the-box `docker` CLI);
-  set `0` to omit the rules and close the host-root escape path when
-  the daemon is up.
+  wrapped in `(when (equal? (param "ALLOW_DOCKER") "1") …)`. The
+  default is now `0` on both backends (settings catalog, the Linux
+  bwrap wrapper and the SBPL param), which omits the rules and closes
+  the host-root escape path; set `1` only when the session needs the
+  `docker` CLI. (This entry originally said the default stayed `1`;
+  corrected by #62.)
 - **3.J → BLOCK_LOCALHOST scope clarified.** README now states
   explicitly that the flag is IP-only — it does not cover Unix-domain
   sockets or link-local addresses (AWS IMDS at `169.254.169.254`).
   No code change; documentation only.
 - **3.K → strict profile sanity check.** The `(version 1)` /
-  `(deny default)` check now also refuses a profile whose first 80
-  non-comment lines contain `(allow default)`, which would otherwise
+  `(deny default)` check now also refuses a profile that contains
+  `(allow default)` (first 80 lines only until #67, S-ν), which would otherwise
   silently neutralise the `(deny default)` baseline.
   `AI_SANDBOX_PROFILE_TRUST_ME=1` bypasses this check too — single
   bypass for the whole sanity-check block.
@@ -146,8 +148,9 @@ regular file as a sandbox profile replacement. A trivially permissive
 substitute (`(version 1)(allow default)`) silently nullified the
 fence.
 
-**Resolution.** WS3 sanity-checks the loaded profile body: scans the
-first 80 non-comment lines for `(version 1)` and `(deny default)`. If
+**Resolution.** WS3 sanity-checks the loaded profile body: scans it
+for `(version 1)` and `(deny default)` (originally the first 80
+non-comment lines; the whole body since #67, see S-ν). If
 either is missing, refuses to launch unless
 `AI_SANDBOX_PROFILE_TRUST_ME=1` is set (red banner). The check is
 intentionally cheap string-grep — false positives can be overridden;
@@ -325,7 +328,9 @@ servers on `localhost:*`, AWS instance metadata via VPN, etc.
 wrapper passes `-D BLOCK_LOCALHOST=…` and the SBPL profile gates a
 `(deny network-outbound (remote ip "localhost:*"))` / symmetric
 inbound rule on the param. Off by default — dev DBs and other
-localhost workflows keep working without the flag.
+localhost workflows keep working without the flag. Since #78 (S-ο) the
+default restricted network blocks loopback anyway; the flag only
+matters with `AI_SANDBOX_ALLOW_UNRESTRICTED_NET=1`.
 
 The "localhost" string is the only host form sandbox-exec accepts
 besides "*" in `(remote ip "...")` — literal IPs are rejected at
@@ -399,6 +404,537 @@ need launchd integration, which remains out of scope. OS-level OOM
 kills can still happen but the wrapper no longer claims to interpret
 them as rlimit-induced.
 
+### S-θ — Linux host dirs and the Tailscale socket bound unconditionally (RESOLVED, 2026-10, #62)
+
+The bwrap backend bound, whenever they existed and with no setting:
+`~/bin` RW (first on the sandbox PATH and on the host user's), the
+shared skill source `~/ai-wrapper/.agents` RW (copied into every
+client's skill dir by `setup_skills.bash`), `~/Android` RW, `~/.kind`
+RW, `~/kind_dot_kube` RW *onto `~/.kube`* (a kubeconfig even with
+`AI_SANDBOX_PASS_KUBE=0`), and `/run/tailscale/tailscaled.sock` RW. An
+agent could plant a program or rewrite a skill that later runs outside
+the sandbox, or use Kubernetes / Tailscale access nobody granted.
+
+**Resolution.** Linux-only catalog settings (default `0`, shown only on
+Linux, saved in the per-workdir preset like other toggles):
+
+| Resource | Default | Opt-in |
+|----------|---------|--------|
+| `~/bin` | `--ro-bind` (runs, not writable) | `AI_SANDBOX_ALLOW_BIN_RW=1` → `--bind` |
+| `~/ai-wrapper/.agents` | `--ro-bind` | `AI_SANDBOX_ALLOW_AGENTS_SKILLS_RW=1` → `--bind` |
+| `~/Android` | absent | `AI_SANDBOX_ALLOW_ANDROID=1` → `--bind` |
+| `/run/tailscale/tailscaled.sock` | absent | `AI_SANDBOX_PASS_TAILSCALE=1` → `--ro-bind` |
+| `~/.kind`, `~/kind_dot_kube`, `KIND_EXPERIMENTAL_PROVIDER` | removed (Kind support dropped) | none |
+
+`~/.kube` / `KUBECONFIG` stay behind `AI_SANDBOX_PASS_KUBE` (RO).
+Relaxed modes log a `WARNING` at launch. Missing host paths are
+skipped, never created; host Kind files are left in place. The
+protected binds mount before WORKDIR and the extra binds, so an
+explicit grant at or above them still wins (bwrap's later mount
+covers the earlier one): launching from `~/ai-wrapper`, or
+`AI_SANDBOX_EXTRA_RW_DIRS=~/bin`, makes that tree writable whatever
+the toggles say, and a WORKDIR inside `~/bin` stays writable while
+the rest of `~/bin` stays read-only.
+
+**Residual.**
+- A read-only bind of a UNIX socket stops the socket file being
+  removed or replaced, not `connect()`/`send()`. With
+  `AI_SANDBOX_PASS_TAILSCALE=1` the agent talks to the LocalAPI with
+  the host user's UID (`SO_PEERCRED`), so it can do whatever
+  `tailscaled` allows that user — read-only for a plain user,
+  settings changes for `--operator=$USER`. There is no read-only
+  Tailscale API mode.
+- `/run/user/$UID` (`XDG_RUNTIME_DIR`) was still bound RW; resolved
+  by #63 (S-ι).
+- macOS binds none of these paths; unchanged.
+- Native enforcement is tested by `tests/test_linux_host_binds.bash`
+  under real bubblewrap (CI `smoke-linux`), with a synthetic socket
+  standing in for `tailscaled`.
+
+### S-ι — Linux user runtime dir bound wholesale; XDG_RUNTIME_DIR lost (RESOLVED, 2026-11, #63)
+
+The bwrap backend bound the host `$XDG_RUNTIME_DIR` (normally
+`/run/user/$UID`) read-write whenever it existed. It holds the
+session's sockets: D-Bus session bus, `systemd --user`, keyring / Secret
+Service, Wayland / X / PipeWire / PulseAudio, SSH and GPG agents,
+rootless Docker / Podman. The sandbox runs as the host UID, and these
+daemons authorise callers by UID (`SO_PEERCRED`) — a read-only bind
+would not have changed that. So `AI_SANDBOX_PASS_SSH_AGENT=0` and
+`AI_SANDBOX_ALLOW_DOCKER=0` did not stop an agent that found the
+sockets. What each socket allowed depends on that daemon. Separately,
+`--setenv XDG_RUNTIME_DIR` came before `--clearenv`, so the client never
+saw the variable.
+
+**Resolution.**
+
+| Resource | Default | Opt-in |
+|----------|---------|--------|
+| Runtime dir | private, empty, `--perms 0700 --dir`; host path if it lies below `/run` or `/tmp` and no other mount overlaps it, else `/run/user/UID` (also when unset/invalid) | `AI_SANDBOX_ALLOW_XDG_RUNTIME_RW=1` → `--bind` of the validated host dir |
+| `XDG_RUNTIME_DIR` | set after `--clearenv` to the sandbox dir | same |
+| SSH agent socket | absent | `AI_SANDBOX_PASS_SSH_AGENT=1` → `--bind` at `SSH_AUTH_SOCK`'s exact path |
+| Rootless `docker.sock`, `podman/podman.sock` | absent | `AI_SANDBOX_ALLOW_DOCKER=1` → `--bind` into the sandbox runtime dir (socket, not a symlink, owned by you) |
+| Session bus, `systemd/`, keyring, display, audio, other sockets | absent | broad override only |
+
+`AI_SANDBOX_ALLOW_XDG_RUNTIME_RW` is a Linux-only red catalog setting
+(saved in the per-workdir preset). It requires an existing directory,
+resolved through symlinks, owned by the user, not a system root,
+`$HOME`, a dotfile dir, a parent of `$HOME`, or group/world-writable;
+otherwise the launch fails with the reason instead of falling back. The
+permission check fails closed: if it cannot run, the launch is refused.
+`AI_SANDBOX_PASS_DOCKER` still alone controls `DOCKER_HOST` and
+`~/.docker`; a `DOCKER_HOST` that names the shared rootless socket via a
+host spelling the sandbox does not reuse is rewritten to the mounted
+path.
+
+**Residual.**
+- A wider explicit grant wins: a WORKDIR, `AI_SANDBOX_EXTRA_RW_DIRS`
+  entry or plugin `--bind` that contains the host runtime dir exposes it
+  and its sockets regardless of these settings. In that overlap the
+  sandbox uses `/run/user/UID` so its private dir setup never touches
+  the host-backed path.
+- Shared sockets are full API access to that daemon for the host UID;
+  bind flags do not restrict the API.
+- `--perms` needs bubblewrap 0.5 or newer.
+- Native enforcement is tested by `tests/test_linux_runtime_dir.bash`
+  under real bubblewrap (CI `smoke-linux`), with synthetic socket
+  servers standing in for the bus, `systemd`, Docker, Podman and SSH
+  agents.
+
+### S-κ — Linux process isolation: nested user namespaces, TIOCSTI, sysctl preflight (RESOLVED, 2026-11, #64)
+
+Three gaps in the bwrap backend:
+
+- **L3.** `--unshare-all` only *tries* a user namespace and leaves the
+  sandboxed process free to create more. Each nested user namespace
+  gives it namespace-root capabilities and reaches kernel code
+  (filesystem mounts, netfilter, ...) an unprivileged process cannot.
+- **L5.** The sandbox shared the caller's controlling terminal with no
+  filter, so on kernels that still allow `ioctl(TIOCSTI)`
+  (`dev.tty.legacy_tiocsti=1`, or older than 6.2) the agent could push
+  keystrokes into the terminal's input queue for the shell to run after
+  the session (CVE-2017-5226 class). `TIOCLINUX` offers a similar
+  console-selection paste path.
+- **L7.** Preflight required the `sysctl` binary and failed when
+  `kernel.unprivileged_userns_clone` did not exist; it never checked that
+  a namespace could actually be created.
+
+**Resolution.**
+
+| Control | Default | Opt-out |
+|---------|---------|---------|
+| Nested user namespaces | `--unshare-user --disable-userns --assert-userns-disabled` | `AI_SANDBOX_ALLOW_NESTED_USERNS=1` (red, Linux) omits them, launch `WARNING` |
+| Terminal injection | seccomp filter: `ioctl(TIOCSTI)` and `ioctl(TIOCLINUX)` fail with `EPERM`; everything else allowed | `AI_SANDBOX_ALLOW_TIOCSTI=1` (yellow, Linux) omits it, launch `WARNING` |
+| Knob check | `/proc/sys/kernel/unprivileged_userns_clone`, `/proc/sys/user/max_user_namespaces` read directly | none |
+| Launch probe | real bwrap run of the external `true` that must create a user namespace (`--unshare-user`), with the launch's isolation options | none |
+
+- *Filter.* `bin/ai_wrapper_data/linux_tty_seccomp.py`, run as
+  `python3 -I` on the host, loads libseccomp through ctypes, resolves
+  the native `ioctl` syscall through it, adds the 32-bit compat ABIs
+  (`x86`/`x32` on `x86_64`, `arm` on `aarch64`; any other arch hits
+  libseccomp's bad-arch kill), and matches the request on its low 32
+  bits (the kernel truncates the command, so `1<<32 | TIOCSTI` is the
+  same ioctl). Request values come from Python's `termios`. Before it
+  prints the filter it loads the exported BPF in a forked child that
+  owns a private pty and checks that `TIOCSTI` (plain and high-bit) and
+  `TIOCLINUX` turn from non-`EPERM` into `EPERM` while `TIOCGWINSZ` still
+  works. The wrapper accepts only whole 8-byte instructions, feeds the
+  filter through a pipe to `--add-seccomp-fd` (one fresh descriptor for
+  the probe, one for the launch, both closed afterwards) and never reads
+  a filter from a file. A missing interpreter, library, symbol or
+  architecture match, a failed self-test or a filter bwrap cannot load
+  refuses the launch and names `AI_SANDBOX_ALLOW_TIOCSTI=1`. Python 3
+  and the libseccomp runtime (`libseccomp2`) are Linux prerequisites.
+- *Terminal behaviour.* No `--new-session`, no PTY proxy, no signal
+  forwarding: the client keeps the controlling terminal, `/dev/tty`,
+  raw input, window size and `SIGWINCH`, and Ctrl+C reaches it as
+  `SIGINT` (the wrapper and bwrap receive it too, as before; bwrap
+  exiting on it ends the session, so a clean exit 0 is not promised).
+- *Caller filters.* A `--seccomp FD` added by a hook is switched to the
+  equivalent `--add-seccomp-fd FD` (bwrap refuses to mix them); the
+  kernel applies every filter and the strictest result wins, so ours
+  never replaces or weakens it. With `AI_SANDBOX_ALLOW_TIOCSTI=1` the
+  caller's flags are left as given.
+- *Preflight.* An absent knob is inconclusive. One that is `0`, cannot
+  be read or holds a non-number refuses the launch (no privileged fix is
+  prescribed). The probe binds `/usr`, `/bin`, `/lib`, `/lib64` where they
+  exist and runs `type -P true`; its output is captured in memory. The
+  refusal says whether bwrap lacks an option (names the opt-out), could
+  not disable nested namespaces, could not load the filter, hit a setup
+  problem (`execvp`, missing path — not a namespace denial), or was
+  denied a user namespace (kernel, LSM such as AppArmor, container
+  runtime). The probe source paths are assigned at source time; the
+  caller's environment cannot redirect or skip them.
+
+**Residual / tradeoffs.**
+- With nested user namespaces denied: nested bubblewrap / Flatpak,
+  Chromium, Playwright or Puppeteer using their namespace sandbox
+  (instead of `--no-sandbox`), and rootless container engines run
+  *inside* the sandbox fail. Docker / Podman clients talking to a host
+  daemon through a shared socket (#63) are unaffected; that daemon
+  creates the namespaces outside the sandbox. A client's own
+  bubblewrap-based command sandbox would also need the opt-out; the
+  wrappers launch clients with their built-in sandboxes turned off.
+- bwrap without `--disable-userns` / `--add-seccomp-fd` support refuses
+  the protected launch; there is no warn-and-skip path.
+- `TIOCSTI` is often already blocked by the kernel (`legacy_tiocsti=0`,
+  `EIO`); the tests credit only `EPERM` against an unfiltered control to
+  the filter. The filter is only as complete as libseccomp's arch
+  support and the compat list above.
+- Native coverage: `tests/test_linux_process_isolation.bash` (CI
+  `smoke-linux`): nested `unshare` denial and relaxed success, ioctl
+  `EPERM` versus the unfiltered control, descriptor leaks, a caller filter
+  combined with ours, real knob and probe denial in a child user
+  namespace, and a private PTY driving a real launch (`/dev/tty`, raw
+  input, resize, Ctrl+C, cleanup). Results from one kernel/arch are not
+  claims about others.
+
+### S-λ — paths classified before resolution; broad config-symlink targets (RESOLVED, 2026-11, #65)
+
+Three gaps (CC-1..CC-3):
+
+- **CC-1.** The bwrap backend classified the logical `$(pwd)` with
+  `_sandbox_sensitive_dir_kind` and bound it as given. Launching from
+  `~/proj -> ~/.ssh` (or `-> /etc`, `-> $HOME`) passed the guard, and
+  bwrap followed the link and bound the target read-write.
+- **CC-2.** `AI_SANDBOX_EXTRA_{RW,RO}_DIRS` entries were only trimmed
+  and `~`-expanded on both backends. On Linux a symlink, `..`
+  (`~/proj/../.ssh`) or a spelling such as `//etc` slipped past the
+  string classifier; macOS resolved for the check but fell back to the
+  raw string when resolution failed.
+- **CC-3.** `_wrapper_check_config_symlink` (B-κ) only refused targets
+  outside `$HOME` and a short credential list. An agent config symlink to
+  `$HOME/`, `~/.config`, `~/.local`, `~/bin`, `~/.config/gh`,
+  `~/.password-store`, `~/.gitconfig` or `~/.bashrc` was accepted and
+  bound RW. A dangling link was accepted too (`touch` / `mkdir -p` could
+  then create its target). `claude_wrapper` bound the unresolved path.
+
+**Resolution.**
+
+- `_realpath` is defined once, in `ai_agent_universal_wrapper.bash`
+  (the copies in `ai_wrapper_lib.bash` and `macos_sandbox_exec.bash` are
+  gone; both are sourced after it).
+- *WORKDIR (Linux).* The cwd is resolved; an unresolvable cwd refuses
+  the launch. `_sandbox_sensitive_pair_kind` classifies the resolved path
+  against the resolved `$HOME` and the logical path against the raw
+  `$HOME` (so `~/.config` relocated to a data disk is still refused). The
+  resolved path is bound at itself and, when the cwd came through a
+  symlink, also at the logical path, and `--chdir` uses the logical path.
+  The git metadata overlays already cover both paths
+  (`_wrapper_git_ro_bind` / `_wrapper_git_pin`).
+- *Extra dirs (both backends).* `_sandbox_resolve_extra_dir` resolves
+  each entry before it is classified or granted. A missing entry is
+  skipped with a WARNING, as before (a preset from another machine stays
+  usable and nothing is granted). An entry that exists but does not
+  resolve to a directory (dangling symlink, loop, unreadable component,
+  regular file) refuses the launch; `AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1`
+  does not change that. Grants use the resolved path. The sensitivity
+  guard checks both forms, and the override works as before.
+- *Config symlinks.* `_wrapper_check_config_symlink` separates two kinds
+  of check. **Mandatory validation:** the link must resolve, without a
+  loop, to an existing target. **Authorization:** the target must be
+  strictly under `$HOME`. It must not be a broad root (`~/.config`,
+  `~/.local`, `~/.local/share`, `~/.local/state`, `~/.cache`,
+  `~/Library`, `~/Library/Application Support`). It must not lie in, at
+  or above an entry of `_WRAPPER_CONFIG_SYMLINK_DENIED`:
+  - credential stores: `.ssh`, `.gnupg`, `.aws`, `.azure`, `.kube`,
+    `.docker`, `.colima`, `.podman`, `.netrc`, `.npmrc`, `.pypirc`,
+    `.git-credentials`, `.password-store`, gh / gcloud / glab config,
+    keyrings and Keychains;
+  - host-executed config: `.gitconfig`, `.config/git`, shell startup
+    files, `.config/systemd`, `.config/autostart`,
+    `.config/environment.d`, `.local/bin`, `Library/LaunchAgents`;
+  - the #62 read-only paths `~/bin` and `~/ai-wrapper/.agents`.
+
+  A config path whose ancestor is a symlink, so that it resolves
+  elsewhere than it is spelled, gets the same check. Relocated and
+  multi-account profiles (`~/.claude-<name>`, `~/.config/claude`,
+  `~/.local/share/gemini`, `~/profiles/...`, `~/dotfiles/claude.json`)
+  are still accepted. `claude_wrapper` binds the resolved `~/.claude*`
+  dir and `.json`, as Codex, Antigravity and Copilot already did.
+
+**Residual / owner choices.**
+- The config-symlink policy is a denylist. A credential store not listed
+  under `$HOME` is still an accepted target. A strict allowlist (only
+  agent namespaces and non-dot paths) would close that but could reject
+  existing setups, so it is left to the owner. Targets outside `$HOME`
+  stay refused with no opt-in.
+- Extra dirs are granted only at their resolved path. On Linux a
+  symlinked entry such as `~/data -> /mnt/data` is visible inside the
+  sandbox as `/mnt/data`, not `~/data`. A logical alias would add a
+  writable path that the git overlays do not cover.
+- Missing extra-dir entries are still skipped, not refused (compatibility
+  with presets shared across machines). Making them fatal is an owner
+  choice.
+- Mounting at the logical WORKDIR path needs its parent to be creatable
+  in the sandbox, as before this change. A cwd behind a symlink under a
+  read-only mount (`~/bin/link`) fails the bwrap launch loudly.
+- Coverage: `tests/test_bind_hardening.bash` (helper units, config
+  policy matrix, Linux argv through a stub bwrap, claude resolved
+  binds) and `tests/test_extra_bind_dirs.bash` (native refusals and
+  grants through the real sandbox, CI `smoke-linux` / `smoke-macos`).
+
+### S-μ — saved preset overrode the launch environment (RESOLVED, 2026-11, #66)
+
+CC-6. `_preset_autoload` exported every saved setting unconditionally,
+so `AI_SANDBOX_PASS_AWS=0 claude_wrapper` in a workdir whose preset held
+`AI_SANDBOX_PASS_AWS=1` launched with AWS credentials anyway. Only
+`AI_SANDBOX_ALLOW_GIT_CONFIG` had a launch-wins check, and only that
+setting WARNed when a relaxed value was restored; every other red or
+yellow setting (Docker socket, SSH agent, extra RW dirs, ...) came back
+silently, including for scripted launches with no menu.
+
+**Resolution.**
+
+- A setting already present in the launch environment (even set to an
+  empty string) is never overwritten by the preset
+  (`[[ -n "${!key+x}" ]]`). This replaces the one-off
+  `_AI_GIT_CONFIG_SET_AT_LAUNCH` flag. Ordinary settings, red and yellow
+  ones included, still persist in the preset by owner choice.
+- Restoring a red or yellow setting at a non-default value WARNs on
+  stderr (`Restored KEY=VAL from the saved preset (...)`) in interactive
+  and scripted launches alike. Default values and info settings restore
+  silently.
+- The claude, codex and agy libs no longer `export *_ACCOUNT=private` at
+  source time — that would count as caller-set and hide a saved account.
+  `_setting_current_value` now substitutes the catalog default for an
+  empty str/path, so the settings table still shows `private`.
+- Session-only settings (`AI_SANDBOX_ALLOW_EXTERNAL_WORKTREES`, B-ο) are
+  still rejected before the precedence check: never saved, never loaded.
+
+**Residual.** In an interactive launch, auto-save runs after the menu and
+writes the session's current values, so a one-off launch value (e.g.
+`AI_SANDBOX_PASS_AWS=0`) replaces the saved one for that workdir. A
+preset entry for a variable that is set at launch is skipped silently.
+
+### S-ν — macOS: git credential files, Keychain, custom-profile check (RESOLVED, 2026-11, #67)
+
+M3, M1, CC-4.
+
+- **Git credential-store files (M3).** The base profile granted read on
+  `(subpath ~/.config/git)` for git's XDG config (`ignore`,
+  `attributes`), which also covered `~/.config/git/credentials` — the
+  plaintext token file `git credential-store` uses there. Neither it nor
+  `~/.git-credentials` was in the `ALLOW_RO_HOMEDIR` `(require-not …)`
+  chain. **Resolution.** An explicit `(deny file-read* (literal …))` for
+  both files follows every read grant in the base profile (~/.config/git,
+  `ALLOW_RO_HOMEDIR`, `ALLOW_RO_CREDENTIALS`), and both are excluded from
+  the `ALLOW_RO_HOMEDIR` chain. Explicit grants rendered after the base
+  profile (WORKDIR, `--bind` / `--ro-bind`, `AI_SANDBOX_EXTRA_*_DIRS`)
+  still win, as for every other credential path. glab's on-disk token
+  stays with `AI_SANDBOX_PASS_GITLAB` (#47).
+- **glab config under `ALLOW_RO_HOMEDIR` (#47).** The glab config dirs
+  (`~/Library/Application Support/glab-cli`, `~/.config/glab-cli`,
+  `~/.local/share/glab-cli`) were missing from the `ALLOW_RO_HOMEDIR`
+  `(require-not …)` chain, so `AI_SANDBOX_ALLOW_RO_HOMEDIR=1` exposed
+  the glab token while `AI_SANDBOX_PASS_GITLAB=0`. **Resolution.** All
+  three are excluded from the chain; the `PASS_GITLAB` rule is now the
+  only base-profile grant on them. A config relocated outside `$HOME`
+  via `XDG_CONFIG_HOME` / `XDG_DATA_HOME` is not covered by either rule.
+- **Keychain (M1).** Formerly S4: `~/Library/Keychains` was RW and the
+  `com.apple.SecurityServer` / `com.apple.securityd` Mach lookups were
+  always granted. With `(allow process-exec)`, any process in the sandbox
+  could run `/usr/bin/security` against the login keychain and read any
+  item whose access list admits that program without a prompt — the
+  file path and the daemon path each reach items on their own.
+  **Resolution.** Both the file rule and the two lookups move under
+  `(when (equal? (param "ALLOW_KEYCHAIN") "1") …)`, driven by the new
+  catalog setting `AI_SANDBOX_ALLOW_KEYCHAIN` (macOS only, red,
+  default `0`; a restored `1` WARNs per S-μ). `trustd` / `trustd.agent`
+  (TLS certificate evaluation) and `cryptoTokenKit` stay granted.
+  Client evidence: Claude Code keeps its macOS OAuth login in the
+  Keychain, so with the default it needs an env-var credential
+  (`CLAUDE_CODE_OAUTH_TOKEN`, from `claude setup-token`; `CLAUDE_*` is
+  passed through) or `AI_SANDBOX_ALLOW_KEYCHAIN=1`. Codex, agy and
+  Copilot keep their state in their own dot-dirs, which the wrappers
+  bind. Tests use only throwaway fixtures: a fake `*.keychain-db` file in
+  the fake home for the file path, and — on CI or with
+  `AI_WRAPPER_TEST_SYNTHETIC_KEYCHAIN=1` — a keychain created with
+  `security create-keychain` in the fake home, named explicitly on every
+  call and deleted on exit. The default keychain is never queried.
+- **Custom-profile check (CC-4).** U-C / 3.K inspected only the first 80
+  non-comment lines and matched `(version 1)`, `(deny default)` and
+  `(allow default)` as line prefixes, so `(allow default)` on line 81, after
+  another form on the same line, or split across whitespace passed.
+  **Resolution.** `_sandbox_profile_violation` scans the whole body:
+  string literals (including `#"…"` regex strings, with escapes) are
+  blanked, `;` comments dropped, the rest case-folded and
+  whitespace-flattened, then token-matched. Any `allow` rule whose
+  operation list names `default` is refused. Block comments (`#|`), datum
+  comments (`#;`) and character literals (`#\`) outside strings refuse
+  the launch, because they can hide a rule from the scanner.
+  `AI_SANDBOX_PROFILE_TRUST_ME=1` still bypasses the whole check.
+
+**Residual.** The check is a token match, not an SBPL evaluator: a rule
+built at run time (`define`, `string->symbol`, macros) is not seen. A
+custom profile is operator-supplied; the check guards against mistakes
+and casual substitution, not against a profile author.
+
+### S-ξ — Linux sandbox shared the host network (RESOLVED, 2026-11, #77)
+
+The bwrap backend ran with `--share-net`: the agent could reach every
+service on the host's loopback (dev databases, `kubectl proxy`, local
+admin UIs), host abstract `AF_UNIX` sockets (X11 `@/tmp/.X11-unix/X0`,
+D-Bus and other `@name` sockets live in the network namespace, not the
+filesystem), the LAN, Tailscale peers and cloud metadata
+(`169.254.169.254`), and send raw traffic anywhere.
+
+**Resolution.** By default the sandbox gets its own network namespace
+(`--unshare-net`): only its own loopback exists, so host loopback and host
+abstract sockets are unaddressable and there is no route out. HTTP(S)
+egress goes through the host proxy from #76
+(`bin/ai_wrapper_data/ai_network_proxy.py`), which resolves each
+destination itself and refuses (403) any whose resolved addresses include
+loopback, link-local / metadata, private LAN (RFC 1918, RFC 6598, ULA),
+multicast or reserved ranges, with IPv4-in-IPv6 unwrapped.
+
+| Piece | Where | Detail |
+|-------|-------|--------|
+| Proxy | host, as the user | `python3 -I ai_network_proxy.py --socket DIR/proxy.sock --parent-pid PID`; DIR is a fresh `mktemp -d` (0700) under the host runtime dir when it is under `/run`, else `/tmp`; socket 0600. Started after the launch probe, before the filter descriptor opens (it inherits neither); stdout/stderr go to files in DIR. Own session (`setsid`): terminal Ctrl+C does not reach it. Refuses to start unless PID is its parent and stops when it no longer is (wrapper killed without cleanup). |
+| Socket bind | sandbox | `--ro-bind DIR/proxy.sock /run/ai-sandbox-net/proxy.sock` (connect needs no write access to the mount) |
+| Forwarder | sandbox, first program | `bin/ai_wrapper_data/ai_sandbox_net_forwarder.py`, `--ro-bind` to `/run/ai-sandbox-net/forwarder.py`, run by the system `python3` (looked up in `/usr/bin:/bin:/usr/local/bin` only). Binds `127.0.0.1:3128` on the sandbox loopback, double-forks a relay into its own session (not a child of the client, all inherited descriptors closed), then `execvp`s the client in place: same PID, terminal, descriptors and exit status (127/126 when the client cannot run). The relay copies bytes only; the proxy decides. It ends with bwrap's PID namespace, or when the client's PID is gone. |
+| Client env | sandbox | `http_proxy` `https_proxy` `HTTP_PROXY` `HTTPS_PROXY` `all_proxy` `ALL_PROXY` = `http://127.0.0.1:3128`; `no_proxy` / `NO_PROXY` = `localhost,127.0.0.1,::1` (the sandbox's own loopback). Set after `AI_SANDBOX_PASS_ENV` and the `_extra_sandbox_setup` hook, so a passthrough cannot point clients elsewhere (and the namespace leaves nowhere else to go). |
+| Cleanup | host | After the launch: SIGTERM (SIGKILL after 5 s), DIR removed, a `WARNING` with the number of refused requests (`AI_SANDBOX_DEBUG=1` prints the proxy log). An EXIT trap covers the shell exiting or being killed during the session; the caller's own EXIT trap is restored afterwards, in a subshell too; a trap the subshell only inherited (which `trap -p` there also reports) is never restored, so the parent's cleanup does not run when the subshell exits. |
+| Fail closed | host | No `python3`, missing helper, proxy exit or no `READY unix` within 5 s, socket path over 107 bytes: launch refused, naming `AI_SANDBOX_ALLOW_UNRESTRICTED_NET=1`. |
+| Opt-out | `AI_SANDBOX_ALLOW_UNRESTRICTED_NET=1` (red, networking, Linux and macOS since #78, saved in presets; a restored `1` WARNs) | `--share-net`, no proxy, launch `WARNING`. Any other value keeps the isolation. |
+
+Why a forwarder: the proxy listens on a UNIX socket (a host TCP port
+cannot be reached from another network namespace, and an unprivileged
+process cannot join the sandbox's namespace from outside), while Node,
+curl/git, reqwest, Go and pip only accept `http://HOST:PORT` proxies.
+
+**Residual / tradeoffs.**
+- Public internet stays reachable through the proxy, so read + network
+  exfiltration (top of this file) is unchanged; the proxy filters
+  destinations, not content, and keeps no allowlist.
+- Clients that ignore the proxy variables, SSH (git `git@` remotes),
+  raw TCP/UDP, DNS lookups inside the sandbox and LAN / Tailscale /
+  cluster endpoints fail; those sessions need the opt-out. Unix-socket
+  grants (Docker, SSH agent, Tailscale LocalAPI) are unchanged; a host
+  Docker daemon reachable through `AI_SANDBOX_ALLOW_DOCKER=1` can still
+  run containers on the host network.
+- The proxy dir is under the host runtime dir; with
+  `AI_SANDBOX_ALLOW_XDG_RUNTIME_RW=1` the agent can see it (its own
+  request log) and delete the socket (breaking only its own network).
+- macOS (Seatbelt) wiring of the same proxy: S-ο (#78).
+- Tests: `tests/test_linux_network_isolation.bash` (stub argv,
+  lifecycle and failure handling with the real proxy; native bubblewrap:
+  host abstract socket, host loopback and direct egress denied, proxy
+  path refusing host loopback, `--share-net` as control; CI
+  `smoke-linux`), `tests/test_sandbox_net_forwarder.py`,
+  `tests/test_network_proxy.py`.
+
+### S-ο — macOS sandbox allowed all networking (RESOLVED, 2026-11, #78)
+
+`claude_wrapper.sb` granted `(allow network*)`: the agent could connect
+to every service on the host's loopback (dev databases, `kubectl proxy`,
+local admin UIs), the LAN, Tailscale peers and cloud metadata
+(`169.254.169.254`), listen on any port, and send raw TCP/UDP anywhere.
+`AI_SANDBOX_BLOCK_LOCALHOST=1` (S-α) only covered loopback and was off by
+default.
+
+**Resolution.** Seatbelt has no network namespaces, but filters socket
+operations by remote address. By default (`ALLOW_UNRESTRICTED_NET` other
+than `"1"`) the profile renders:
+
+    (deny network*)
+    (allow network* (subpath "/"))
+    (allow network-outbound (remote ip (string-append "localhost:" (param "PROXY_PORT"))))
+
+so the only IP operation left is an outbound connection to the host egress
+proxy from #76 on `localhost:PROXY_PORT`. The proxy resolves and checks
+every destination as on Linux (S-ξ), so `CONNECT 127.0.0.1:…` through it
+is refused too. A path filter never matches an IP operation:
+`(subpath "/")` re-allows only UNIX-domain socket networking, which
+`(allow network*)` allowed before (mDNSResponder name resolution, the SSH
+agent and Docker sockets, still gated by their own settings).
+
+| Piece | Where | Detail |
+|-------|-------|--------|
+| Proxy | host, as the user | `python3 -I ai_network_proxy.py --host 127.0.0.1 --port 0 --parent-pid PID` (python3 from `PATH`); the port is read from its `READY tcp 127.0.0.1:PORT` line. stdout/stderr go to files in a fresh `mktemp -d` (0700) under `DARWIN_USER_TEMP_DIR` (per-user, 0700 parent). Own session: terminal Ctrl+C does not reach it. Refuses to start unless PID is its parent and stops when it no longer is. PID is `BASHPID`, or on bash 3.2 the `PPID` of a `sh` exec'd in a command substitution. |
+| Profile | `sandbox-exec -D` | `ALLOW_UNRESTRICTED_NET=0 PROXY_PORT=<port>`; `ALLOW_UNRESTRICTED_NET=1 PROXY_PORT=0` when opted out. |
+| Client env | `env -i` allowlist | `http_proxy` `https_proxy` `HTTP_PROXY` `HTTPS_PROXY` `all_proxy` `ALL_PROXY` = `http://127.0.0.1:<port>`. Entries with those names are removed and the wrapper's appended after `AI_SANDBOX_PASS_ENV` and the `_extra_sandbox_setup` hook. No `no_proxy`: a direct localhost connection is denied anyway, and through the proxy the refusal is counted. |
+| Cleanup | host | As on Linux: SIGTERM (SIGKILL after 5 s), dir removed, refused-request `WARNING`, `AI_SANDBOX_DEBUG=1` proxy log; EXIT trap during the session, caller's own EXIT trap restored; a trap a subshell only inherited is never run. Under bash 3.2 (`/bin/bash`), whose subshells keep listing the parent's traps, a subshell's (or command substitution's) EXIT trap is cleared rather than restored after the launch, since its own trap cannot be told from the parent's. `AI_SANDBOX_DRYRUN=1` starts the proxy too, so it prints the real port and environment, then stops it. |
+| Fail closed | host | No `python3`, missing helper, proxy exit or no `READY tcp` within 5 s, temp dir not creatable: launch refused, naming `AI_SANDBOX_ALLOW_UNRESTRICTED_NET=1`. |
+| Opt-out | `AI_SANDBOX_ALLOW_UNRESTRICTED_NET=1` (red, networking, both OSes) | `(allow network*)` plus the optional `BLOCK_LOCALHOST` rules, no proxy, launch `WARNING`. Any other value keeps the restriction. |
+
+**Residual / tradeoffs.**
+- Read + network exfiltration through the proxy to public hosts is
+  unchanged (as on Linux).
+- The proxy port is on the host loopback: any local process of any user
+  can use it while the session runs, getting the same filtered egress
+  it already has directly. The sandbox cannot reach any other localhost
+  port.
+- Unlike the Linux namespace, the sandbox has no private loopback: dev
+  servers or test fixtures inside the sandbox cannot listen on or connect
+  to `localhost`; those sessions need the opt-out.
+- UNIX-domain sockets stay open as before (S-α scope note); a Docker
+  daemon reachable through `AI_SANDBOX_ALLOW_DOCKER=1` can still run
+  containers with open networking. DNS queries through mDNSResponder
+  remain possible (a low-bandwidth channel; the proxy is what connects).
+- Clients that ignore the proxy variables, SSH remotes, raw TCP/UDP and
+  LAN / cluster endpoints fail, as on Linux.
+- A custom `AI_SANDBOX_PROFILE` decides its own network rules; the
+  wrapper still passes `ALLOW_UNRESTRICTED_NET` / `PROXY_PORT` and starts
+  the proxy.
+- Tests: `tests/test_macos_network_isolation.bash` (profile text; stub
+  `sandbox-exec` argv/env, lifecycle and failure handling with the real
+  proxy on any OS; native Seatbelt: host loopback port and direct egress
+  denied, proxy port reachable and refusing host loopback, opt-out as
+  control; CI `smoke-macos` and `smoke-linux`).
+
+### S-π — client profiles' persistent controls writable (IN PROGRESS, 2026-11, #48)
+
+**Problem.** Client profile dirs (`~/.claude`, `~/.codex`, Copilot and
+AGY state) are bound RW for session, history and login state, but they
+also hold settings, skills, plugins, hooks and prompts that every later
+session (also unsandboxed) loads. An agent could plant persistent
+instructions or hooks there.
+
+**Core (#86).** `_wrapper_protect_client_controls TAG SRC_BASE DST_BASE
+CONTROL...` (`ai_wrapper_lib.bash`) pins the profile base and every
+directory between it and a control (`_wrapper_add_pin`), then over-mounts
+each control present at launch read-only (`_wrapper_add_ro_bind`), all
+pins first. bwrap: mount points, so writes fail with `EROFS` and
+rename/unlink of a control or pinned dir with `EBUSY`. Seatbelt:
+`_append_ro_deny_rules` / `_append_pin_rules` write denies including the
+ancestors below `$HOME`. A remapped Linux account is covered at both its
+sandbox and host path. A control that is a symlink, sits behind one
+inside the profile, or is neither file nor directory refuses the launch
+(binding the target would protect or expose another path). Controls
+inside WORKDIR stay editable (trusted maintenance from their repository);
+a control containing WORKDIR stays writable with a WARN.
+`AI_SANDBOX_ALLOW_SETTINGS=1` (red, Sensitive) skips the protection with
+a WARN, also when restored from a preset.
+
+**Per-client inventories (#87).** Each wrapper passes its list after the
+RW profile bind and after the menu: `_CLAUDE_CLIENT_CONTROLS`
+(`claude_wrapper_lib.bash`, where `_bind_claude_account` now lives),
+`_CODEX_CLIENT_CONTROLS` (`codex_wrapper_lib.bash`),
+`_COPILOT_CLIENT_CONTROLS` / `_COPILOT_GH_CLIENT_CONTROLS`
+(`copilot_wrapper_lib.bash`; `_copilot_bind_config_dirs` moved after the
+menu) and `_AGY_CLIENT_CONTROLS` (`agy_wrapper_lib.bash`, after the
+managed-skills sync). Writable on purpose: `~/.claude.json`,
+`.credentials.json`, `projects/`; Codex `auth.json`, `history.jsonl`,
+`sessions/`; Copilot `session-state/`, `~/.config/github-copilot/hosts.json`
+and `apps.json`, `~/.local/share/copilot`; AGY's OAuth token,
+conversation databases, `brain/`, `conversations/`, `config/projects`.
+
+**Residual.** Controls absent at launch stay creatable (nothing is
+created on the host); a client may also read controls from places its
+inventory does not list, or that a listed setting points at (e.g. a
+statusline or hook script elsewhere in `$HOME`). Clients that rewrite a
+protected file themselves (Copilot `config.json` on in-sandbox `/login`
+or a trust grant, Claude `settings.json` on `/model`, Codex
+`config.toml` on project trust, Codex refreshing bundled
+`skills/.system`, agy `config/config.json` from settings commands) fail
+that write; run the change outside the sandbox or with
+`AI_SANDBOX_ALLOW_SETTINGS=1`. Tests: `tests/test_bind_hardening.bash` (flag
+generation; native bwrap/Seatbelt write, replace and rename probes where
+a backend is installed), `tests/test_macos_ro_overlays.bash` (SBPL
+rendering), `tests/test_client_persistent_controls.bash` (each wrapper's
+binder; native write, replace, rename denial plus auth, session and
+WORKDIR writes for all four clients).
+
 ## Local bugs / brittleness
 
 ### B-α — `mkdir -p ~/.claude` follows symlinks (RESOLVED, 2026-05-24, WS3)
@@ -437,17 +973,19 @@ moved to `ai_wrapper_lib.bash`.
 
 **Resolution.** `_wrapper_git_common_dir_ok` validates the resolved
 path first: a real directory strictly under `$HOME`; not sensitive per
-`_sandbox_sensitive_dir_kind` (the classifier the Linux backend now uses
-for WORKDIR / `AI_SANDBOX_EXTRA_*_DIRS`); basename `.git` or
+`_sandbox_sensitive_dir_kind` (the classifier both backends use for
+WORKDIR / `AI_SANDBOX_EXTRA_*_DIRS`, see B-ξ); basename `.git` or
 `<name>.git` with `HEAD`, `objects/`, `refs/`; and WORKDIR's own gitdir
 must resolve to `<common>/worktrees/<name>` (an attacker who can only
 write inside WORKDIR cannot create that back-link). Failure WARNs and
 skips the bind; the launch continues. `AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR`
 does not relax it. **Behaviour change:** worktrees of repos outside
 `$HOME` (or under a `$HOME` dotfile dir) no longer get the shared `.git`
-bound automatically — grant it explicitly with `AI_SANDBOX_EXTRA_RW_DIRS`.
+bound automatically. Outside `$HOME` see B-ο (session opt-in); a raw
+`AI_SANDBOX_EXTRA_RW_DIRS` grant works but has no read-only layers and
+is WARNed.
 
-### B-λ — worktree common dir: borrowed entries and host code execution (RESOLVED on Linux, 2026-10)
+### B-λ — worktree common dir: borrowed entries and host code execution (RESOLVED, 2026-10)
 
 Two gaps left by B-ι's first fix:
 
@@ -465,9 +1003,19 @@ Two gaps left by B-ι's first fix:
    wrapper now over-mounts read-only: `config`, `hooks/` (created if
    missing), all of `worktrees/` except this worktree's own entry, that
    entry's `commondir` / `gitdir` / `config.worktree` (pre-created when
-   `extensions.worktreeConfig` is on), and `modules/*/{hooks,config}`.
-   Any of those being a symlink aborts the bind (WARN). Commit, branch,
-   checkout, fetch keep working; `git config`, `remote add`, `push -u`,
+   `extensions.worktreeConfig` is on), and the submodule git dirs below
+   `modules/` at any depth (see "Submodule git dirs" under B-ν): their
+   `config`, `hooks/`, `config.worktree`, `commondir` and `worktrees/`
+   are RO in both modes and every directory on the chain to them is
+   pinned. A symlink among the root-level targets aborts the bind
+   (WARN); a symlink, wrong type or exceeded limit in the submodule tree
+   refuses the launch (#12). This worktree's own submodule git dirs
+   (`<common>/worktrees/<name>/modules`, where git keeps them for a
+   linked worktree) are protected after the menu and follow
+   `AI_SANDBOX_ALLOW_GIT_CONFIG` like WORKDIR's own submodules; the
+   shared ones never do. Missing submodule `hooks/` are no longer
+   created on the host (WARNed instead). Commit, branch, checkout, fetch
+   keep working; `git config`, `remote add`, `push -u`,
    `branch --set-upstream-to`, `worktree add/prune` and submodule
    updates fail inside the sandbox. Applies to the Claude wrapper too.
 
@@ -476,18 +1024,355 @@ the over-mount targets are checked for symlinks immediately before the
 flags are built. A residual window remains between this check and
 bwrap's mount for a *concurrent* host process that can write the
 victim repo; sandboxed sessions can no longer rename the RO mount
-points.
+points. The owner accepted this window without a code change (#14,
+below).
 
-**macOS (open).** Seatbelt grants are additive allows: a nested
-`--ro-bind` under the common dir's `--bind` does not remove write
-access, and `macos_sandbox_exec.bash` has no deny-write helper. On
-macOS the over-mounts are emitted but not enforced; the wrapper WARNs.
-Follow-up: add a `--deny-write` flag emitting `(deny file-write*
-(subpath …))` after the allows.
+**Check-to-mount window (#14, ACCEPTED RESIDUAL, 2026-10).** Not fixed;
+the current behaviour is kept and documented. All Git-metadata
+validation (common-dir eligibility, back-links, root and submodule
+symlink/type checks) runs in the wrapper's shell before the kernel
+mounts (bwrap) or enforces rules (Seatbelt). Nothing re-checks the
+paths at launch, and the check, the mount and the exec are not atomic.
 
-**Not covered (follow-up).** The same hooks/config vector exists for the
-WORKDIR's own `.git` (regular repos, and the worktree's `.git` file,
-which can be repointed): WORKDIR is RW by design.
+- *Who.* A process other than the sandboxed agent that can replace a
+  selected source or one of its ancestors after validation: another host
+  process of the user, a concurrent session whose grants cover the
+  repository (an older wrapper, `AI_SANDBOX_ALLOW_GIT_CONFIG=1`, or a raw
+  `AI_SANDBOX_EXTRA_RW_DIRS` grant on it), or another local user who
+  can write a shared repository. A default-protected session cannot
+  rename the RO mount points it sees. Write access to one repository is
+  not, by itself, the right to run code as the user or read the user's
+  other files, so these actors are not assumed to own everything the
+  launching session can reach.
+- *Source selection.* bwrap and the Seatbelt rule generator select
+  sources by pathname. A source or ancestor swapped for a symlink or a
+  different directory after validation is resolved at mount / rule
+  time, so the bind or grant can name something other than what was
+  validated (on macOS `_resolve_bind_target` realpaths each path when
+  the SBPL rules are rendered). Which grant changes depends on the
+  swapped entry: the common dir and this worktree's entry are RW, the
+  over-mounts RO.
+- *Vanished protection entries (Linux).* The generic bind loop in
+  `_run_sandboxed_agent_linux` only tests that a source exists and, with
+  the default `BWRAP_STRICT=0`, skips a missing one with a WARN. An RO
+  over-mount present at discovery but removed before that loop is
+  therefore skipped, leaving that path under the RW common-dir bind.
+  This is a validation/protection gap; no end-to-end host execution has
+  been demonstrated natively. Entries absent at discovery are a
+  separate, already accepted residual (B-ν).
+- *Evidence.* A native synthetic bwrap probe (bwrap 0.13.1, synthetic
+  directories only — no real credentials, user repositories or
+  host-sensitive paths): a `--ro-bind` of the original path read the
+  original content; after a rename + symlink swap the same path bind
+  read a synthetic sibling outside the selected scope; a `--ro-bind-fd`
+  of a descriptor opened before the swap still read the original. This
+  shows pathname source selection and descriptor identity for that one
+  directory, not descendant/destination safety or a full wrapper exploit.
+  On macOS only source inspection and simulated SBPL generation exist —
+  no native race probe and no evidence about kernel enforcement or
+  broader rule interactions. Existing native CI (`smoke-linux`,
+  `smoke-macos`) covers the current access rules, not this race.
+- *Not adopted.* Descriptor binding (`--bind-fd` / `--ro-bind-fd`,
+  supported by bwrap 0.13.1) could pin selected source identity on Linux
+  only; Seatbelt has no equivalent, and it would not remove every
+  pathname race. A pre-exec re-check would narrow the window but cannot
+  close it atomically. Neither is implemented.
+- *Operational boundary.* While a wrapper launches, coordinate with (or
+  trust) every writer of the selected Git metadata: the common dir, its
+  `config`, `hooks/`, `worktrees/`, this worktree's entry and submodule
+  git dirs, and their ancestors. Protection after launch, B-ο's opt-in
+  and exact-scope checks and the #12 limits do not make the pre-launch
+  window atomic. Deliberate raw grants (`AI_SANDBOX_EXTRA_RW_DIRS`) are a
+  separate, user-chosen exposure. All existing checks, WARNs and
+  overrides (#10/#12 `AI_SANDBOX_ALLOW_GIT_CONFIG` handling, #13
+  external worktrees default off and session-only, #15 classifier and
+  `/Volumes` behaviour) are unchanged.
+
+**macOS (#11).** Seatbelt has no mounts, so the backend renders every
+`--ro-bind` as a read allow plus a `(deny file-write* file-link …)`
+rule appended after all allows (`_append_ro_deny_rules`). Precedence is
+"most specific bind wins", independent of flag order: an RO path is
+denied except below an RW `--bind` nested strictly inside it (so
+`worktrees/` stays RO except this worktree's own entry, whose
+`commondir`/`gitdir` are RO again). An equal or broader RW grant —
+WORKDIR, `AI_SANDBOX_EXTRA_RW_DIRS`, a duplicate `--bind` — never
+reopens an RO path. Because Seatbelt matches paths rather than inodes,
+every ancestor directory of an RO path below `$HOME` (and the root of
+each nested RW exception) is also write-denied as a literal: renaming a
+writable parent away, editing the file under its new name and renaming
+it back fails. `$HOME` and its ancestors have no write grant, so they
+are not pinned; they get stat-only (`file-read-metadata`) grants instead
+so git/realpath can walk a `$HOME` that is not directly under `/Users`.
+`file-link` blocks hard-linking a protected file into a writable
+directory. The same rules apply to `AI_SANDBOX_EXTRA_RO_DIRS`, the
+glab config bind and `_extra_sandbox_setup` entries. Native coverage:
+`tests/test_bind_hardening.bash` (worktree e2e through the codex
+wrapper) and `tests/test_macos_ro_overlays.bash`, both in CI
+`smoke-macos`.
+
+Linux used to differ in one case: bwrap applies binds in order, and
+`AI_SANDBOX_EXTRA_RW_DIRS` entries were appended after the wrapper's RO
+over-mounts, so an entry covering the common dir hid them. Since #10 the
+backend mounts user RW extra dirs before the wrapper's own binds (user
+RO extra dirs stay after them, so the wrapper's RW binds cannot reopen
+them), so the RO layers win on both OSes (`_extra_sandbox_setup` binds
+still come last).
+
+The WORKDIR's own `.git` is covered by B-ν.
+
+### B-ο — worktrees of repositories outside `$HOME` (MITIGATED, 2026-10, #13)
+
+B-ι bound a worktree's shared `.git` only strictly under `$HOME`, so git
+failed in worktrees of repos elsewhere (e.g. `/Data/projects`). The only
+workaround, `AI_SANDBOX_EXTRA_RW_DIRS=<repo>/.git`, grants plain RW with
+none of B-λ's read-only layers — exactly the host-code-execution path
+B-λ closes — and the wrapper's rejection WARN recommended it.
+
+**Mitigation.** `AI_SANDBOX_ALLOW_EXTERNAL_WORKTREES` (bool, default 0,
+category *sensitive*). Off keeps HOME-only eligibility; `$HOME`
+worktrees (and the verified `~/.local/share/<repo>/.git/modules/<name>`
+layout) never need it. On, `_wrapper_git_common_dir_ok` accepts a
+common dir outside `$HOME` only if:
+
+- `_wrapper_git_external_location_ok` accepts its realpath: not equal to
+  or below `/bin /boot /dev /etc /lib* /nix /opt /proc /root /run /sbin
+  /snap /sys /tmp /usr /var /Applications /Library /System /Users/Shared
+  /cores /private` (matched per path component, so `/etcx` is not
+  `/etc`; macOS `/tmp`, `/var`, `/etc` resolve under `/private`), not
+  containing `$HOME`, and with no dot-prefixed directory above the git
+  dir (another user's `~/.config/...`, `<repo>/.git/modules/<name>`).
+  Mount points (`/mnt`, `/media`, `/srv`, `/Volumes`) and other users'
+  `/home` / `/Users` dirs stay eligible.
+- every existing check passes unchanged: real directory, sensitive
+  classifier, `.git` / `<name>.git` basename and git shape, forward link
+  (WORKDIR's gitdir is exactly `<common>/worktrees/<name>`) and reverse
+  link (that entry's `gitdir`, not a symlink, resolves to exactly this
+  checkout's `.git`). The submodule exception stays HOME-only.
+
+The bind is the same as under `$HOME`: exactly the validated common dir
+RW, its `config`, `hooks/`, `worktrees/` (except this worktree's entry),
+the entry's `commondir` / `gitdir` / `config.worktree` and all submodule
+metadata read-only in both `AI_SANDBOX_ALLOW_GIT_CONFIG` modes, the #12
+scan limits (16 levels / 256 module dirs). No parent or sibling of the
+common dir is granted. On macOS the external ancestors of the common dir
+and (when it is outside `$HOME`) of WORKDIR get `file-read-metadata` on
+the literal path only — stat, no listing or reads. Accepting an
+external dir is logged (WARN).
+
+*Session-only.* The value comes from the host launch environment or
+this session's `s) Settings`. `_preset_autosave` never writes it and
+`_preset_autoload` ignores it with a WARN (also in the legacy shared
+file), so a saved, injected or historical preset — which a sandboxed
+agent may be able to write — cannot authorize access; an explicit launch
+value, including `=0`, is kept. The common-dir bind therefore moved from
+before the menu into `_apply_post_menu_binds` (common dir, then WORKDIR
+metadata, then this worktree's submodules, then credential binds) in the
+claude, codex, agy and copilot wrappers. The host shell configuration
+that may set the variable is not proven tamper-proof; separating
+persistent controls from agent-writable state is #48.
+
+*Raw RW grants.* `AI_SANDBOX_EXTRA_RW_DIRS` stays available. Both
+backends WARN when an accepted entry is a git dir or a work tree with a
+`.git` dir, unless that git dir is WORKDIR's own `.git` or the common dir
+the wrapper bound with read-only layers (those layers still win, see
+B-λ). The WARN points to the opt-in; the grant is not refused.
+
+**Residual risks.**
+
+- *Links are not ownership.* Worktree links are ordinary files. They
+  prove the checkout and the repository name each other, not that the
+  user meant to expose the repository. Anyone who can already write the
+  external repository on the host (another local user with write access
+  to a shared repo, an earlier unprotected session) can create a
+  matching entry. The opt-in is the user's decision for the session.
+- *Git ownership.* Eligibility uses `git rev-parse` without overriding
+  `safe.directory`: a repository git considers owned by someone else is
+  not discovered and not bound. No separate UID rule was added, so
+  shared repositories git accepts (via `safe.directory`) are eligible.
+  Tests only cover repos owned by the test user.
+- *Unchanged B-λ / B-ν residuals:* metadata absent at launch, config
+  indirection, content written by earlier sessions, the existing creation
+  of a missing top-level `hooks/` and `config.worktree` in the validated
+  common dir, and the check-to-mount window (#14, accepted residual,
+  see B-λ). The location guard is
+  separate from `_sandbox_sensitive_dir_kind` (B-ξ).
+
+Coverage: `tests/test_external_worktree.bash` (CI `smoke-linux` and
+`smoke-macos`): location guard, opt-in off/on, HOME regression, prefix
+and alias paths, borrowed / forged / foreign backlinks, crafted
+commondir, refused real-Git locations, preset save/load exclusion and
+injection, raw-RW WARN, a pty-driven `s) Settings` toggle, and native
+enforcement (commit, branch, objects / refs / index; shared config,
+hooks, worktrees, pointers and submodule metadata denied; sibling repo
+and canary unreadable and unchanged). The macOS `--meta-bind` flag
+shape is also checked on Linux with a simulated `_wrapper_os`; that is
+not enforcement evidence.
+
+### B-ν — WORKDIR's own git metadata (MITIGATED, 2026-10, #10)
+
+WORKDIR is RW, and with it the repository's `.git/hooks/*` and
+`.git/config` (`core.hooksPath`, `core.fsmonitor`, `core.sshCommand`,
+aliases, filter/diff drivers, credential helpers), a linked worktree's
+`.git` file (repointable), `.git/commondir` (git takes config and hooks
+from the dir it names, even in a normal repo) and other checkouts'
+`worktrees/*` pointers. All of them run commands on the host,
+unsandboxed, on the user's next git command there.
+
+**Mitigation.** `_wrapper_protect_workdir_git` (`ai_wrapper_lib.bash`),
+called from `_apply_post_menu_binds` after the preset and menu in the
+claude, codex, agy and copilot wrappers. A refusal exits the wrapper
+before the client starts. It protects only entries that exist at launch:
+
+| WORKDIR | Always | Protected mode only |
+|---|---|---|
+| normal repo (`.git` dir) | `.git` and the chain to every submodule git dir pinned; `commondir`, `worktrees/` RO (also in submodule git dirs) | `config`, `hooks/`, `config.worktree` RO, also in submodule git dirs at any depth |
+| linked worktree / submodule checkout (`.git` file) | `.git` file RO | — (shared `.git`: B-λ) |
+| bare repo, or WORKDIR is a git dir | `commondir`, `worktrees/` RO | same entries directly under WORKDIR |
+| repository subdirectory | nothing to do: the git dir is outside WORKDIR and not writable | |
+| not a repository | WARN: metadata created in the session (`git init`, clone, nested repos) needs host review | |
+
+- **Pin (root integrity).** On Linux a self-bind makes `.git` a mount
+  point, so `rename(2)`/`rmdir(2)` fail with `EBUSY`. On macOS the new
+  backend flag `--pin` renders a literal write deny on `.git` and its
+  ancestors below `$HOME` (`_append_pin_rules`); RO entries alone pin it
+  only when one exists, which is not the case in relaxed mode or when
+  every protected entry is absent. Children stay writable, so the index,
+  objects, refs, logs, `HEAD` and lock files work as before.
+- **Setting.** `AI_SANDBOX_ALLOW_GIT_CONFIG=1` (menu: Sensitive, "Allow
+  editing git config and hooks"; default 0) drops the RO layers on
+  `config`, `hooks/`, `config.worktree` and submodule config/hooks only
+  (WORKDIR's submodules and a linked worktree's own submodules). The
+  pins, pointer files, `commondir`, `worktrees/` and all validation and
+  limits stay. A value given explicitly at launch (even `=0`) wins over
+  the per-workdir preset, as for every setting (S-μ); restoring `1` from
+  a preset WARNs. It does not
+  relax the worktree common dir or its shared submodules (B-λ).
+- **Submodule git dirs (#12).** `_wrapper_git_scan_modules` walks
+  `modules/` (WORKDIR's git dir, a worktree's shared common dir and its
+  own `worktrees/<name>/modules`; one shared helper). A directory whose
+  `HEAD` or `config` is a regular file is a module git dir (a missing
+  `config` alone does not demote it); any other directory is a namespace
+  parent of a slash-containing name (`modules/libs/foo`) and is searched
+  further; git refuses to nest module git dirs inside another one's
+  namespace. Below a module git dir only its own `modules/` is searched
+  (`modules/a/modules/b`), never `objects/` or `refs/`. Every module git
+  dir gets the root's entry set (above) and every directory from
+  `modules/` down to it (namespace parents, nested `modules/`) is pinned,
+  in both modes: read-only children alone do not stop `rename(2)` of a
+  parent on Linux, and a moved parent would let the agent plant a fresh
+  tree in its place. On Linux all pins are mounted before the read-only
+  layers below them.
+  Limits: at most 16 directory levels below a `modules/` root (every
+  component counts: `modules/a/modules/b` is 3, `modules/x/y/z` is 3) and
+  at most 256 module git dirs per scan (a linked worktree's shared and
+  own trees count together). Exceeding either refuses the launch with an
+  ERROR naming the path; nothing is skipped or truncated.
+- **Validation (both modes).** A symlinked `.git`, `config`, `hooks`,
+  `config.worktree`, `commondir`, `worktrees`, `modules`, any symlink in
+  the searched submodule tree (namespace parents, module git dirs, their
+  `HEAD`, `config`, `hooks`, `commondir`, `worktrees`, `modules`), or one
+  of those with the wrong file type, refuses the launch. The common-dir
+  binder propagates such a refusal too (all wrappers exit 1). So does a WORKDIR strictly inside a git
+  dir. Failure to resolve WORKDIR or its git dir fails closed. Host-side
+  detection runs `git rev-parse` / `git config --file` only (no hooks or
+  configured commands), with inherited `GIT_DIR` / `GIT_WORK_TREE` /
+  `GIT_COMMON_DIR` dropped.
+- **No host mutation.** Nothing is created or truncated, unlike the
+  common-dir helper (B-λ), and there is no post-session step.
+
+**Usability impact (protected mode).** Commit, new local branches,
+checkout of local branches, merge/rebase, fetch and plain push keep
+working and persist. Anything that writes config fails with "could not
+lock/rename config" or EROFS: `git config`, `git remote add`, `git
+branch --set-upstream-to`, hook installers (`pre-commit install`,
+husky), `git submodule init/update`. Some commands fail half-way:
+
+- `git push -u` can update the remote and then fail to record the local
+  tracking config: the push lands, the upstream is not set
+  (`tests/test_workdir_git_protection.bash` checks both);
+- creating a branch that tracks a remote (`git checkout <remote-only
+  branch>`, `checkout -b x origin/x`, `switch`, `branch x origin/y`)
+  creates the ref, fails to write the tracking config and exits non-zero
+  (checkout leaves HEAD where it was);
+- `git branch -m` renames the ref, then fails to update config.
+
+When linked worktrees exist, `worktrees/` is read-only from the main
+checkout too, so `git worktree add/prune`, `git gc`'s worktree pruning
+and renaming a branch checked out in another worktree fail.
+
+**Residual (accepted by the owner).**
+
+- *Absent entries.* bwrap needs an existing mount point and Seatbelt
+  rules are only rendered for existing sources; creating them would
+  mutate the host. A missing `config`, `hooks/`, `commondir` (absent in
+  almost every repo, so this WARN appears on most normal-repo launches)
+  or `config.worktree` (with `extensions.worktreeConfig`), in the root or
+  in any submodule git dir, stays creatable and is listed in a WARN.
+  Created ones are not protected until the next launch. The same holds
+  for submodule git dirs created in the session (`modules/` stays
+  writable so `git submodule update --init` works).
+- *Indirection.* WARNs (detection only) for `core.hooksPath`,
+  `core.fsmonitor` and `include.path` / `includeIf.*.path` resolving into
+  WORKDIR, hook symlinks into WORKDIR, a `.git` file pointing at a git dir
+  inside WORKDIR, and submodule checkouts (their `.git` pointer files
+  below WORKDIR stay writable). Other commands in config (filter drivers,
+  `sshCommand`, aliases) that run scripts from WORKDIR, and existing hooks
+  that read WORKDIR content (pre-commit's `.pre-commit-config.yaml`,
+  husky scripts, Makefiles), are not audited.
+- *Operation state.* `.git/rebase-merge/` and `.git/rebase-apply/` must
+  stay writable. The agent can leave a rebase in progress whose todo list
+  contains `exec <cmd>`; `git rebase --continue` on the host then runs it.
+  Check `git status` and the todo before continuing a rebase you did not
+  start.
+- *Not sanitized.* RO protection freezes what is there; it does not
+  clean commands or hook symlinks already present, or metadata written by
+  an earlier unprotected session.
+- *Nested metadata.* Repos and `.git` dirs created anywhere below
+  WORKDIR (outside `modules/`) are writable. Submodule git dirs below
+  `modules/` are covered at any depth (#12).
+- *Plugins.* `_extra_sandbox_setup` binds are applied last and can
+  re-grant RW (trusted code, S-β).
+
+### B-ξ — macOS backend duplicated the sensitive-path lists (RESOLVED, 2026-10, #15)
+
+**Problem.** `macos_sandbox_exec.bash` kept its own inline system-root,
+`$HOME` and dotfile/`~/Library` checks for WORKDIR and
+`AI_SANDBOX_EXTRA_*_DIRS` instead of `_sandbox_sensitive_dir_kind`, so
+the lists could drift. They had: neither knew `/private/etc`, so
+launching from `/etc` (which `pwd -P` resolves to `/private/etc`) was
+accepted on macOS. An extra dir of `/` also slipped past the macOS
+inline list (trailing-slash stripping left an empty string it did not
+match), but it never reached a client: `_resolve_bind_target` refuses
+an empty subpath before launch. The shared classifier now refuses it
+earlier, with the same system-location message as Linux; effective
+access is unchanged.
+
+**Resolution.** The macOS backend classifies with
+`_sandbox_sensitive_dir_kind` and fails closed (`ERROR`, no launch) if
+the function is not loaded. `/private/etc` joins the Darwin system list.
+System entries stay exact roots: children (`/private/etc/x`,
+`/Volumes/<disk>/<project>`) and sibling prefixes (`/etcx`) are not
+refused; `/Volumes` is unchanged (accepted). Each backend keeps its own
+enforcement:
+
+| Kind | Linux | macOS |
+|------|-------|-------|
+| WORKDIR system root | refused; `AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1` overrides | refused; **not** overridable |
+| WORKDIR `$HOME` / dotfile dir (macOS also `~/Library`) | refused; overridable | refused; overridable |
+| extra dir: system / `$HOME` / dotfile | refused; overridable | refused; overridable |
+
+Platform lists differ by design (Linux `/home`, `/root`, `/mnt`, `/media`,
+`/srv`, `/opt`, `/proc`, …; macOS `/Users`, `/System`, `/Applications`,
+`/Library`, the `/private/...` canonical forms of `/tmp`, `/var`, `/etc`).
+The #13 external-worktree location guard stays separate and stricter.
+
+Coverage: `tests/test_sensitive_path_parity.bash` (CI `smoke-linux` and
+`smoke-macos`): classifier tables for both OS rule sets (shadowed
+`uname`), macOS backend refusals and overrides (native on macOS; mocked
+`uname`/`getconf`/`sandbox-exec` elsewhere), classifier-missing
+fail-closed, and native refusals through `run_sandboxed_agent` on the
+host backend: a stub client prints a marker on stdout, which must be
+absent for refusals and present for the project / override launches.
 
 ### B-κ — symlinked account paths (RESOLVED, 2026-10)
 
@@ -500,7 +1385,90 @@ resolving outside `$HOME` or into a credential location (`~/.ssh`,
 `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.docker`, `~/.colima`, `~/.netrc`,
 `~/.npmrc`, `~/.pypirc`, gcloud and glab config). The `~/.claude.json`
 check runs before `touch`, so a dangling symlink target is never
-created. The Codex wrapper binds the resolved path.
+created. The Codex wrapper binds the resolved path. Widened in #65
+(S-λ): dangling links, broad roots, shell / git / session startup
+files and paths behind a symlinked parent are refused too, and
+`claude_wrapper` binds resolved paths.
+
+### B-μ — AGY host-side Python and profile file operations (MITIGATED, 2026-10, #44)
+
+Before launch, the agy wrapper lists/renames/deletes conversations and
+rewrote `antigravity-cli/settings.json` on the host. It ran `python3 -`
+(CWD first on `sys.path`, so a checkout `json.py` ran on the host), followed
+symlinked `antigravity-cli/`, `brain/`, `conversations/`, database and
+`.wrapper_title` paths, and wrote `settings.json.tmp.$$` (predictable,
+followed if pre-created as a symlink).
+
+**Mitigation.** One embedded helper (`_agy_host_py`, run as `python3 -I -`)
+does the conversation operations. `settings.json` is not touched at all
+since #85 (see "Settings are session-only" below). It opens the resolved profile component by component with
+`O_NOFOLLOW` and `*at` calls, refuses symlinked directories, database,
+SQLite sidecars and title files before changing anything, unlinks symlinked
+artifact leaves without traversal, opens SQLite with `mode=rw|ro` (never
+creates a database) and checks that SQLite's descriptor is the inode it
+verified. Without `python3`, or without dir-fd/`O_NOFOLLOW`/`flock`
+support, these operations fail closed; the old `jq`/`sqlite3` fallbacks
+are gone.
+
+- **SQLite sidecars.** SQLite opens `-journal`/`-wal`/`-shm` itself, by
+  path, so the helper cannot open them for it. It relies on two SQLite
+  behaviours instead: sidecars are opened with `O_NOFOLLOW`, and a write is
+  refused once the database path no longer names the open file
+  (`SQLITE_READONLY_DBMOVED`). Before any profile database is opened, the
+  helper proves both on the running library in a private temp dir (a
+  symlinked sidecar per kind, and a directory swapped mid-transaction) and
+  refuses the operation if either fails. Tests swap each sidecar for a
+  symlink at open and at write time, and swap `antigravity-cli/` for a
+  directory holding same-named sidecars; the external bytes stay unchanged.
+- **Settings are session-only (#85).** The sandbox permissions
+  (`toolPermission`/`artifactReviewPolicy` `always-proceed`,
+  `allowNonWorkspaceAccess` true, `enableTerminalSandbox` false,
+  `trustedWorkspaces` = the resolved WORKDIR) are passed as
+  `agy --settings '<JSON>'`, which agy applies to that invocation only and
+  never saves. The wrapper never reads, creates, rewrites, chmods or
+  replaces `settings.json` (or a symlink target) and never creates
+  `antigravity-cli/`, so unwrapped `agy` sessions keep the user's own
+  policy, parallel wrappers in different workdirs cannot race, and a
+  killed wrapper leaves nothing to restore. The JSON is built in pure bash
+  (no host interpreter); the WORKDIR path is JSON-escaped, so it cannot
+  add or override keys. Tests run the real wrapper through a stub `bwrap`
+  (normal, missing, symlinked `settings.json`, four parallel workdirs, a
+  SIGKILL at launch) and check that file and its directory keep their
+  content, inode, mode and mtime.
+- **Title writes (rename).** `.wrapper_title` is replaced by an `O_EXCL`
+  temp file + `renameat` in the held directory, after re-checking the file
+  (inode, size, mtime) and re-walking the parent; a changed file fails the
+  rename (nothing is reported as renamed) instead of being overwritten.
+  Every wrapper instance holds an exclusive advisory `flock` on the
+  conversation directory from the read to the rename, so two wrappers never
+  interleave; a lock held for more than 10 s fails the rename. The lock is
+  taken and the temp file written before the database title changes, so a
+  lock or permission failure leaves the database untouched. Failures name
+  the path and tell the user to retry.
+
+**Residual limits.**
+
+- **Non-cooperating title writers (accepted by the owner).** The `flock`
+  is advisory and a re-check followed by `rename` is not a compare-and-swap.
+  A process that does not take the lock (agy itself, or a sandboxed agent
+  still running on the same profile) and writes `.wrapper_title` exactly
+  between the final re-check and the rename loses that write, and the
+  wrapper cannot detect it. No portable POSIX call closes this. The owner
+  kept rename available under this limit (concurrent renames are
+  unlikely); it no longer affects `settings.json`, which is never written.
+  A test pins the behaviour so this section stays accurate.
+- A title change detected after the database title was updated (the final
+  re-check) fails the rename and says the database already holds the new
+  title while the picker still shows the old `.wrapper_title`; retrying the
+  rename resolves it.
+- SQLite's two guards are library behaviours, verified per run rather
+  than enforced by the helper. On macOS the probe dir is in `$TMPDIR`,
+  which the sandbox can write; a running agent could make the probe fail
+  (a refusal) but cannot change how the library behaves.
+- `~/bin` was bound RW into the sandbox on Linux. Since #62 it is
+  read-only unless `AI_SANDBOX_ALLOW_BIN_RW=1` (S-θ); the trust check
+  counts it as writable only then, or when a wider grant (WORKDIR,
+  `AI_SANDBOX_EXTRA_RW_DIRS`, a `--bind` in `WRAPPER_FLAGS`) covers it.
 
 ### B-β — `_realpath` fallback chain has multiple silent branches (RESOLVED, 2026-05-24, WS6)
 
@@ -524,8 +1492,9 @@ Each `--bind` / `--ro-bind` appends to the profile string passed to
 
 **Disposition.** Deferred. The bind-array growth pattern this
 concerned was largely a Linux-side artifact (the upstream bwrap
-wrapper auto-binds `~/.kube`, `~/.kind`, `~/Android`, `~/bin`,
-`~/.agents`, etc., growing the array fast). Post-WS1 the macOS flag
+wrapper auto-bound `~/.kube`, `~/.kind`, `~/Android`, `~/bin`,
+`~/.agents`, etc., growing the array fast; since #62 only `~/bin` and
+`~/ai-wrapper/.agents` are bound by default, read-only, see S-θ). Post-WS1 the macOS flag
 surface is single-arg and the wrapper only adds three to four binds
 in practice. Revisit if a future caller ever needs hundreds of binds
 or if the auto-bind set grows substantially.
@@ -636,9 +1605,12 @@ when that plugin is loaded.
 
 ## Carry-overs from earlier reviews (still open by design)
 
-- **S2** — `(allow network*)`. Required for the Anthropic API. Documented.
-- **S4** — `~/Library/Keychains` RW. Required for go-keyring
-  atomic-replace path. Documented.
+- **S2** — `(allow network*)`. Closed: Linux isolates the network since
+  #77 (S-ξ), macOS since #78 (S-ο); both route HTTP(S) through the
+  filtering egress proxy, and `(allow network*)` remains only under
+  `AI_SANDBOX_ALLOW_UNRESTRICTED_NET=1`.
+- **S4** — `~/Library/Keychains` RW. Closed by #67 (S-ν): gated on
+  `AI_SANDBOX_ALLOW_KEYCHAIN`, default off.
 - **S7** — `~/Library/Caches/claude-cli-nodejs` RW. Today log-only, no
   write→exec gadget. Documented.
 - **S9** — `--dangerously-skip-permissions`. By design; sandbox is the
@@ -659,10 +1631,12 @@ does not re-open the question.
   Re-evaluate if a second account is required. (Was tracked as R2 in
   the README "Linux merge" section; both the env-var row and the R2
   paragraph have been removed; this entry is the breadcrumb.)
-- **Tailscale integration** — not needed. No reachability to
-  Tailscale-bound services required from the sandbox. Upstream
-  `cb4aaa5` (unconditional Tailscale socket bind) explicitly NOT
-  pulled. Historical references to Tailscale inside
+- **Tailscale integration** — the Linux wrapper did carry an
+  unconditional `--bind` of `/run/tailscale/tailscaled.sock` (from
+  upstream `cb4aaa5`) despite this entry saying it was not pulled.
+  Since #62 it is off by default and only `AI_SANDBOX_PASS_TAILSCALE=1`
+  RO-binds the socket (S-θ); macOS has no Tailscale grant. Historical
+  references to Tailscale inside
   `docs/plans/2026-05-23-sandbox-migration.md` and
   `docs/plans/2026-05-23-sandbox-hardening-context.md` stay as
   upstream-example context — they are not active grants.

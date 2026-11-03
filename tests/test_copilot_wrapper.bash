@@ -7,7 +7,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${REPO_ROOT}/tests/lib_test_helpers.bash"
 
 FAKE_HOME="$(mktemp -d "${HOME}/ai-wrapper-test.XXXXXX")"
-export HOME="${FAKE_HOME}"
+isolate_test_env "${FAKE_HOME}"
 cleanup() { rm -rf "${FAKE_HOME}"; }
 trap cleanup EXIT
 
@@ -53,13 +53,22 @@ _sandbox_pass_env_add A_VAR_EXTRA
 assert_eq "${AI_SANDBOX_PASS_ENV}" "A_VAR,A_VAR_EXTRA" \
     "helper matches whole entries, not name prefixes"
 
+# bash < 4.4 (macOS /bin/bash 3.2) treats "${arr[@]}" of an empty array as
+# unbound under `set -u`, so the bash 5 runs above cannot catch it. The
+# helper's parsed list and the client-controls RO overlay list can both be
+# empty; their expansions must use the guarded "${arr[@]+...}" form.
+unguarded="$(grep -nE '(^|[^+])"\$\{!?(pass_env_vars|ro_src)\[@\]\}"' \
+    "${REPO_ROOT}/bin/ai_agent_universal_wrapper.bash" \
+    "${REPO_ROOT}/bin/ai_wrapper_data/ai_wrapper_lib.bash" || true)"
+assert_eq "${unguarded}" "" "pass_env_vars/ro_src expansions are empty-safe under bash 3.2 set -u"
+
 echo "-- Copilot config binds"
 NL=$'\n'
 _copilot_binds() {
     (
         WRAPPER_FLAGS=()
         _copilot_bind_config_dirs || exit 1
-        printf '%s\n' "${WRAPPER_FLAGS[@]}"
+        printf '%s\n' "${WRAPPER_FLAGS[@]+"${WRAPPER_FLAGS[@]}"}"
     ) 2>&1
 }
 _reset_copilot_home() {
@@ -126,10 +135,9 @@ assert_eq "$(_copilot_argv resume)" \
     "copilot${NL}${SEP}${NL}${SEP}${NL}--allow-all-tools${NL}--allow-all-paths${NL}--allow-all-urls${NL}--resume" \
     "resume picker also receives unrestricted permission flags"
 
-if command -v copilot >/dev/null 2>&1; then
-    copilot --allow-all-tools --allow-all-paths --allow-all-urls --help >/dev/null 2>&1
-    assert_eq "$?" "0" "installed Copilot CLI accepts explicit unrestricted flags"
-fi
+# Real-CLI flag acceptance is not checked here: tests never launch an
+# installed, possibly authenticated copilot (see isolate_test_env).
+echo "  skip - real copilot flag acceptance (manual check only; no live clients in tests)"
 
 # Argument passthrough applies the shared post-menu binds: with GitLab
 # passthrough enabled, file-based glab auth is bound read-only.
@@ -159,6 +167,7 @@ printf 'ALLOW_ALL=%s\nASSISTED_APPROVAL=%s\n' \
 printf 'ARG=%s\n' "$@"
 STUB
     chmod +x "${FAKE_HOME}/bin/copilot"
+    assert_client_is_fake copilot
     out="$(cd "${FAKE_HOME}/work" && PATH="${FAKE_HOME}/bin:${PATH}" \
         bash "${REPO_ROOT}/bin/executable_copilot_wrapper.bash" --prompt test 2>&1)"
     assert_contains "${out}" "ALLOW_ALL=true" "sandboxed Copilot receives workspace trust opt-in"
@@ -168,4 +177,5 @@ STUB
     done
 fi
 
+assert_no_live_client_reached
 tests_summary_and_exit

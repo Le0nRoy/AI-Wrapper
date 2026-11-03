@@ -5,7 +5,8 @@
 ;;   - The agent is trusted by the user to *read* their files (it was invited
 ;;     into the session). The sandbox bounds *writes* to the working directory,
 ;;     agent config, and tmp.
-;;   - Network is allowed because the Anthropic API call would otherwise fail.
+;;   - Network goes through the host egress proxy (#78): public hosts stay
+;;     reachable because the Anthropic API call would otherwise fail.
 ;;     Consequence: combined with broad file-read, the agent can exfiltrate any
 ;;     readable file (~/.ssh, ~/.aws, browser data, etc.). The trust assumption
 ;;     is "the agent is invited and not malicious"; if you don't grant that
@@ -16,12 +17,12 @@
 ;;     new process inherits the sandbox, so this isn't an escape — but treat
 ;;     "sandboxed" as "confined", not "cannot run code".
 ;;   - Keychain item access uses two API families. The modern SecItem API
-;;     routes through securityd over Mach IPC and is gated by (allow mach-lookup).
-;;     The legacy SecKeychain* API (used by /usr/bin/security and by Go's
-;;     go-keyring) writes the keychain DB file
-;;     *directly* from the client process via SQLite atomic-replace — temp file
-;;     `login.keychain-db.sb-<rand>` created in ~/Library/Keychains, then
-;;     renamed. That path needs file-write, not just file-read.
+;;     routes through securityd over Mach IPC (mach-lookup). The legacy
+;;     SecKeychain* API (used by /usr/bin/security) writes the keychain DB
+;;     file *directly* from the client process via atomic replace — a temp
+;;     file created in ~/Library/Keychains, then renamed — so it needs
+;;     file-write, not just file-read. Both paths are closed unless
+;;     ALLOW_KEYCHAIN=1.
 ;;
 ;; Required parameters (passed via -D KEY=VALUE):
 ;;   HOME_DIR                — user's home directory (literal/subpath rules)
@@ -58,12 +59,21 @@
 ;;                              GITLAB_TOKEN / CI_JOB_TOKEN env var
 ;;                              pass-through so `glab` also works when it
 ;;                              reads its token from disk instead of the env.
+;;   ALLOW_UNRESTRICTED_NET  — "1" allows all networking (network*); any
+;;                              other value denies IP networking except
+;;                              outbound TCP to localhost:PROXY_PORT (#78)
+;;   PROXY_PORT              — the host egress proxy's TCP port on
+;;                              127.0.0.1 ("0" when ALLOW_UNRESTRICTED_NET=1)
 ;;   BLOCK_LOCALHOST         — "1" emits (deny network-* (… ip "localhost:*"))
-;;                              pair; any other value leaves localhost reachable.
+;;                              pair under ALLOW_UNRESTRICTED_NET=1; any other
+;;                              value leaves localhost reachable there.
 ;;                              NOTE: this only covers IP loopback. Unix-domain
 ;;                              sockets (/var/run/docker.sock, ~/.colima/*.sock)
 ;;                              and link-local addresses (e.g. AWS IMDS at
 ;;                              169.254.169.254) are NOT covered.
+;;   ALLOW_KEYCHAIN          — "1" grants RW on ~/Library/Keychains and the
+;;                              com.apple.SecurityServer / com.apple.securityd
+;;                              Mach lookups (keychain items). Default "0".
 ;;   ALLOW_DOCKER            — "1" emits the Docker/Colima socket + ~/.docker
 ;;                              RW rules. Default "0"; set "1" to opt in when
 ;;                              the session needs `docker` from inside the
@@ -116,9 +126,8 @@
     (global-name "com.apple.cfprefsd.agent")
     (global-name "com.apple.cfprefsd.daemon")
 
-    ;; Keychain
-    (global-name "com.apple.SecurityServer")                 ; legacy SecKeychain* path
-    (global-name "com.apple.securityd")                      ; modern securityd
+    ;; Security framework. SecurityServer / securityd (keychain item
+    ;; brokers) are granted only under ALLOW_KEYCHAIN, below.
     (global-name "com.apple.security.cryptoTokenKit")        ; CTK (smart cards / Secure Enclave-backed keys)
     (global-name "com.apple.trustd")                         ; TLS trust eval — system daemon (Go's Security.framework path)
     (global-name "com.apple.trustd.agent")                   ; TLS trust eval — per-user agent (matches Aqua-session callers)
@@ -135,6 +144,16 @@
     ;; inherited; tccd lookup is what Foundation/Security frameworks call.
     (global-name "com.apple.tccd")
     (global-name "com.apple.tccd.system"))
+
+;; Keychain item brokers (#67 / M1). The SecItem API and `security`
+;; reach keychain items through these two daemons; ALLOW_KEYCHAIN=1
+;; (AI_SANDBOX_ALLOW_KEYCHAIN, default 0) grants them together with the
+;; ~/Library/Keychains file rule further down. trustd (TLS certificate
+;; evaluation) above stays reachable either way.
+(when (equal? (param "ALLOW_KEYCHAIN") "1")
+    (allow mach-lookup
+        (global-name "com.apple.SecurityServer")             ; legacy SecKeychain* path
+        (global-name "com.apple.securityd")))                ; modern securityd
 
 ;; Services intentionally NOT in the allowlist (high-risk if granted):
 ;;   com.apple.coreservices.launchservicesd  → would enable `open -a` escape
@@ -290,6 +309,13 @@
             (require-not (literal  (string-append (param "HOME_DIR") "/.netrc")))
             (require-not (literal  (string-append (param "HOME_DIR") "/.npmrc")))
             (require-not (literal  (string-append (param "HOME_DIR") "/.pypirc")))
+            ;; git credential-store files (#67 / M3); also denied below
+            (require-not (literal  (string-append (param "HOME_DIR") "/.git-credentials")))
+            (require-not (literal  (string-append (param "HOME_DIR") "/.config/git/credentials")))
+            ;; glab (GitLab CLI) config — readable only via PASS_GITLAB (#47)
+            (require-not (subpath (string-append (param "HOME_DIR") "/Library/Application Support/glab-cli")))
+            (require-not (subpath (string-append (param "HOME_DIR") "/.config/glab-cli")))
+            (require-not (subpath (string-append (param "HOME_DIR") "/.local/share/glab-cli")))
             (require-not (subpath (string-append (param "HOME_DIR") "/Library/Keychains")))
             ;; iMessage + Mail
             (require-not (subpath (string-append (param "HOME_DIR") "/Library/Messages")))
@@ -358,6 +384,18 @@
         (literal  (string-append (param "HOME_DIR") "/.npmrc"))
         (literal  (string-append (param "HOME_DIR") "/.pypirc"))))
 
+;; git credential-store files (#67 / M3). `git credential-store` keeps
+;; plaintext tokens in ~/.git-credentials or ~/.config/git/credentials; the
+;; latter sits inside the ~/.config/git grant above. Seatbelt applies the
+;; last matching rule, so this deny follows every read grant above it
+;; (~/.config/git, ALLOW_RO_HOMEDIR, ALLOW_RO_CREDENTIALS). Explicit grants
+;; rendered later (WORKDIR, --bind / --ro-bind, AI_SANDBOX_EXTRA_*_DIRS)
+;; still win, as for every other credential path. glab's on-disk token
+;; stays with PASS_GITLAB (#47).
+(deny file-read*
+    (literal (string-append (param "HOME_DIR") "/.git-credentials"))
+    (literal (string-append (param "HOME_DIR") "/.config/git/credentials")))
+
 ;; --- /dev devices commonly needed by CLIs ----------------------------------
 ;; /dev/dtracehelper deliberately omitted: SIP gates DTrace probe registration
 ;; on shipping macOS, so writes are no-ops; Apple's own narrow profiles
@@ -401,23 +439,43 @@
 ;; --- Working directory (read-write) ----------------------------------------
 (allow file* (subpath (param "WORKDIR")))
 
-;; --- Network: full (required for the Anthropic API) ------------------------
-(allow network*)
-(allow system-socket)
-
-;; WS4 / S-α: optional localhost block. Opt-in via
-;; AI_SANDBOX_BLOCK_LOCALHOST=1. Off by default to keep dev workflows
-;; working (local DBs, dev servers). When set, the agent cannot
-;; connect() or bind() the loopback interface; common targets it cuts off are
+;; --- Network (#78) --------------------------------------------------------
+;; Restricted by default (ALLOW_UNRESTRICTED_NET other than "1"): no IP
+;; networking except outbound TCP to the host egress proxy on
+;; localhost:PROXY_PORT. The wrapper starts the proxy (ai_network_proxy.py)
+;; on 127.0.0.1 for the session and points http(s)_proxy / all_proxy at it;
+;; the proxy refuses loopback, LAN, link-local / cloud metadata, multicast
+;; and reserved destinations. Direct connections anywhere else (public
+;; hosts, LAN, 169.254.169.254, other localhost ports) and listening on IP
+;; ports fail with EPERM. UNIX-domain sockets keep their previous access:
+;; a path filter never matches an IP operation, so (subpath "/") re-allows
+;; only UNIX-socket networking (mDNSResponder, ssh-agent, Docker socket —
+;; the latter two still gated by their own settings). Name resolution goes
+;; through mDNSResponder (Mach IPC above), not raw UDP.
+;;
+;; ALLOW_UNRESTRICTED_NET=1 (AI_SANDBOX_ALLOW_UNRESTRICTED_NET=1, red):
+;; open networking, as before #78, with the optional localhost block.
+;;
+;; WS4 / S-α: optional localhost block for the unrestricted case. Opt-in via
+;; AI_SANDBOX_BLOCK_LOCALHOST=1. When set, the agent cannot connect() or
+;; bind() the loopback interface; common targets it cuts off are
 ;; postgres/redis/kubectl-proxy on localhost, AWS instance metadata
-;; via VPN, and any localhost-bound dev server.
+;; via VPN, and any localhost-bound dev server. The restricted policy
+;; already blocks all of these.
 ;;
 ;; sandbox-exec accepts only "*" or "localhost" as the host portion
 ;; of (remote ip ...) — literal IPs (127.0.0.1, ::1) are rejected at
 ;; parse time. The localhost form covers both IPv4 and IPv6 loopback.
-(when (equal? (param "BLOCK_LOCALHOST") "1")
-    (deny network-outbound (remote ip "localhost:*"))
-    (deny network-inbound  (local  ip "localhost:*")))
+(when (equal? (param "ALLOW_UNRESTRICTED_NET") "1")
+    (allow network*)
+    (when (equal? (param "BLOCK_LOCALHOST") "1")
+        (deny network-outbound (remote ip "localhost:*"))
+        (deny network-inbound  (local  ip "localhost:*"))))
+(when (not (equal? (param "ALLOW_UNRESTRICTED_NET") "1"))
+    (deny network*)
+    (allow network* (subpath "/"))
+    (allow network-outbound (remote ip (string-append "localhost:" (param "PROXY_PORT")))))
+(allow system-socket)
 
 ;; --- sysctl, system info, IOKit, pseudo-ttys -------------------------------
 (allow sysctl-read)
@@ -440,13 +498,9 @@
 ;;                                            covered by the per-call bind)
 ;;   - ~/Library/Caches/claude-cli-nodejs/  : Node CLI cache
 ;;   - ~/Library/Keychains/                 : macOS Keychain holds the OAuth
-;;                                            credential (item label
-;;                                            "Claude Code-credentials").
-;;                                            Needs RW: the legacy
-;;                                            SecKeychain* API path (used by
-;;                                            `security` CLI and go-keyring)
-;;                                            writes the SQLite DB directly
-;;                                            via atomic-replace.
+;;                                            credential. Granted only under
+;;                                            ALLOW_KEYCHAIN=1 (see the
+;;                                            Keychains rule below).
 ;; The tempfile regex deliberately accepts any suffix after `.claude.json.tmp.`
 ;; because Claude's atomic-write naming has changed before; tight `<pid>.<ts>`
 ;; patterns silently broke writes when the format shifted. Anything matching
@@ -480,13 +534,16 @@
         (subpath (string-append (param "HOME_DIR") "/.colima"))
         (subpath (string-append (param "HOME_DIR") "/.docker"))))
 
-;; Keychains DB: read-write. The SecItem path routes through securityd, but
-;; the legacy SecKeychain* path (which `security` CLI and go-keyring both use)
-;; writes the SQLite DB directly via atomic-replace — it creates a temp file
-;; alongside login.keychain-db, writes it, then renames over the original. The
-;; whole subpath needs file*, not just file-read*. Without this, a
-;; keychain-backed session store (e.g. any go-keyring client) fails with
-;; `exit status 161`
-;; (SecKeychainItemCreateFromContent: UNIX[Operation not permitted]).
-(allow file*
-    (subpath (string-append (param "HOME_DIR") "/Library/Keychains")))
+;; Keychains DB (#67 / M1): read-write, only under ALLOW_KEYCHAIN=1
+;; (AI_SANDBOX_ALLOW_KEYCHAIN, default 0). The SecItem path routes through
+;; securityd, but the legacy SecKeychain* path (used by the `security` CLI)
+;; opens the keychain file from the client process and updates it by
+;; atomic replace — a temp file next to login.keychain-db, renamed over the
+;; original — so the whole subpath needs file*, not just file-read*. With
+;; the flag off, both this file path and the SecurityServer / securityd
+;; Mach lookups are closed: keychain-backed logins (Claude Code stores its
+;; OAuth credential in the Keychain on macOS) do not work inside the
+;; sandbox; use an env-var credential or opt in.
+(when (equal? (param "ALLOW_KEYCHAIN") "1")
+    (allow file*
+        (subpath (string-append (param "HOME_DIR") "/Library/Keychains"))))

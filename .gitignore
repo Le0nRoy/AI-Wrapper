@@ -1,1 +1,3 @@
 .worktrees/
+# Fallback scratch root of tests/preset/lib/harness.bash
+tests/preset/_scratch/

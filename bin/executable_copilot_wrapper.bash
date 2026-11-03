@@ -19,13 +19,10 @@ check_agent_binary
 
 WRAPPER_FLAGS=()
 
-# Bind shared Git metadata for worktrees after validating its path and links.
-_wrapper_bind_git_common_dir
-
-# Keep Copilot runtime state in its standard home paths while preventing broad
-# access to unrelated system directories. Symlinked config paths are refused
-# when they resolve outside $HOME or into credential directories.
-_copilot_bind_config_dirs || exit 1
+# Copilot's config dirs (RW, persistent controls read-only) are bound after
+# the menu by _copilot_bind_config_dirs: AI_SANDBOX_ALLOW_SETTINGS may
+# change there. Symlinked config paths are refused when they resolve
+# outside $HOME or into credential directories.
 
 # Auto-approve all tools, filesystem paths, and URLs inside the OS sandbox.
 AGENT_FLAGS=(--allow-all-tools --allow-all-paths --allow-all-urls)
@@ -41,7 +38,8 @@ if [[ $# -eq 0 && -t 0 && -t 1 ]]; then
     _preset_autosave
     # Apply toggle-dependent binds AFTER the menu so flips made in the
     # Settings sub-menu reach WRAPPER_FLAGS.
-    _apply_post_menu_binds
+    _copilot_bind_config_dirs || exit 1
+    _apply_post_menu_binds || exit 1
 
     if declare -f _extra_post_menu_setup >/dev/null 2>&1; then
         _extra_post_menu_setup
@@ -64,9 +62,10 @@ if [[ $# -eq 0 && -t 0 && -t 1 ]]; then
 fi
 
 _preset_autoload
-_apply_post_menu_binds
+_copilot_bind_config_dirs || exit 1
+_apply_post_menu_binds || exit 1
 if declare -f _extra_post_menu_setup >/dev/null 2>&1; then
     _extra_post_menu_setup
 fi
 _copilot_enable_unrestricted_mode
-run_sandboxed_agent "${AI_AGENT_COMMAND}" -- "${WRAPPER_FLAGS[@]}" -- "${AGENT_FLAGS[@]}" "$@"
+run_sandboxed_agent "${AI_AGENT_COMMAND}" -- "${WRAPPER_FLAGS[@]+"${WRAPPER_FLAGS[@]}"}" -- "${AGENT_FLAGS[@]+"${AGENT_FLAGS[@]}"}" "$@"

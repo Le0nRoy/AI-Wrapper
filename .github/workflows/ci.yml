@@ -45,7 +45,9 @@ jobs:
 
   # Pure-logic tests: settings-catalog OS-scope filtering and the
   # wrapper-help.md OS-conditional doc filter, skill deployment/retirement
-  # into a fake HOME, and the Tortuga gh helper. No real sandbox launch, so
+  # into a fake HOME, agy host-side path confinement, per-workdir preset
+  # identity (sha256sum/shasum, fail-closed), the CI/run_all/docs suite
+  # inventory, and the Tortuga gh helper. No real sandbox launch, so
   # these need no setup — but still run on both OSes since they exercise
   # real bash string/array handling, not just the app logic.
   logic-tests:
@@ -59,7 +61,13 @@ jobs:
       - run: bash tests/test_catalog_os_scope.bash
       - run: bash tests/test_help_doc_os_scope.bash
       - run: bash tests/test_setup_skills.bash
+      - run: bash tests/test_cursor_retirement.bash
+      - run: bash tests/test_live_client_isolation.bash
+      - run: bash tests/test_agy_host_boundary.bash
+      - run: bash tests/test_preset_identity.bash
+      - run: bash tests/test_suite_inventory.bash
       - run: python3 -B dot_agents/skills/tortuga/scripts/test_gh.py
+      - run: python3 -I -B tests/test_network_proxy.py
 
   # Real bubblewrap smoke tests: actually launches sandboxed processes and
   # asserts on real security properties (WORKDIR refusal, credential-path
@@ -72,10 +80,14 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4
 
-      - name: Install bubblewrap
+      - name: Install bubblewrap and terminal-filter prerequisites
+        # python3 + the libseccomp runtime build the Linux sandbox's
+        # terminal-injection seccomp filter (#64); without them a protected
+        # launch is refused.
         run: |
           sudo apt-get update
-          sudo apt-get install -y bubblewrap
+          sudo apt-get install -y bubblewrap python3 libseccomp2
+          bwrap --version
 
       - name: Enable unprivileged user namespaces
         # Some Ubuntu point releases restrict unprivileged userns by
@@ -83,22 +95,42 @@ jobs:
         # bubblewrap needs disabled; separately, unprivileged_userns_clone
         # itself must be 1. The wrapper checks both at launch and errors
         # clearly if this step didn't take — see run_sandboxed_agent's
-        # pre-flight validation.
+        # pre-flight validation (procfs knobs plus a real bwrap probe).
         run: |
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
           sysctl kernel.unprivileged_userns_clone
 
+      - run: bash tests/test_live_client_isolation.bash
       - run: bash tests/test_sandbox_common.bash
       - run: bash tests/test_extra_bind_dirs.bash
       - run: bash tests/test_codex_wrapper.bash
       - run: bash tests/test_bind_hardening.bash
+      - run: bash tests/test_sensitive_path_parity.bash
+      - run: bash tests/test_external_worktree.bash
+      - run: bash tests/test_workdir_git_protection.bash
+      - run: bash tests/test_macos_ro_overlays.bash
+      - run: bash tests/test_macos_credential_policy.bash
       - run: bash tests/test_agy_wrapper.bash
       - run: bash tests/test_copilot_wrapper.bash
+      - run: bash tests/test_client_persistent_controls.bash
+      - run: bash tests/test_linux_host_binds.bash
+      - run: bash tests/test_linux_runtime_dir.bash
+      - run: bash tests/test_linux_process_isolation.bash
+      - run: bash tests/test_linux_network_isolation.bash
+      - run: bash tests/test_macos_network_isolation.bash
 
   # macOS's built-in sandbox-exec needs no install step. Runs the same
   # cross-platform smoke tests as Linux (run_sandboxed_agent dispatches on
-  # `uname -s` internally) plus the macOS-only DRYRUN/PROFILE tests.
+  # `uname -s` internally), the macOS-only DRYRUN/PROFILE tests, and the
+  # preset suite (BSD stat; run-preset-tests.sh exits 2 off Darwin, so
+  # this job is its only CI path). Bind-hardening, WORKDIR git metadata
+  # and RO-overlay tests certify native Seatbelt write denial on the
+  # worktree common dir and WORKDIR's own .git; they
+  # fail, not skip, when sandbox-exec is unavailable. The codex/agy/copilot
+  # wrapper suites run their argv, settings and native named-account
+  # refusal (#46) checks here; their bwrap e2e blocks print skip lines
+  # (see docs/testing.md).
   smoke-macos:
     runs-on: macos-latest
     steps:
@@ -106,3 +138,15 @@ jobs:
       - run: bash tests/test_sandbox_common.bash
       - run: bash tests/test_sandbox_macos_only.bash
       - run: bash tests/test_extra_bind_dirs.bash
+      - run: bash tests/test_bind_hardening.bash
+      - run: bash tests/test_sensitive_path_parity.bash
+      - run: bash tests/test_external_worktree.bash
+      - run: bash tests/test_workdir_git_protection.bash
+      - run: bash tests/test_macos_ro_overlays.bash
+      - run: bash tests/test_macos_credential_policy.bash
+      - run: bash tests/test_client_persistent_controls.bash
+      - run: bash tests/test_macos_network_isolation.bash
+      - run: bash tests/test_codex_wrapper.bash
+      - run: bash tests/test_agy_wrapper.bash
+      - run: bash tests/test_copilot_wrapper.bash
+      - run: bash tests/run-preset-tests.sh
