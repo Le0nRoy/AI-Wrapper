@@ -1030,6 +1030,124 @@ _wrapper_check_config_symlink() {
     return 0
 }
 
+# ===== CLIENT PERSISTENT CONTROLS (#48 / #86) =====
+# A client profile dir (~/.claude, ~/.codex, ...) is bound RW for session,
+# history and auth state, but it also holds controls every later session
+# loads: settings, skills, plugins, hooks, prompts. An agent that edits
+# them changes future (also unsandboxed) sessions. This helper keeps the
+# controls that exist at launch read-only and pins their directories:
+#   - the profile base and every directory between it and a control are
+#     pinned (_wrapper_add_pin), so none can be renamed away and replaced;
+#   - each existing control is over-mounted read-only (_wrapper_add_ro_bind;
+#     bwrap mount point / Seatbelt write deny incl. ancestor pins).
+# All pins are emitted before the first RO overlay (bwrap: later mount
+# wins). Call after the RW bind of SRC_BASE and after the menu
+# (AI_SANDBOX_ALLOW_SETTINGS is a menu setting).
+# Absent controls are skipped and stay creatable (nothing is created on
+# the host). A control that is a symlink, sits behind one inside the
+# profile, or is neither a file nor a directory refuses the launch:
+# binding its target would protect, or expose, the wrong path. Controls
+# inside WORKDIR stay editable (trusted maintenance of the active
+# repository); a control containing WORKDIR is left writable with a WARN.
+# AI_SANDBOX_ALLOW_SETTINGS=1 skips everything with a WARN.
+#   TAG       - log tag
+#   SRC_BASE  - host profile dir (may be reached through a symlink)
+#   DST_BASE  - where the sandbox sees it ("" = SRC_BASE; Linux remapping
+#               of named accounts, dropped on macOS)
+#   CONTROL.. - paths relative to the base, or absolute (no remapping)
+# Returns 1 (after an ERROR) when the launch must be refused.
+_wrapper_protect_client_controls() {
+    local tag="${1}" src_base="${2%/}" dst_base="${3:-${2}}"
+    shift 3
+    dst_base="${dst_base%/}"
+    if [[ "${AI_SANDBOX_ALLOW_SETTINGS:-0}" == "1" ]]; then
+        echo_log "WARN" "[${tag}] AI_SANDBOX_ALLOW_SETTINGS=1: client persistent controls (settings, skills, plugins, hooks) in ${src_base} are writable in the sandbox. The agent can modify future behavior outside this session; review any changes before running un-sandboxed tools."
+        return 0
+    fi
+    if [[ ! -d "${src_base}" ]]; then
+        [[ "${AI_SANDBOX_DEBUG:-0}" == "1" ]] && echo_log "DEBUG" "_wrapper_protect_client_controls: ${src_base} absent; nothing to protect"
+        return 0
+    fi
+    local base wd
+    if ! base="$(_realpath "${src_base}")" || [[ -z "${base}" ]]; then
+        echo_log "ERROR" "[${tag}] Cannot resolve ${src_base}; refusing to launch without client settings protection."
+        return 1
+    fi
+    base="${base%/}"
+    wd="$(_realpath "$(pwd -P)" 2>/dev/null)" || wd=""
+    wd="${wd%/}"
+
+    # Pins as relative dirs ("" = base) or absolute paths; RO overlays as
+    # SRC / DST pairs.
+    local -a pins=("") ro_src=() ro_dst=()
+    local control src dst expected resolved prefix part
+    for control in "$@"; do
+        control="${control%/}"
+        if [[ "${control}" == /* ]]; then
+            src="${control}"; dst="${control}"
+            expected="$(_realpath "$(dirname -- "${control}")" 2>/dev/null)" || expected=""
+            expected="${expected%/}/$(basename -- "${control}")"
+        else
+            src="${base}/${control}"; dst="${dst_base}/${control}"; expected="${src}"
+        fi
+        if [[ ! -e "${src}" && ! -L "${src}" ]]; then
+            [[ "${AI_SANDBOX_DEBUG:-0}" == "1" ]] && echo_log "DEBUG" "_wrapper_protect_client_controls: ${src} absent; stays creatable"
+            continue
+        fi
+        if [[ -L "${src}" ]] || ! resolved="$(_realpath "${src}")" || [[ "${resolved%/}" != "${expected}" ]]; then
+            echo_log "ERROR" "[${tag}] Refusing to launch: client control ${src} is a symlink or behind one (it would protect or expose another path). Replace it with a regular file or directory, or set AI_SANDBOX_ALLOW_SETTINGS=1 to leave client settings writable."
+            return 1
+        fi
+        if [[ ! -f "${src}" && ! -d "${src}" ]]; then
+            echo_log "ERROR" "[${tag}] Refusing to launch: client control ${src} is neither a regular file nor a directory."
+            return 1
+        fi
+        src="${resolved%/}"
+        if [[ -n "${wd}" && ( "${src}" == "${wd}" || "${src}" == "${wd}"/* ) ]]; then
+            [[ "${AI_SANDBOX_DEBUG:-0}" == "1" ]] && echo_log "DEBUG" "_wrapper_protect_client_controls: ${src} is inside WORKDIR ${wd}; left writable"
+            continue
+        fi
+        if [[ -n "${wd}" && "${wd}" == "${src}"/* ]]; then
+            echo_log "WARN" "[${tag}] WORKDIR ${wd} is inside client control ${src}; it stays writable in the sandbox so this session can edit it. Review changes before later sessions load them."
+            continue
+        fi
+        if [[ "${control}" != /* ]]; then
+            prefix=""
+            while [[ "${control}" == */* ]]; do
+                part="${control%%/*}"; control="${control#*/}"
+                prefix="${prefix:+${prefix}/}${part}"
+                pins+=("${prefix}")
+            done
+        fi
+        ro_src+=("${src}"); ro_dst+=("${dst}")
+    done
+
+    local -a unique=()
+    local p seen i
+    for p in "${pins[@]}"; do
+        for seen in "${unique[@]+"${unique[@]}"}"; do
+            [[ "${seen}" == "${p}" ]] && continue 2
+        done
+        unique+=("${p}")
+    done
+    for p in "${unique[@]}"; do
+        _wrapper_client_control_bind _wrapper_add_pin "${base}${p:+/${p}}" "${dst_base}${p:+/${p}}"
+    done
+    for i in "${!ro_src[@]}"; do
+        _wrapper_client_control_bind _wrapper_add_ro_bind "${ro_src[i]}" "${ro_dst[i]}"
+    done
+    return 0
+}
+
+# Apply ADDER (_wrapper_add_pin / _wrapper_add_ro_bind) to SRC at DST and,
+# on Linux when they differ, at SRC too: an alias of the host path (e.g.
+# AI_SANDBOX_EXTRA_RW_DIRS naming it) must not stay writable.
+_wrapper_client_control_bind() {
+    local adder="${1}" src="${2}" dst="${3}"
+    [[ "${dst}" != "${src}" && "${_wrapper_os}" != "Darwin" ]] && "${adder}" "${src}"
+    "${adder}" "${src}" "${dst}"
+}
+
 # Bind-list flags that the interactive Settings sub-menu can toggle
 # need to be evaluated AFTER the menu — otherwise enabling them via
 # `s)` has no effect (WRAPPER_FLAGS is frozen by then). The shared
@@ -1131,6 +1249,7 @@ _AI_SETTINGS_LIST=(
     # Sensitive directories
     "AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR|bool|0|red|Allow launch from sensitive dirs|Permits launching from \$HOME itself, a dotfile dir directly under \$HOME${_ai_sensitive_workdir_extra}${_ai_sensitive_workdir_system} — the write fence then grants RW there, which likely exposes credentials|sensitive"
     "AI_SANDBOX_ALLOW_GIT_CONFIG|bool|0|red|Allow editing git config and hooks|Leaves WORKDIR's .git/config, hooks/, config.worktree and submodule config/hooks (also a linked worktree's own submodules) writable so git config, remote add and push -u work. The agent can then make host git run any command. Off: those edits and tracking-branch setup fail; commits, local branches and checkouts still work.|sensitive"
+    "AI_SANDBOX_ALLOW_SETTINGS|bool|0|red|Allow editing client settings and skills|Leaves the client profile's settings, skills, plugins, hooks and prompts writable (advanced: maintaining them from a session). The agent can then change how later sessions, also unsandboxed ones, behave. Off: the ones present at launch are read-only and their directories pinned; controls inside WORKDIR stay editable.|sensitive"
     "AI_SANDBOX_ALLOW_EXTERNAL_WORKTREES|bool|0|yellow|Allow git in worktrees of repos outside \$HOME|For a linked worktree whose repository's shared .git lies outside \$HOME (e.g. /Data/...), binds exactly that .git after the same link and path checks as \$HOME repos; its config, hooks/ and other worktrees stay read-only. System, temp and hidden locations are refused. This session only: never saved to or restored from the per-workdir preset.|sensitive"
     "AI_SANDBOX_ALLOW_BIN_RW|bool|0|red|Allow writing ~/bin|Binds ~/bin RW instead of read-only. ~/bin is first on the sandbox PATH and on yours, so the agent can plant or replace programs you later run outside the sandbox. Off: ~/bin stays usable (read and run) but not writable.|sensitive|linux"
     "AI_SANDBOX_ALLOW_AGENTS_SKILLS_RW|bool|0|red|Allow editing the shared agent-skill source|Binds ~/ai-wrapper/.agents RW instead of read-only. setup_skills copies it into every client's skill dir, so the agent can rewrite skills other clients and sessions load. Off: skills stay readable but not writable.|sensitive|linux"
@@ -1634,6 +1753,10 @@ _preset_warn_restored() {
     [[ -z "${val}" || "${val}" == "${_set_default}" ]] && return 0
     if [[ "${key}" == "AI_SANDBOX_ALLOW_GIT_CONFIG" ]]; then
         echo "  WARN: ${tag} Restored AI_SANDBOX_ALLOW_GIT_CONFIG=1 from the saved preset: git config and hooks in this workdir will be writable by the agent (set AI_SANDBOX_ALLOW_GIT_CONFIG=0 at launch or toggle it in s) Settings to protect them)." >&2
+        return 0
+    fi
+    if [[ "${key}" == "AI_SANDBOX_ALLOW_SETTINGS" ]]; then
+        echo "  WARN: ${tag} Restored AI_SANDBOX_ALLOW_SETTINGS=1 from the saved preset: client settings, skills and plugins will be writable by the agent (set AI_SANDBOX_ALLOW_SETTINGS=0 at launch or toggle it in s) Settings to protect them)." >&2
         return 0
     fi
     echo "  WARN: ${tag} Restored ${key}=${val} from the saved preset (${_set_severity}: ${_set_headline}); set ${key} at launch or change it in s) Settings to override." >&2

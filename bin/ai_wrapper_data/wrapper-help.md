@@ -110,6 +110,17 @@ The sandbox bounds *writes* — it does not bound *reads* or *network*. Be aware
   `.git/commondir`, sometimes `hooks/`) cannot be protected and are
   listed in a WARN; nothing is created on the host. A value set at launch
   wins over the saved per-workdir preset. Red banner.
+- `AI_SANDBOX_ALLOW_SETTINGS=1` — leave the client profile's persistent
+  controls (settings, skills, plugins, hooks, prompts) writable. By
+  default (0) the ones present at launch are read-only and the profile
+  directory and the directories leading to them are pinned (cannot be
+  renamed away and replaced), so the agent cannot change how later
+  sessions, also unsandboxed ones, behave. Session, history and login
+  state stay writable. Controls absent at launch stay creatable; nothing
+  is created on the host. A control that is a symlink (or behind one
+  inside the profile) refuses the launch. Controls inside WORKDIR stay
+  editable, so maintaining them from their own repository works. A value
+  set at launch wins over the saved per-workdir preset. Red banner.
 - `AI_SANDBOX_ALLOW_EXTERNAL_WORKTREES=1` — let git work in a linked
   worktree whose repository's shared `.git` lies outside `$HOME` (e.g.
   `/Data/projects/app/.git`). Off by default: only shared `.git` dirs
