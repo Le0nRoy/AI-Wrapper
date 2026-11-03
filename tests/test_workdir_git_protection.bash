@@ -506,10 +506,6 @@ echo "-- refusal propagates through every wrapper"
 V="${R}/refuse"
 _new_repo "${V}"
 rm -rf "${V}/.git/hooks"; ln -s "${R}/target-dir" "${V}/.git/hooks"
-# agy validates (never writes) its settings.json before the post-menu binds.
-mkdir -p "${FAKE_HOME}/.gemini/antigravity-cli"
-python3 -I -c 'import json,sys;print(json.dumps({"toolPermission":"always-proceed","artifactReviewPolicy":"always-proceed","allowNonWorkspaceAccess":True,"enableTerminalSandbox":False,"trustedWorkspaces":sys.argv[1:]}))' \
-    "${V}" >"${FAKE_HOME}/.gemini/antigravity-cli/settings.json"
 # Nested submodule metadata (#12): a symlinked namespace parent two levels
 # down, in WORKDIR's own .git and in a linked worktree's shared common dir.
 VN="${R}/refuse-nested"
@@ -518,8 +514,6 @@ mv "${VN}/.git/modules/ns/inner" "${R}/refuse-inner.saved"
 ln -s "${R}/refuse-inner.saved" "${VN}/.git/modules/ns/inner"
 VW="${R}/refuse-wt"
 git_q -C "${VN}" worktree add "${VW}" -b refuse-wt
-python3 -I -c 'import json,sys;print(json.dumps({"toolPermission":"always-proceed","artifactReviewPolicy":"always-proceed","allowNonWorkspaceAccess":True,"enableTerminalSandbox":False,"trustedWorkspaces":sys.argv[1:]}))' \
-    "${V}" "${VN}" "${VW}" >"${FAKE_HOME}/.gemini/antigravity-cli/settings.json"
 canary_before="$(ls -A "${R}/refuse-inner.saved")"
 for client in claude codex agy copilot cursor_agent; do
     out="$(cd "${V}" && bash "${REPO_ROOT}/bin/executable_${client}_wrapper.bash" x </dev/null 2>&1)"; rc=$?

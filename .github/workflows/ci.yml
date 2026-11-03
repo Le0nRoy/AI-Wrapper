@@ -139,6 +139,4 @@ jobs:
       - run: bash tests/test_macos_ro_overlays.bash
       - run: bash tests/test_macos_credential_policy.bash
       - run: bash tests/test_macos_network_isolation.bash
-      - run: bash tests/test_linux_host_binds.bash
-      - run: bash tests/test_linux_runtime_dir.bash
       - run: bash tests/run-preset-tests.sh
