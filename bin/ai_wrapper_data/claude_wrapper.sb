@@ -312,6 +312,10 @@
             ;; git credential-store files (#67 / M3); also denied below
             (require-not (literal  (string-append (param "HOME_DIR") "/.git-credentials")))
             (require-not (literal  (string-append (param "HOME_DIR") "/.config/git/credentials")))
+            ;; glab (GitLab CLI) config — readable only via PASS_GITLAB (#47)
+            (require-not (subpath (string-append (param "HOME_DIR") "/Library/Application Support/glab-cli")))
+            (require-not (subpath (string-append (param "HOME_DIR") "/.config/glab-cli")))
+            (require-not (subpath (string-append (param "HOME_DIR") "/.local/share/glab-cli")))
             (require-not (subpath (string-append (param "HOME_DIR") "/Library/Keychains")))
             ;; iMessage + Mail
             (require-not (subpath (string-append (param "HOME_DIR") "/Library/Messages")))
