@@ -96,38 +96,63 @@ if [[ ! -d "${SKILLS_SRC}" ]]; then
     exit 1
 fi
 
-# Prefer rsync — it makes refresh-in-place idempotent (files removed from the
-# source disappear from the copy via --delete, and the marker is protected
-# from deletion via --exclude). Fall back to a cp-based swap when rsync is
+# Prefer rsync to fill the staging copy; fall back to cp when rsync is
 # missing (uncommon on macOS but cheap to support).
 have_rsync=0
 command -v rsync >/dev/null 2>&1 && have_rsync=1
 
-# do_copy <src> <dest> — make <dest> a fresh copy of <src>'s contents and
-# stamp the marker. Caller is responsible for ensuring <dest> is safe to
-# clobber (legacy symlinks / unmanaged dirs are handled in the main loop).
-# Honours the outer `dry` flag — no-op in dry mode.
+# do_copy <src> <dest> — replace whatever is at <dest> (nothing, a managed
+# copy, a legacy symlink, or content the caller has cleared for --force)
+# with a marked copy of <src>. The copy and marker are built in a hidden
+# sibling first; the old entry is moved aside and only deleted once the new
+# copy is in place, and is moved back if the swap fails. Returns nonzero,
+# with <dest> unchanged or restored, on any failure. Never called in dry mode.
 do_copy() {
-    local src="$1" dest="$2"
-    if [[ "${dry}" -eq 1 ]]; then
-        return 0
-    fi
+    local src="$1" dest="$2" stage backup staged=0
+    stage="$(dirname "${dest}")/.$(basename "${dest}").setup-new.$$"
+    backup="$(dirname "${dest}")/.$(basename "${dest}").setup-old.$$"
+    rm -rf "${stage}" "${backup}" || return 1
+
     if [[ "${have_rsync}" -eq 1 ]]; then
-        # Trailing slash on src copies *contents* into dest. --exclude=MARKER
-        # both keeps the marker from being copied from source (it's not there
-        # anyway) AND, because rsync exclude rules also apply to --delete,
-        # protects an existing marker in dest from being wiped.
-        mkdir -p "${dest}"
-        rsync -a --delete --exclude="${MARKER}" "${src}/" "${dest}/"
+        rsync -a "${src}/" "${stage}/" && staged=1
     else
-        # No rsync — copy to a sibling, then atomic-ish rename-over. Doesn't
-        # survive concurrent runs, but neither did the symlink-based setup.
-        rm -rf "${dest}.new"
-        cp -a "${src}" "${dest}.new"
-        rm -rf "${dest}"
-        mv "${dest}.new" "${dest}"
+        cp -a "${src}" "${stage}" && staged=1
     fi
-    printf '%s\n' "${src}" > "${dest}/${MARKER}"
+    if [[ "${staged}" -eq 0 ]] || ! printf '%s\n' "${src}" > "${stage}/${MARKER}"; then
+        echo "ERROR   failed to stage ${src} for ${dest}; existing entry kept" >&2
+        rm -rf "${stage}"
+        return 1
+    fi
+
+    if [[ -e "${dest}" || -L "${dest}" ]] && ! mv "${dest}" "${backup}"; then
+        echo "ERROR   failed to move ${dest} aside; existing entry kept" >&2
+        rm -rf "${stage}"
+        return 1
+    fi
+    if ! mv "${stage}" "${dest}"; then
+        echo "ERROR   failed to install ${dest}" >&2
+        if [[ -e "${backup}" || -L "${backup}" ]] && ! mv "${backup}" "${dest}"; then
+            echo "ERROR   previous ${dest} left at ${backup}" >&2
+        fi
+        rm -rf "${stage}"
+        return 1
+    fi
+    if [[ -e "${backup}" || -L "${backup}" ]] && ! rm -rf "${backup}"; then
+        echo "ERROR   installed ${dest} but could not remove ${backup}" >&2
+        return 1
+    fi
+}
+
+# deploy <counter> <src> <dest> — run do_copy (skipped in dry mode) and
+# bump the <counter> variable only when it succeeded; failures are tallied
+# for the exit status.
+deploy() {
+    local counter="$1" src="$2" dest="$3"
+    if [[ "${dry}" -eq 0 ]] && ! do_copy "${src}" "${dest}"; then
+        copy_failed=$((copy_failed + 1))
+        return 1
+    fi
+    printf -v "${counter}" '%d' "$((${!counter} + 1))"
 }
 
 # archive_skill <path> <bucket> — move <path> to RETIRED_ARCHIVE/<bucket>/,
@@ -156,6 +181,7 @@ replaced=0
 skipped=0
 retired=0
 retire_failed=0
+copy_failed=0
 
 # Managed copies record the source path, so check them before the source
 # itself is moved away.
@@ -182,10 +208,18 @@ for skills_dst in "${SKILLS_DSTS[@]}"; do
     # Removing just the symlink (never its target) before mkdir -p prevents this.
     if [[ -L "${skills_dst}" ]]; then
         echo "MIGRATE ${skills_dst} (removing stale top-level symlink)"
-        [[ "${dry}" -eq 1 ]] || rm -f "${skills_dst}"
+        if [[ "${dry}" -eq 0 ]] && ! rm -f "${skills_dst}"; then
+            echo "ERROR   failed to remove symlink ${skills_dst}; skipping it" >&2
+            copy_failed=$((copy_failed + 1))
+            continue
+        fi
     fi
 
-    mkdir -p "${skills_dst}"
+    if [[ "${dry}" -eq 0 ]] && ! mkdir -p "${skills_dst}"; then
+        echo "ERROR   failed to create ${skills_dst}; skipping it" >&2
+        copy_failed=$((copy_failed + 1))
+        continue
+    fi
 
     for skill_path in "${SKILLS_SRC}"/*/; do
         [[ -d "${skill_path}" ]] || continue
@@ -202,14 +236,10 @@ for skills_dst in "${SKILLS_DSTS[@]}"; do
             current="$(readlink "${dest}")"
             if [[ "${current}" == "${src}" ]]; then
                 echo "MIGRATE ${name} (replacing symlink with copy in ${skills_dst})"
-                [[ "${dry}" -eq 1 ]] || rm -f "${dest}"
-                do_copy "${src}" "${dest}"
-                replaced=$((replaced + 1))
+                deploy replaced "${src}" "${dest}"
             elif [[ "${force}" -eq 1 ]]; then
                 echo "REPLACE ${name} (overwriting symlink to ${current} in ${skills_dst})"
-                [[ "${dry}" -eq 1 ]] || rm -f "${dest}"
-                do_copy "${src}" "${dest}"
-                replaced=$((replaced + 1))
+                deploy replaced "${src}" "${dest}"
             else
                 echo "SKIP    ${name} (symlink to ${current} in ${skills_dst}; use --force to replace with copy)"
                 skipped=$((skipped + 1))
@@ -220,13 +250,10 @@ for skills_dst in "${SKILLS_DSTS[@]}"; do
             # marker file + matching source path is what distinguishes them.
             if [[ -f "${dest}/${MARKER}" ]] && [[ "$(cat "${dest}/${MARKER}" 2>/dev/null)" == "${src}" ]]; then
                 echo "UPDATE  ${name} (${skills_dst})"
-                do_copy "${src}" "${dest}"
-                updated=$((updated + 1))
+                deploy updated "${src}" "${dest}"
             elif [[ "${force}" -eq 1 ]]; then
                 echo "REPLACE ${name} (overwriting unmanaged directory at ${dest})"
-                [[ "${dry}" -eq 1 ]] || rm -rf "${dest}"
-                do_copy "${src}" "${dest}"
-                replaced=$((replaced + 1))
+                deploy replaced "${src}" "${dest}"
             else
                 echo "SKIP    ${name} (unmanaged directory at ${dest}; use --force to replace)"
                 skipped=$((skipped + 1))
@@ -236,23 +263,20 @@ for skills_dst in "${SKILLS_DSTS[@]}"; do
             # --force — replacing arbitrary user content silently is too risky.
             if [[ "${force}" -eq 1 ]]; then
                 echo "REPLACE ${name} (overwriting file at ${dest})"
-                [[ "${dry}" -eq 1 ]] || rm -f "${dest}"
-                do_copy "${src}" "${dest}"
-                replaced=$((replaced + 1))
+                deploy replaced "${src}" "${dest}"
             else
                 echo "SKIP    ${name} (non-directory at ${dest}; use --force to replace)"
                 skipped=$((skipped + 1))
             fi
         else
             echo "COPY    ${name}: ${src} -> ${dest}"
-            do_copy "${src}" "${dest}"
-            copied=$((copied + 1))
+            deploy copied "${src}" "${dest}"
         fi
     done
 done
 
 echo ""
-echo "Copied: ${copied}, Updated: ${updated}, Replaced: ${replaced}, Skipped: ${skipped}, Retired: ${retired}"
+echo "Copied: ${copied}, Updated: ${updated}, Replaced: ${replaced}, Skipped: ${skipped}, Retired: ${retired}, Failed: ${copy_failed}"
 
 if [[ "${dry}" -eq 1 ]]; then
     echo "(dry run — no changes made)"
@@ -260,5 +284,10 @@ fi
 
 if [[ "${retire_failed}" -gt 0 ]]; then
     echo "ERROR: ${retire_failed} retired skill(s) could not be archived" >&2
+fi
+if [[ "${copy_failed}" -gt 0 ]]; then
+    echo "ERROR: ${copy_failed} skill copy operation(s) failed; rerun after fixing the cause" >&2
+fi
+if [[ "${retire_failed}" -gt 0 || "${copy_failed}" -gt 0 ]]; then
     exit 1
 fi
