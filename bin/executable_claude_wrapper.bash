@@ -97,6 +97,7 @@ _bind_claude_account() {
             echo "ERROR: Invalid CLAUDE_ACCOUNT '${account}': must contain only letters, digits, hyphens, underscores" >&2
             exit 1
         fi
+        _wrapper_check_account_supported "${account}" "CLAUDE_ACCOUNT" || exit 1
         claude_dir="${HOME}/.claude-${account}"
         if [[ ! -d "${claude_dir}" ]]; then
             echo "ERROR: Account profile directory not found: ${claude_dir}" >&2

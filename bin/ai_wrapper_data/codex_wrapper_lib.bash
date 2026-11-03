@@ -100,6 +100,7 @@ _bind_codex_account() {
             echo "ERROR: Invalid CODEX_ACCOUNT '${account}': must contain only letters, digits, hyphens, underscores" >&2
             exit 1
         fi
+        _wrapper_check_account_supported "${account}" "CODEX_ACCOUNT" || exit 1
         codex_dir="${HOME}/.codex-${account}"
         if [[ ! -d "${codex_dir}" ]]; then
             echo "ERROR: Account profile directory not found: ${codex_dir}" >&2

@@ -636,16 +636,18 @@ fi
 # ---------------------------------------------------------------------------
 echo "-- config dir / file symlink guards"
 # shellcheck disable=SC2034  # CODEX_ACCOUNT is read by _bind_codex_account
-_bind_codex() { ( _load codex; WRAPPER_FLAGS=(); CODEX_ACCOUNT="${1}"; _bind_codex_account; printf '%s\n' "${WRAPPER_FLAGS[@]}" ) 2>&1; }
+# Named-profile symlink checks force the Linux backend: macOS refuses named
+# profiles before them (#46).
+_bind_codex() { ( _load codex; [[ -n "${2:-}" ]] && _wrapper_os="${2}"; WRAPPER_FLAGS=(); CODEX_ACCOUNT="${1}"; _bind_codex_account; printf '%s\n' "${WRAPPER_FLAGS[@]}" ) 2>&1; }
 
 ln -s "${OUTSIDE}" "${FAKE_HOME}/.codex-out"
-out="$(_bind_codex out)"; rc=$?
+out="$(_bind_codex out Linux)"; rc=$?
 assert_eq "${rc}" "1" "named ~/.codex-<name> symlinked outside \$HOME is refused"
 assert_contains "${out}" "outside" "... with outside-\$HOME error"
 
 mkdir -p "${FAKE_HOME}/.ssh"
 ln -s "${FAKE_HOME}/.ssh" "${FAKE_HOME}/.codex-cred"
-out="$(_bind_codex cred)"; rc=$?
+out="$(_bind_codex cred Linux)"; rc=$?
 assert_eq "${rc}" "1" "named ~/.codex-<name> symlinked into ~/.ssh is refused"
 assert_contains "${out}" "credential location" "... with credential-location error"
 
@@ -656,7 +658,7 @@ rm -f "${FAKE_HOME}/.codex"
 
 mkdir -p "${FAKE_HOME}/profiles/ok"
 ln -s "${FAKE_HOME}/profiles/ok" "${FAKE_HOME}/.codex-ok"
-out="$(_bind_codex ok)"; rc=$?
+out="$(_bind_codex ok Linux)"; rc=$?
 assert_eq "${rc}" "0" "named profile symlinked to a plain dir under \$HOME is allowed"
 assert_contains "${out}" "--bind${NL}${FAKE_HOME}/profiles/ok" "... and the resolved path (not the symlink) is bound"
 

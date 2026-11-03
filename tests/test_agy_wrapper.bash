@@ -290,10 +290,14 @@ _write_valid_settings() {
     mkdir -p "$(dirname "${file}")"
     python3 -I -c 'import json,sys;print(json.dumps({"toolPermission":"always-proceed","artifactReviewPolicy":"always-proceed","allowNonWorkspaceAccess":True,"enableTerminalSandbox":False,"trustedWorkspaces":sys.argv[1:]}))' "$@" >"${file}"
 }
+# Optional $2 forces the backend (_wrapper_os) so both backends' account
+# policy is covered whichever OS runs the suite. Named-profile settings and
+# skills checks force Linux: macOS refuses named profiles before them.
 _bind() {
     (
         cd "${FAKE_HOME}/work" || exit 1
         _load agy
+        [[ -n "${2:-}" ]] && _wrapper_os="${2}"
         WRAPPER_FLAGS=()
         AGY_ACCOUNT="${1}"
         _bind_agy_account
@@ -316,14 +320,34 @@ cat >"${FAKE_HOME}/.gemini-alt/antigravity-cli/settings.json" <<'JSON'
 }
 JSON
 
-out="$(_bind 'missing')"; rc=$?
+out="$(_bind 'missing' Linux)"; rc=$?
 assert_eq "${rc}" "1" "missing profile directory is an error"
 assert_contains "${out}" "Account profile directory not found: ${FAKE_HOME}/.gemini-missing" "... naming the missing dir"
 assert_contains "${out}" "Available profiles: alt" "... and listing existing profiles"
 
 alt_file="${FAKE_HOME}/.gemini-alt/antigravity-cli/settings.json"
 alt_before="$(cat "${alt_file}")"
+
+# macOS refuses a named profile before reading its settings.json or
+# syncing skills into it.
 out="$(_bind 'alt')"; rc=$?
+if [[ "${OS}" == "Darwin" ]]; then
+    assert_eq "${rc}" "1" "named profile refused on macOS (no remapping)"
+    assert_contains "${out}" "AGY_ACCOUNT='alt' is not supported on macOS" "... with the platform error"
+else
+    assert_eq "${rc}" "1" "named profile with invalid settings.json fails on Linux"
+fi
+out="$(_bind 'alt' Darwin)"; rc=$?
+assert_eq "${rc}" "1" "macOS backend: named profile refused"
+assert_contains "${out}" "AGY_ACCOUNT='alt' is not supported on macOS" "macOS backend: error names the setting and profile"
+assert_contains "${out}" "AGY_ACCOUNT=private" "macOS backend: error names the remedy"
+assert_not_contains "${out}" "toolPermission" "macOS backend: refused before the settings.json check"
+assert_not_contains "${out}" "--bind" "macOS backend: no bind emitted for a refused profile"
+out="$(_bind 'bad/../name' Darwin)"; rc=$?
+assert_eq "${rc}" "1" "macOS backend: invalid name still rejected"
+assert_contains "${out}" "Invalid AGY_ACCOUNT" "... by name validation first"
+
+out="$(_bind 'alt' Linux)"; rc=$?
 assert_eq "${rc}" "1" "settings.json lacking the sandbox settings fails the bind"
 assert_contains "${out}" '"toolPermission" is "request-review"; required: "always-proceed"' "... naming each wrong setting"
 assert_contains "${out}" '"enableTerminalSandbox" is true; required: false' "... including the terminal sandbox"
@@ -332,13 +356,14 @@ assert_contains "${out}" "then relaunch" "... with how to retry"
 assert_eq "$(cat "${alt_file}")" "${alt_before}" "... and the wrapper never edits settings.json"
 
 _write_valid_settings "${alt_file}" /existing/workspace "${FAKE_HOME}/work"
-out="$(_bind 'alt')"; rc=$?
+out="$(_bind 'alt' Darwin)"; rc=$?
+assert_eq "${rc}" "1" "macOS backend: named profile refused even with valid settings.json"
+synced=0; [[ -e "${FAKE_HOME}/.gemini-alt/config" ]] && synced=1
+assert_eq "${synced}" "0" "macOS backend: no skills synced into the refused profile"
+
+out="$(_bind 'alt' Linux)"; rc=$?
 assert_eq "${rc}" "0" "existing named profile binds once settings.json is valid"
-if [[ "${OS}" == "Darwin" ]]; then
-    assert_eq "${out}" "--bind${NL}${FAKE_HOME}/.gemini-alt${NL}NAME=Antigravity CLI [alt]" "named profile: single-arg bind on macOS"
-else
-    assert_eq "${out}" "--bind${NL}${FAKE_HOME}/.gemini-alt${NL}${FAKE_HOME}/.gemini${NL}NAME=Antigravity CLI [alt]" "named profile remapped to ~/.gemini"
-fi
+assert_eq "${out}" "--bind${NL}${FAKE_HOME}/.gemini-alt${NL}${FAKE_HOME}/.gemini${NL}NAME=Antigravity CLI [alt]" "named profile remapped to ~/.gemini"
 
 
 skill_synced=0
@@ -349,7 +374,7 @@ assert_eq "${skill_synced}" "1" "orchestrator-mode skill synced into named profi
 mkdir -p "${FAKE_HOME}/.gemini-alt/config/skills/orchestrator-mode"
 rm -f "${FAKE_HOME}/.gemini-alt/config/skills/orchestrator-mode/.setup_skills_managed"
 echo "custom-user-skill" >"${FAKE_HOME}/.gemini-alt/config/skills/orchestrator-mode/SKILL.md"
-_bind 'alt' >/dev/null
+_bind 'alt' Linux >/dev/null
 assert_eq "$(cat "${FAKE_HOME}/.gemini-alt/config/skills/orchestrator-mode/SKILL.md")" "custom-user-skill" \
     "unmanaged skill directory is not overwritten"
 

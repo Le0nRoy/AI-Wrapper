@@ -1580,6 +1580,7 @@ _bind_agy_account() {
             echo "ERROR: Invalid AGY_ACCOUNT '${account}': must contain only letters, digits, hyphens, underscores" >&2
             exit 1
         fi
+        _wrapper_check_account_supported "${account}" "AGY_ACCOUNT" || exit 1
         gemini_dir="${HOME}/.gemini-${account}"
         if [[ ! -d "${gemini_dir}" ]]; then
             echo "ERROR: Account profile directory not found: ${gemini_dir}" >&2

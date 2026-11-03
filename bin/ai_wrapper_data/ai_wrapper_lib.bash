@@ -50,10 +50,11 @@ ORCHESTRATOR_PROMPT="${WRAPPER_DATA_DIR}/orchestrator-prompt.md"
 # `--bind` is a single-arg path-based ACL grant (see macos_sandbox_exec.bash
 # header) — there is no remapping, so DST is dropped. Known consequence:
 # path-remapping features (multi-account switching to a differently-named
-# on-disk directory) only work as designed on the Linux backend today; on
-# macOS every account maps to its own on-disk path rather than appearing as
-# ~/.claude. This is a macOS-backend limitation (ai_wrapper_data/
-# macos_sandbox_exec.bash, out of scope here), not a bug in this file.
+# on-disk directory) only work on the Linux backend; on macOS a named
+# account would be granted at its own on-disk path while the CLI still
+# reads ~/.claude, so the session would silently run on the default
+# profile. _wrapper_check_account_supported refuses such selections before
+# any host-side change (see #46).
 #
 # Shared across all three wrappers (Claude/Codex/Cursor) — every wrapper
 # sources this file, so a single `uname -s` check here covers them all.
@@ -66,6 +67,22 @@ _wrapper_add_bind() {
     else
         WRAPPER_FLAGS+=(--bind "${src}" "${dst}")
     fi
+}
+
+# Refuse a named (non-default) account profile on macOS. Each _bind_*_account
+# remaps ~/.<cli>-<name> onto the CLI's default config root, which
+# sandbox-exec cannot do (see above), and none of the maintained CLIs has a
+# verified invocation-local config-root override that covers all of its
+# credentials and state. Call after the account name is validated and
+# before any host-state mutation (mkdir, settings checks, skill sync).
+#   $1 - normalised account name ("" = default 'private' profile)
+#   $2 - the setting name, for the error message (e.g. CLAUDE_ACCOUNT)
+_wrapper_check_account_supported() {
+    local account="${1}" var_name="${2}"
+    [[ -z "${account}" || "${_wrapper_os}" != "Darwin" ]] && return 0
+    echo "ERROR: ${var_name}='${account}' is not supported on macOS: sandbox-exec cannot remap ~/.<cli>-${account} onto the CLI's default config directory, so the session would silently use the default profile." >&2
+    echo "Set ${var_name}=private (or unset it) to use the default profile on macOS; named account profiles work on Linux only." >&2
+    return 1
 }
 
 _wrapper_add_ro_bind() {

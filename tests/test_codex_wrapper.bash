@@ -140,10 +140,12 @@ assert_contains "${out}" "cannot inject orchestrator prompt" "... with the expla
 # ---------------------------------------------------------------------------
 echo "-- CODEX_ACCOUNT binding"
 # Run _bind_codex_account in a subshell; print WRAPPER_FLAGS / agent name
-# on success, stderr on failure.
+# on success, stderr on failure. Optional $2 forces the backend (_wrapper_os)
+# so both backends' account policy is covered whichever OS runs the suite.
 _bind() {
     (
         _load codex
+        [[ -n "${2:-}" ]] && _wrapper_os="${2}"
         WRAPPER_FLAGS=()
         CODEX_ACCOUNT="${1}"
         _bind_codex_account
@@ -156,18 +158,47 @@ assert_eq "${rc}" "1" "invalid account name rejected"
 assert_contains "${out}" "Invalid CODEX_ACCOUNT" "... with validation error"
 
 mkdir -p "${FAKE_HOME}/.codex-alt"
-out="$(_bind 'missing')"; rc=$?
+out="$(_bind 'missing' Linux)"; rc=$?
 assert_eq "${rc}" "1" "missing profile directory is an error"
 assert_contains "${out}" "Account profile directory not found: ${FAKE_HOME}/.codex-missing" "... naming the missing dir"
 assert_contains "${out}" "Available profiles: alt" "... and listing existing profiles"
 
 out="$(_bind 'alt')"; rc=$?
-assert_eq "${rc}" "0" "existing named profile binds"
 if [[ "${OS}" == "Darwin" ]]; then
-    assert_eq "${out}" "--bind${NL}${FAKE_HOME}/.codex-alt${NL}NAME=Codex CLI [alt]" "named profile: single-arg bind on macOS"
+    assert_eq "${rc}" "1" "named profile refused on macOS (no remapping)"
+    assert_contains "${out}" "CODEX_ACCOUNT='alt' is not supported on macOS" "... naming the setting and profile"
+    assert_not_contains "${out}" "NAME=" "... before any bind is emitted"
 else
+    assert_eq "${rc}" "0" "existing named profile binds"
     assert_eq "${out}" "--bind${NL}${FAKE_HOME}/.codex-alt${NL}${FAKE_HOME}/.codex${NL}NAME=Codex CLI [alt]" "named profile remapped to ~/.codex"
 fi
+
+out="$(_bind 'alt' Linux)"; rc=$?
+assert_eq "${rc}" "0" "Linux backend: named profile binds"
+assert_eq "${out}" "--bind${NL}${FAKE_HOME}/.codex-alt${NL}${FAKE_HOME}/.codex${NL}NAME=Codex CLI [alt]" "Linux backend: named profile remapped to ~/.codex"
+
+rm -rf "${FAKE_HOME}/.codex"
+out="$(_bind 'alt' Darwin)"; rc=$?
+assert_eq "${rc}" "1" "macOS backend: named profile refused"
+assert_contains "${out}" "CODEX_ACCOUNT='alt' is not supported on macOS" "macOS backend: error names the setting and profile"
+assert_contains "${out}" "CODEX_ACCOUNT=private" "macOS backend: error names the remedy"
+assert_not_contains "${out}" "--bind" "macOS backend: no bind emitted for a refused profile"
+assert_eq "$([[ -e "${FAKE_HOME}/.codex" ]] && echo yes || echo no)" "no" "macOS backend: refusal creates no ~/.codex"
+
+out="$(_bind 'missing' Darwin)"; rc=$?
+assert_eq "${rc}" "1" "macOS backend: missing named profile refused"
+assert_contains "${out}" "not supported on macOS" "... by the platform check, not a misleading missing-dir error"
+
+out="$(_bind 'bad/../name' Darwin)"; rc=$?
+assert_eq "${rc}" "1" "macOS backend: invalid name still rejected"
+assert_contains "${out}" "Invalid CODEX_ACCOUNT" "... by name validation first"
+
+out="$(_bind 'private' Darwin)"; rc=$?
+assert_eq "${rc}" "0" "macOS backend: default profile still binds"
+assert_eq "${out}" "--bind${NL}${FAKE_HOME}/.codex${NL}NAME=Codex CLI" "macOS backend: default profile single-arg bind on ~/.codex"
+out="$(_bind '' Darwin)"; rc=$?
+assert_eq "${rc}" "0" "macOS backend: empty CODEX_ACCOUNT still binds the default profile"
+rm -rf "${FAKE_HOME}/.codex"
 
 out="$(_bind 'private')"; rc=$?
 assert_eq "${rc}" "0" "default account binds"
@@ -374,6 +405,40 @@ STUB
 else
     echo "  skip - Linux + bwrap required"
 fi
+
+# ---------------------------------------------------------------------------
+echo "-- end-to-end: macOS refuses named account profiles before launch (#46)"
+# Seatbelt cannot remap ~/.<cli>-<name> onto the CLI's config root, so every
+# wrapper must refuse a named profile before any host change or launch. On
+# Linux a `uname -s` stub selects the macOS code path; nothing reaches
+# sandbox-exec because the refusal comes first.
+MAC_STUBS="${FAKE_HOME}/mac-stubs"
+mkdir -p "${MAC_STUBS}"
+if [[ "${OS}" != "Darwin" ]]; then
+    printf '#!/bin/sh\n[ "$*" = "-s" ] && { echo Darwin; exit 0; }\nexec %s "$@"\n' \
+        "$(command -v uname)" >"${MAC_STUBS}/uname"
+fi
+for agent in claude codex agy; do
+    printf '#!/bin/sh\necho STUB-RAN\n' >"${MAC_STUBS}/${agent}"
+done
+chmod +x "${MAC_STUBS}"/*
+for spec in claude:CLAUDE_ACCOUNT:.claude codex:CODEX_ACCOUNT:.codex agy:AGY_ACCOUNT:.gemini; do
+    IFS=: read -r agent var dir <<<"${spec}"
+    rm -rf "${FAKE_HOME:?}/${dir}" "${FAKE_HOME:?}/${dir}.json"
+    mkdir -p "${FAKE_HOME}/${dir}-mac"
+    out="$(cd "${FAKE_HOME}/work" && env PATH="${MAC_STUBS}:${PATH}" "${var}=mac" \
+        bash "${REPO_ROOT}/bin/executable_${agent}_wrapper.bash" x </dev/null 2>&1)"; rc=$?
+    assert_eq "${rc}" "1" "${agent} (macOS): ${var}=mac refused"
+    assert_contains "${out}" "${var}='mac' is not supported on macOS" "${agent} (macOS): error names the setting and profile"
+    assert_not_contains "${out}" "STUB-RAN" "${agent} (macOS): agent never started"
+    assert_eq "$([[ -e "${FAKE_HOME}/${dir}" ]] && echo yes || echo no)" "no" "${agent} (macOS): default ~/${dir} not created"
+    assert_eq "$(find "${FAKE_HOME}/${dir}-mac" -mindepth 1 | wc -l | tr -d ' ')" "0" "${agent} (macOS): named profile left untouched"
+    out="$(cd "${FAKE_HOME}/work" && env PATH="${MAC_STUBS}:${PATH}" "${var}=private" \
+        bash "${REPO_ROOT}/bin/executable_${agent}_wrapper.bash" x </dev/null 2>&1)"
+    assert_not_contains "${out}" "not supported on macOS" "${agent} (macOS): ${var}=private is not refused"
+    rm -rf "${FAKE_HOME:?}/${dir}-mac" "${FAKE_HOME:?}/${dir}" "${FAKE_HOME:?}/${dir}.json"
+done
+rm -rf "${MAC_STUBS}"
 
 assert_no_live_client_reached
 tests_summary_and_exit
