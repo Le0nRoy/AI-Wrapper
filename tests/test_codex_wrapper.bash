@@ -170,12 +170,12 @@ if [[ "${OS}" == "Darwin" ]]; then
     assert_not_contains "${out}" "NAME=" "... before any bind is emitted"
 else
     assert_eq "${rc}" "0" "existing named profile binds"
-    assert_eq "${out}" "--bind${NL}${FAKE_HOME}/.codex-alt${NL}${FAKE_HOME}/.codex${NL}NAME=Codex CLI [alt]" "named profile remapped to ~/.codex"
+    assert_eq "${out}" "--bind${NL}${FAKE_HOME}/.codex-alt${NL}${FAKE_HOME}/.codex${NL}--bind${NL}${FAKE_HOME}/.codex-alt${NL}${FAKE_HOME}/.codex-alt${NL}--bind${NL}${FAKE_HOME}/.codex-alt${NL}${FAKE_HOME}/.codex${NL}NAME=Codex CLI [alt]" "named profile remapped to ~/.codex (base pinned at both paths, #87)"
 fi
 
 out="$(_bind 'alt' Linux)"; rc=$?
 assert_eq "${rc}" "0" "Linux backend: named profile binds"
-assert_eq "${out}" "--bind${NL}${FAKE_HOME}/.codex-alt${NL}${FAKE_HOME}/.codex${NL}NAME=Codex CLI [alt]" "Linux backend: named profile remapped to ~/.codex"
+assert_eq "${out}" "--bind${NL}${FAKE_HOME}/.codex-alt${NL}${FAKE_HOME}/.codex${NL}--bind${NL}${FAKE_HOME}/.codex-alt${NL}${FAKE_HOME}/.codex-alt${NL}--bind${NL}${FAKE_HOME}/.codex-alt${NL}${FAKE_HOME}/.codex${NL}NAME=Codex CLI [alt]" "Linux backend: named profile remapped to ~/.codex (base pinned at both paths, #87)"
 
 rm -rf "${FAKE_HOME}/.codex"
 out="$(_bind 'alt' Darwin)"; rc=$?
@@ -195,7 +195,7 @@ assert_contains "${out}" "Invalid CODEX_ACCOUNT" "... by name validation first"
 
 out="$(_bind 'private' Darwin)"; rc=$?
 assert_eq "${rc}" "0" "macOS backend: default profile still binds"
-assert_eq "${out}" "--bind${NL}${FAKE_HOME}/.codex${NL}NAME=Codex CLI" "macOS backend: default profile single-arg bind on ~/.codex"
+assert_eq "${out}" "--bind${NL}${FAKE_HOME}/.codex${NL}--pin${NL}${FAKE_HOME}/.codex${NL}NAME=Codex CLI" "macOS backend: default profile single-arg bind and pin on ~/.codex"
 out="$(_bind '' Darwin)"; rc=$?
 assert_eq "${rc}" "0" "macOS backend: empty CODEX_ACCOUNT still binds the default profile"
 rm -rf "${FAKE_HOME}/.codex"

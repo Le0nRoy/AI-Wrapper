@@ -86,8 +86,21 @@ _codex_list_account_profiles() {
     done
 }
 
+# ===== PERSISTENT CONTROLS (#48 / #87) =====
+# Paths under the profile dir that every later Codex session loads:
+# config.toml (model, MCP servers, notify commands, project trust),
+# hooks, global instructions, exec-policy rules, custom prompts, agents,
+# plugins and skills. _bind_codex_account keeps the ones present at launch
+# read-only via _wrapper_protect_client_controls. Session state stays
+# writable: auth.json, history.jsonl, sessions/, log/, cache.
+_CODEX_CLIENT_CONTROLS=(
+    config.toml config.json hooks.json
+    AGENTS.md AGENTS.override.md
+    agents hooks plugins prompts rules skills
+)
+
 # Resolve CODEX_ACCOUNT to the profile dir and append its bind (at
-# ~/.codex) to WRAPPER_FLAGS. Must run AFTER _preset_autoload and the menu
+# ~/.codex) and the read-only persistent controls to WRAPPER_FLAGS. Must run AFTER _preset_autoload and the menu
 # — CODEX_ACCOUNT isn't authoritative until then. Exits on invalid input,
 # same contract as _bind_claude_account in executable_claude_wrapper.bash.
 _bind_codex_account() {
@@ -137,6 +150,8 @@ _bind_codex_account() {
     local bind_src
     bind_src="$(_realpath "${codex_dir}")" || bind_src="${codex_dir}"
     _wrapper_add_bind "${bind_src}" "${HOME}/.codex"
+    _wrapper_protect_client_controls "codex" "${bind_src}" "${HOME}/.codex" \
+        "${_CODEX_CLIENT_CONTROLS[@]}" || exit 1
 }
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
