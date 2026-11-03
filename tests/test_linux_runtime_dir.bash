@@ -8,11 +8,9 @@
 # (AI_SANDBOX_PASS_SSH_AGENT) and the rootless Docker / Podman sockets
 # (AI_SANDBOX_ALLOW_DOCKER). AI_SANDBOX_ALLOW_XDG_RUNTIME_RW=1 restores the
 # RW bind of the validated host dir, with a warning; invalid input then
-# fails the launch. Also checks that the agy trust analysis
-# (_agy_path_sandbox_writable) follows the same rules.
+# fails the launch.
 #
-# Three layers: _agy_path_sandbox_writable (pure logic, Linux and macOS),
-# then on Linux only bwrap argv through a stub bwrap/sysctl, and native
+# Two layers, Linux only: bwrap argv through a stub bwrap/sysctl, and native
 # bubblewrap probes that talk to synthetic UNIX socket servers (a missing
 # bwrap fails). Synthetic fake HOME and runtime dirs under /tmp only; the
 # host session's runtime dir, buses and agents are never touched, and no
@@ -67,40 +65,6 @@ _load_linux() {
 }
 
 echo "== Linux user runtime dir (${OS}) =="
-
-# ---------------------------------------------------------------------------
-echo "-- agy trust analysis: host runtime dir is not a default RW root"
-_writable() {
-    # $1: path, $2: OS for _wrapper_os, rest: NAME=VALUE env.
-    local path="${1}" os="${2}"; shift 2
-    (
-        { cd "${WORK}" && export "$@" && _load_linux \
-            && source "${REPO_ROOT}/bin/ai_wrapper_data/agy_wrapper_lib.bash"; } >/dev/null 2>&1 \
-            || { echo LOAD_FAILED; exit 0; }
-        _wrapper_os="${os}"; WRAPPER_FLAGS=()
-        if _agy_path_sandbox_writable "${path}" "${H}/.gemini" 2>/dev/null; then echo yes; else echo no; fi
-    )
-}
-# HOME_RT (not RT): on macOS /tmp is a shared RW temp root anyway.
-for os in Linux Darwin; do
-    assert_eq "$(_writable "${HOME_RT}/sub" "${os}" XDG_RUNTIME_DIR="${HOME_RT}")" no \
-        "${os}: host runtime dir not writable by default"
-    assert_eq "$(_writable "${HOME_RT}/sub" "${os}" XDG_RUNTIME_DIR="${HOME_RT}" \
-        AI_SANDBOX_EXTRA_RW_DIRS="${HOME_RT}")" yes "${os}: explicit RW extra over the runtime dir still counts"
-done
-assert_eq "$(_writable "${HOME_RT}/sub" Linux XDG_RUNTIME_DIR="${HOME_RT}" AI_SANDBOX_ALLOW_XDG_RUNTIME_RW=1)" yes \
-    "Linux: ALLOW_XDG_RUNTIME_RW=1 makes the host runtime dir writable"
-assert_eq "$(_writable "${RT}/sub" Linux XDG_RUNTIME_DIR="${H}/rt-link-${RUN_ID}" AI_SANDBOX_ALLOW_XDG_RUNTIME_RW=1)" yes \
-    "Linux: ALLOW_XDG_RUNTIME_RW=1 via a symlink alias covers the canonical dir"
-assert_eq "$(_writable "${HOME_RT}/sub" Linux XDG_RUNTIME_DIR="${HOME_RT}" AI_SANDBOX_ALLOW_XDG_RUNTIME_RW=yes)" no \
-    "Linux: non-1 toggle value grants nothing"
-assert_eq "$(_writable "${HOME_RT}/sub" Darwin XDG_RUNTIME_DIR="${HOME_RT}" AI_SANDBOX_ALLOW_XDG_RUNTIME_RW=1)" no \
-    "Darwin: Linux-only toggle grants nothing"
-assert_eq "$(_writable "${WORK}/rt/sub" Linux XDG_RUNTIME_DIR="${WORK}/rt")" yes \
-    "Linux: a runtime dir inside WORKDIR stays writable (WORKDIR grant)"
-assert_eq "$(_writable "${H}/missing-rt-${RUN_ID}/sub" Linux XDG_RUNTIME_DIR="${H}/missing-rt-${RUN_ID}" \
-    AI_SANDBOX_ALLOW_XDG_RUNTIME_RW=1)" no "Linux: missing runtime dir is not a root"
-assert_eq "$(_yes test -e "${H}/missing-rt-${RUN_ID}")" no "missing runtime dir is not created on the host"
 
 # ---------------------------------------------------------------------------
 if [[ "${OS}" != "Linux" ]]; then

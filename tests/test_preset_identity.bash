@@ -275,31 +275,4 @@ for spec in claude:CLAUDE_ACCOUNT codex:CODEX_ACCOUNT agy:AGY_ACCOUNT; do
     rm -f "${PRESET_DIR}/${ID_A}-${agent}.env"
 done
 
-# ---------------------------------------------------------------------------
-echo "-- agy trusted-target check on hash failure"
-mkdir -p "${FAKE_HOME}/agy-stub" "${FAKE_HOME}/.gemini-x/antigravity-cli" "${FAKE_HOME}/dot"
-_stub "${FAKE_HOME}/agy-stub" sha256sum 'exit 1'
-"${PY}" -I -c 'import json,sys;print(json.dumps({"colorScheme":"dark","toolPermission":"always-proceed","artifactReviewPolicy":"always-proceed","allowNonWorkspaceAccess":True,"enableTerminalSandbox":False,"trustedWorkspaces":sys.argv[1:]}))' \
-    "${A}" >"${FAKE_HOME}/dot/settings.json"
-ln -s "${FAKE_HOME}/dot/settings.json" "${FAKE_HOME}/.gemini-x/antigravity-cli/settings.json"
-# _agy_trusted PATH-PREFIX: validate the approved symlinked settings.json.
-_agy_trusted() {
-    (
-        cd "${A}" || exit 1
-        _load agy
-        PATH="${1}${HOST_PATH}"
-        # shellcheck disable=SC2034  # read by _agy_validate_settings
-        WRAPPER_FLAGS=()
-        AGY_SETTINGS_TRUSTED_PROFILE="${FAKE_HOME}/.gemini-x" \
-            AGY_SETTINGS_TRUSTED_TARGET="${FAKE_HOME}/dot/settings.json" \
-            _agy_validate_settings "${FAKE_HOME}/.gemini-x" && echo CONFIGURED
-    ) 2>&1
-}
-out="$(_agy_trusted "")"
-assert_contains "${out}" "CONFIGURED" "agy control: approval honoured with a valid identity (${out})"
-out="$(_agy_trusted "${FAKE_HOME}/agy-stub:")"
-assert_contains "${out}" "per-workdir preset location cannot be determined" "agy: approval refused, preset location undeterminable"
-assert_not_contains "${out}" "CONFIGURED" "agy: ... failing the launch check"
-assert_not_contains "${out}" "preset directory . is writable" "agy: ... never checks dirname of an empty path"
-
 tests_summary_and_exit

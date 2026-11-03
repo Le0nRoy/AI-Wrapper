@@ -6,11 +6,9 @@
 # socket are absent unless AI_SANDBOX_ALLOW_ANDROID / AI_SANDBOX_PASS_TAILSCALE;
 # Kind support is gone (~/.kind and ~/kind_dot_kube are never mounted,
 # KIND_EXPERIMENTAL_PROVIDER is not passed); missing host paths are omitted
-# and never created. Also checks that the agy trust analysis
-# (_agy_path_sandbox_writable) follows the same grants.
+# and never created.
 #
-# Three layers: _agy_path_sandbox_writable (pure logic, Linux and macOS),
-# then on Linux only bwrap argv through a stub bwrap/sysctl, and native
+# Two layers, Linux only: bwrap argv through a stub bwrap/sysctl, and native
 # bubblewrap probes (denial + persistence of legitimate writes; a missing
 # bwrap fails). Synthetic fake HOME only; no real client is ever
 # launched (isolate_test_env traps every client name).
@@ -78,40 +76,6 @@ _yes() { if "$@"; then echo yes; else echo no; fi; }
 
 echo "== Linux host-path gates (${OS}) =="
 H="${FAKE_HOME}"
-
-# ---------------------------------------------------------------------------
-echo "-- agy trust analysis follows the grants"
-_writable() {
-    # $1: path, $2: OS for _wrapper_os, rest: NAME=VALUE env.
-    local path="${1}" os="${2}"; shift 2
-    (
-        { cd "${WORK}" && export "$@" && _load_linux \
-            && source "${REPO_ROOT}/bin/ai_wrapper_data/agy_wrapper_lib.bash"; } >/dev/null 2>&1 \
-            || { echo LOAD_FAILED; exit 0; }
-        _wrapper_os="${os}"; WRAPPER_FLAGS=()
-        if _agy_path_sandbox_writable "${path}" "${FAKE_HOME}/.gemini" 2>/dev/null; then echo yes; else echo no; fi
-    )
-}
-mkdir -p "${H}/Android/sub" "${H}/bin/sub" "${H}/ai-wrapper/.agents/skills/x" "${H}/kind_dot_kube/sub" "${H}/.kind/sub"
-for os in Linux Darwin; do
-    assert_eq "$(_writable "${H}/bin/sub" "${os}" _NOOP=1)" no "${os}: ~/bin not writable by default"
-    assert_eq "$(_writable "${H}/ai-wrapper/.agents/skills/x" "${os}" _NOOP=1)" no "${os}: skills not writable by default"
-    assert_eq "$(_writable "${H}/Android/sub" "${os}" _NOOP=1)" no "${os}: ~/Android not writable by default"
-    assert_eq "$(_writable "${H}/kind_dot_kube/sub" "${os}" AI_SANDBOX_PASS_KUBE=1)" no "${os}: ~/kind_dot_kube never writable"
-    assert_eq "$(_writable "${H}/.kind/sub" "${os}" AI_SANDBOX_PASS_KUBE=1)" no "${os}: ~/.kind never writable"
-    assert_eq "$(_writable "${WORK}/x" "${os}" _NOOP=1)" yes "${os}: WORKDIR still writable"
-    assert_eq "$(_writable "${H}/bin/sub" "${os}" AI_SANDBOX_EXTRA_RW_DIRS="${H}/bin")" yes \
-        "${os}: explicit RW extra over ~/bin still counts"
-done
-assert_eq "$(_writable "${H}/bin/sub" Linux AI_SANDBOX_ALLOW_BIN_RW=1)" yes "Linux: ALLOW_BIN_RW=1 makes ~/bin writable"
-assert_eq "$(_writable "${H}/ai-wrapper/.agents/skills/x" Linux AI_SANDBOX_ALLOW_AGENTS_SKILLS_RW=1)" yes \
-    "Linux: ALLOW_AGENTS_SKILLS_RW=1 makes skills writable"
-assert_eq "$(_writable "${H}/Android/sub" Linux AI_SANDBOX_ALLOW_ANDROID=1)" yes "Linux: ALLOW_ANDROID=1 makes ~/Android writable"
-assert_eq "$(_writable "${H}/ai-wrapper/.agents/skills/x" Linux AI_SANDBOX_EXTRA_RW_DIRS="${H}/ai-wrapper")" yes \
-    "Linux: RW extra on a parent of the skills dir counts"
-assert_eq "$(_writable "${H}/bin/sub" Darwin AI_SANDBOX_ALLOW_BIN_RW=1)" no "Darwin: Linux-only toggle grants nothing"
-assert_eq "$(_writable "${H}/bin/sub" Linux AI_SANDBOX_ALLOW_BIN_RW=yes)" no "Linux: non-1 toggle value grants nothing"
-rm -rf "${H}/Android" "${H}/bin/sub" "${H}/ai-wrapper/.agents/skills/x" "${H}/kind_dot_kube/sub" "${H}/.kind/sub"
 
 # ---------------------------------------------------------------------------
 if [[ "${OS}" != "Linux" ]]; then

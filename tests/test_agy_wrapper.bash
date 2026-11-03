@@ -3,7 +3,8 @@
 #   - agy orchestrate / resume / start argv construction
 #   - AGY_ACCOUNT validation and binding (invalid name, missing profile,
 #     default ~/.gemini symlink guards, credential-dir symlink refusal)
-#   - read-only settings.json validation (antigravity-cli/settings.json) and
+#   - invocation-local `--settings '<JSON>'` permissions (host
+#     antigravity-cli/settings.json is never read, created or edited) and
 #     managed skill sync (config/skills/orchestrator-mode/SKILL.md)
 #   - per-agent per-workdir presets (<hash>-agy.env isolation from claude/codex)
 #   - agy-help.md OS-conditional rendering
@@ -67,6 +68,31 @@ assert_eq "${rc}" "0" "agy orchestrate succeeds"
 assert_eq "${out}" \
     "agy${NL}${SEP}${NL}--bind${NL}/w${NL}/w${NL}${SEP}${NL}--dangerously-skip-permissions${NL}--prompt-interactive${NL}Orchestrate \"now\"${NL}line two" \
     "agy orchestrate: --prompt-interactive <orchestrator prompt>"
+
+# ---------------------------------------------------------------------------
+echo "-- invocation-local --settings JSON (_agy_build_settings_json)"
+# Parse the JSON with python3 and print it in a canonical form.
+_json_canon() { python3 -I -c 'import json,sys;d=json.load(sys.stdin);print(json.dumps(d,sort_keys=True))'; }
+_expected_settings() {
+    python3 -I -c 'import json,sys;print(json.dumps({"toolPermission":"always-proceed","artifactReviewPolicy":"always-proceed","allowNonWorkspaceAccess":True,"enableTerminalSandbox":False,"trustedWorkspaces":[sys.argv[1]]},sort_keys=True))' "${1}"
+}
+out="$( cd "${FAKE_HOME}/work" && _load agy && _agy_build_settings_json )"
+assert_eq "$(_json_canon <<<"${out}")" "$(_expected_settings "${FAKE_HOME}/work")" \
+    "default: the five sandbox keys, trusting the resolved current directory"
+assert_not_contains "${out}" "${NL}" "... as one compact argv token"
+ln -s "${FAKE_HOME}/work" "${FAKE_HOME}/work-link"
+out="$( cd "${FAKE_HOME}/work-link" && _load agy && _agy_build_settings_json )"
+assert_eq "$(_json_canon <<<"${out}")" "$(_expected_settings "${FAKE_HOME}/work")" \
+    "a symlinked workdir is trusted by its canonical path"
+rm -f "${FAKE_HOME}/work-link"
+for special in '/p/with space' '/p/"quoted"' '/p/back\slash' "/p/single'quote" $'/p/tab\tnl\nend' $'/p/ctl\x01\x1f' '/p/utf8-é-日本'; do
+    out="$( _load agy && _agy_build_settings_json "${special}" )"
+    assert_eq "$(_json_canon <<<"${out}" 2>&1)" "$(_expected_settings "${special}")" \
+        "path $(printf '%q' "${special}") round-trips through JSON"
+done
+out="$( _load agy && _agy_build_settings_json '/p/"],"toolPermission":"request-review' )"
+assert_eq "$(_json_canon <<<"${out}" 2>&1)" "$(_expected_settings '/p/"],"toolPermission":"request-review')" \
+    "a path cannot inject or override settings keys"
 
 # ---------------------------------------------------------------------------
 echo "-- interactive resume conversation picker (_agy_list_conversations / _agent_resume_args)"
@@ -282,17 +308,10 @@ assert_contains "${err_out}" "ValueError" "_agy_list_conversations: stderr expos
 echo "  skip - real agy argv acceptance (manual check only; no live clients in tests)"
 
 # ---------------------------------------------------------------------------
-echo "-- AGY_ACCOUNT binding, settings validation, and skills sync"
-# Write a settings.json that passes validation for the given workspaces.
-_write_valid_settings() {
-    local file="${1}"
-    shift
-    mkdir -p "$(dirname "${file}")"
-    python3 -I -c 'import json,sys;print(json.dumps({"toolPermission":"always-proceed","artifactReviewPolicy":"always-proceed","allowNonWorkspaceAccess":True,"enableTerminalSandbox":False,"trustedWorkspaces":sys.argv[1:]}))' "$@" >"${file}"
-}
+echo "-- AGY_ACCOUNT binding, host settings.json untouched, and skills sync"
 # Optional $2 forces the backend (_wrapper_os) so both backends' account
-# policy is covered whichever OS runs the suite. Named-profile settings and
-# skills checks force Linux: macOS refuses named profiles before them.
+# policy is covered whichever OS runs the suite. Named-profile skills checks
+# force Linux: macOS refuses named profiles before them.
 _bind() {
     (
         cd "${FAKE_HOME}/work" || exit 1
@@ -304,6 +323,8 @@ _bind() {
         printf '%s\n' "${WRAPPER_FLAGS[@]}" "NAME=${AI_WRAPPER_AGENT_NAME}"
     ) 2>&1
 }
+# Content, inode, mode and mtime: any rewrite, replace or chmod changes one.
+_snap() { python3 -I -c 'import hashlib,os,sys;p=sys.argv[1];st=os.stat(p);print(hashlib.sha256(open(p,"rb").read()).hexdigest(),st.st_ino,oct(st.st_mode),st.st_mtime_ns)' "${1}"; }
 
 out="$(_bind 'bad/../name')"; rc=$?
 assert_eq "${rc}" "1" "invalid AGY_ACCOUNT name rejected"
@@ -326,45 +347,38 @@ assert_contains "${out}" "Account profile directory not found: ${FAKE_HOME}/.gem
 assert_contains "${out}" "Available profiles: alt" "... and listing existing profiles"
 
 alt_file="${FAKE_HOME}/.gemini-alt/antigravity-cli/settings.json"
-alt_before="$(cat "${alt_file}")"
+alt_before="$(_snap "${alt_file}")"
 
-# macOS refuses a named profile before reading its settings.json or
-# syncing skills into it.
+# macOS refuses a named profile before syncing skills into it.
 out="$(_bind 'alt')"; rc=$?
 if [[ "${OS}" == "Darwin" ]]; then
     assert_eq "${rc}" "1" "named profile refused on macOS (no remapping)"
     assert_contains "${out}" "AGY_ACCOUNT='alt' is not supported on macOS" "... with the platform error"
 else
-    assert_eq "${rc}" "1" "named profile with invalid settings.json fails on Linux"
+    assert_eq "${rc}" "0" "named profile binds on Linux whatever its settings.json holds"
 fi
 out="$(_bind 'alt' Darwin)"; rc=$?
 assert_eq "${rc}" "1" "macOS backend: named profile refused"
 assert_contains "${out}" "AGY_ACCOUNT='alt' is not supported on macOS" "macOS backend: error names the setting and profile"
 assert_contains "${out}" "AGY_ACCOUNT=private" "macOS backend: error names the remedy"
-assert_not_contains "${out}" "toolPermission" "macOS backend: refused before the settings.json check"
 assert_not_contains "${out}" "--bind" "macOS backend: no bind emitted for a refused profile"
 out="$(_bind 'bad/../name' Darwin)"; rc=$?
 assert_eq "${rc}" "1" "macOS backend: invalid name still rejected"
 assert_contains "${out}" "Invalid AGY_ACCOUNT" "... by name validation first"
-
-out="$(_bind 'alt' Linux)"; rc=$?
-assert_eq "${rc}" "1" "settings.json lacking the sandbox settings fails the bind"
-assert_contains "${out}" '"toolPermission" is "request-review"; required: "always-proceed"' "... naming each wrong setting"
-assert_contains "${out}" '"enableTerminalSandbox" is true; required: false' "... including the terminal sandbox"
-assert_contains "${out}" "does not include the current workspace \"${FAKE_HOME}/work\"" "... and the missing workspace trust"
-assert_contains "${out}" "then relaunch" "... with how to retry"
-assert_eq "$(cat "${alt_file}")" "${alt_before}" "... and the wrapper never edits settings.json"
-
-_write_valid_settings "${alt_file}" /existing/workspace "${FAKE_HOME}/work"
+rm -rf "${FAKE_HOME}/.gemini-alt/config"
 out="$(_bind 'alt' Darwin)"; rc=$?
-assert_eq "${rc}" "1" "macOS backend: named profile refused even with valid settings.json"
 synced=0; [[ -e "${FAKE_HOME}/.gemini-alt/config" ]] && synced=1
 assert_eq "${synced}" "0" "macOS backend: no skills synced into the refused profile"
 
 out="$(_bind 'alt' Linux)"; rc=$?
-assert_eq "${rc}" "0" "existing named profile binds once settings.json is valid"
-assert_eq "${out}" "--bind${NL}${FAKE_HOME}/.gemini-alt${NL}${FAKE_HOME}/.gemini${NL}NAME=Antigravity CLI [alt]" "named profile remapped to ~/.gemini"
-
+assert_eq "${rc}" "0" "existing named profile binds with a non-sandbox settings.json (${out})"
+assert_eq "$(printf '%s\n' "${out}" | head -3)" "--bind${NL}${FAKE_HOME}/.gemini-alt${NL}${FAKE_HOME}/.gemini" "named profile remapped to ~/.gemini"
+assert_contains "${out}" "--ro-bind${NL}${FAKE_HOME}/.gemini-alt/antigravity-cli/settings.json${NL}${FAKE_HOME}/.gemini/antigravity-cli/settings.json" \
+    "named profile: host settings.json read-only at ~/.gemini (#87)"
+assert_eq "${out##*${NL}}" "NAME=Antigravity CLI [alt]" "named profile: agent name names the account"
+assert_eq "$(_snap "${alt_file}")" "${alt_before}" "... and its settings.json is untouched (content, inode, mode, mtime)"
+assert_contains "$(cat "${alt_file}")" '"toolPermission": "request-review"' "... keeping the user's own toolPermission"
+assert_eq "$(ls -A "${FAKE_HOME}/.gemini-alt/antigravity-cli")" "settings.json" "... with no temp or backup files beside it"
 
 skill_synced=0
 [[ -f "${FAKE_HOME}/.gemini-alt/config/skills/orchestrator-mode/SKILL.md" ]] && skill_synced=1
@@ -379,14 +393,11 @@ assert_eq "$(cat "${FAKE_HOME}/.gemini-alt/config/skills/orchestrator-mode/SKILL
     "unmanaged skill directory is not overwritten"
 
 out="$(_bind 'private')"; rc=$?
-assert_eq "${rc}" "1" "default account without settings.json fails the bind"
-assert_contains "${out}" "${FAKE_HOME}/.gemini/antigravity-cli/settings.json: does not exist" "... naming the file to create"
+assert_eq "${rc}" "0" "default account binds without any settings.json (${out})"
 created=0; [[ -d "${FAKE_HOME}/.gemini" ]] && created=1
 assert_eq "${created}" "1" "default ~/.gemini is created when absent"
-assert_eq "$([[ -e "${FAKE_HOME}/.gemini/antigravity-cli/settings.json" ]] && echo yes || echo no)" "no" "... but settings.json is not"
-_write_valid_settings "${FAKE_HOME}/.gemini/antigravity-cli/settings.json" "${FAKE_HOME}/work"
-out="$(_bind 'private')"; rc=$?
-assert_eq "${rc}" "0" "default account binds once settings.json is valid"
+assert_eq "$([[ -e "${FAKE_HOME}/.gemini/antigravity-cli/settings.json" ]] && echo yes || echo no)" "no" \
+    "... but antigravity-cli/settings.json is never created"
 assert_eq "${out##*${NL}}" "NAME=Antigravity CLI" "default account keeps the plain agent name"
 assert_eq "$(_bind '')" "$(_bind 'private')" "empty AGY_ACCOUNT behaves like 'private'"
 
@@ -406,7 +417,6 @@ assert_contains "${out}" "credential location" "... with credential location err
 rm -f "${FAKE_HOME}/.gemini"
 
 mkdir -p "${FAKE_HOME}/gemini-real"
-_write_valid_settings "${FAKE_HOME}/gemini-real/antigravity-cli/settings.json" "${FAKE_HOME}/work"
 ln -s "${FAKE_HOME}/gemini-real" "${FAKE_HOME}/.gemini"
 out="$(_bind 'private')"; rc=$?
 assert_eq "${rc}" "0" "default ~/.gemini symlinked inside \$HOME is allowed"
@@ -491,7 +501,7 @@ echo "-- end-to-end: real agy wrapper + stub agy in ~/.local/bin inside sandbox"
 if [[ "${OS}" == "Linux" ]] && command -v bwrap >/dev/null 2>&1; then
     mkdir -p "${FAKE_HOME}/.local/bin" "${FAKE_HOME}/.gemini-alt"
     echo "alt-gemini-profile" >"${FAKE_HOME}/.gemini-alt/marker"
-    _write_valid_settings "${FAKE_HOME}/.gemini-alt/antigravity-cli/settings.json" "${FAKE_HOME}/work"
+    alt_before="$(_snap "${alt_file}")"
     # Inside bwrap, PATH is ~/bin:<system dirs>:~/.local/bin. Without the
     # ~/bin trap, an agy in a system dir would beat the ~/.local/bin stub, so
     # the trap is only dropped when no such agy exists; otherwise the stub
@@ -522,7 +532,10 @@ STUB
         bash "${REPO_ROOT}/bin/executable_agy_wrapper.bash" chat hello </dev/null 2>&1)"
     rc=$?
     assert_eq "${rc}" "0" "wrapper launches stub agy from ~/.local/bin inside sandbox"
-    assert_contains "${out}" "ARGV:--dangerously-skip-permissions chat hello" "non-interactive argv is AGENT_FLAGS + user args"
+    expected_settings="$( cd "${FAKE_HOME}/work" && _load agy && _agy_build_settings_json )"
+    assert_contains "${out}" "ARGV:--dangerously-skip-permissions --settings ${expected_settings} chat hello" \
+        "non-interactive argv is AGENT_FLAGS (with session-only --settings) + user args"
+    assert_eq "$(_snap "${alt_file}")" "${alt_before}" "host settings.json is untouched by a wrapper run"
     assert_contains "${out}" "alt-gemini-profile" "\$HOME/.gemini-alt is visible at \$HOME/.gemini inside the sandbox"
     assert_contains "${out}" "SETTINGS_OK" "antigravity-cli/settings.json is visible inside the sandbox"
     assert_contains "${out}" "SKILL_OK" "orchestrator-mode skill is visible inside the sandbox"
@@ -539,7 +552,6 @@ STUB
         git_q init "${FAKE_HOME}/repos/main"
         git_q -C "${FAKE_HOME}/repos/main" commit --allow-empty -m init
         git_q -C "${FAKE_HOME}/repos/main" worktree add "${FAKE_HOME}/wt" -b wt
-        _write_valid_settings "${FAKE_HOME}/.gemini/antigravity-cli/settings.json" "${FAKE_HOME}/wt"
         cat >"${FAKE_HOME}/.local/bin/agy" <<'STUB'
 #!/bin/bash
 git log --format='LOG:%s' -1 2>&1

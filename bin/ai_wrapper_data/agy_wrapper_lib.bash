@@ -61,7 +61,7 @@ _agy_list_account_profiles() {
 }
 
 # Host-side filesystem helper for the operations above the OS sandbox:
-# conversation listing/rename/delete and read-only settings.json validation.
+# conversation listing/rename/delete.
 # It runs on the host before the sandbox exists, so:
 #   - `python3 -I` keeps the CWD (a possibly hostile checkout), PYTHONPATH and
 #     user site-packages off sys.path: a checkout `json.py` never executes;
@@ -69,7 +69,6 @@ _agy_list_account_profiles() {
 #     with O_NOFOLLOW and directory-relative (*at) calls, so a symlinked
 #     antigravity-cli/, brain/, conversations/, database or title file is
 #     refused instead of followed;
-#   - settings.json is only read and checked, never created or rewritten;
 #   - the rename title file is replaced via an O_EXCL temp file + rename in
 #     the verified directory, after re-checking the file and parent are
 #     unchanged, while holding an advisory flock on that directory (serialises wrapper
@@ -81,7 +80,7 @@ _agy_list_account_profiles() {
 # Platforms lacking dir_fd/O_NOFOLLOW support fail closed. Python 3 is
 # required for every operation but listing; there is no jq/sqlite3 fallback
 # because neither can enforce the same boundary.
-# Usage: _agy_host_py <list|rename|delete|settings> ARGS...
+# Usage: _agy_host_py <list|rename|delete> ARGS...
 _agy_host_py() {
     python3 -I - "$@" <<'PY'
 import contextlib, errno, fcntl, json, os, re, secrets, shutil, signal, sqlite3, stat, sys, tempfile, time, traceback
@@ -91,7 +90,6 @@ CLI_DIR_NAME = "antigravity-cli"
 DB_NAME = "conversation_summaries.db"
 SQLITE_SIDECAR_SUFFIXES = ("-journal", "-wal", "-shm")
 TITLE_NAME = ".wrapper_title"
-SETTINGS_NAME = "settings.json"
 MAX_TITLE_BYTES = 4096
 NEW_FILE_MODE = 0o600
 NEW_DIR_MODE = 0o777  # narrowed by the umask, like `mkdir -p`
@@ -100,20 +98,6 @@ WRITE_LOCK_POLL_SECONDS = 0.05
 SQLITE_PROBE_PREFIX = "agy-sqlite-probe-"
 SQLITE_PROBE_CANARY = b"agy sqlite probe canary\n"
 CID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
-# (key, required value, why the sandboxed launch needs it)
-REQUIRED_SETTINGS = (
-    ("toolPermission", "always-proceed", "tool calls must not block on approval prompts"),
-    ("artifactReviewPolicy", "always-proceed", "artifact edits must not block on review prompts"),
-    ("allowNonWorkspaceAccess", True,
-     "sandbox-bound paths outside the workspace (/tmp, ~/bin, extra dirs) must be reachable"),
-    ("enableTerminalSandbox", False, "agy's nested terminal sandbox conflicts with the outer OS sandbox"),
-)
-TRUSTED_WORKSPACES_KEY = "trustedWorkspaces"
-CREDENTIAL_DIRS = (
-    ".ssh", ".gnupg", ".aws", ".kube", ".docker", ".colima", ".netrc", ".npmrc",
-    ".pypirc", ".config/gcloud", ".config/glab-cli", ".local/share/glab-cli",
-    "Library/Application Support/glab-cli",
-)
 O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
 O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
@@ -798,144 +782,11 @@ def cmd_delete(profile_dir, cid, busy_timeout_ms):
     return 0 if ok else 1
 
 
-def workspace_path(entry):
-    if not isinstance(entry, str) or not entry:
-        return None
-    if entry.startswith("file://"):
-        entry = unquote(urlparse(entry).path)
-    return os.path.normpath(entry)
-
-
-def settings_problems(data, workdir):
-    """Human-readable list of what `data` lacks for a sandboxed launch."""
-    problems = []
-    for key, required, why in REQUIRED_SETTINGS:
-        if key not in data:
-            problems.append("%s is missing; required: %s (%s)" % (json.dumps(key), json.dumps(required), why))
-        elif data[key] != required or type(data[key]) is not type(required):
-            problems.append("%s is %s; required: %s (%s)"
-                            % (json.dumps(key), json.dumps(data[key]), json.dumps(required), why))
-    trusted = data.get(TRUSTED_WORKSPACES_KEY)
-    if not isinstance(trusted, list):
-        problems.append("%s is %s; required: a list that includes %s (agy must not prompt for workspace trust)"
-                        % (json.dumps(TRUSTED_WORKSPACES_KEY),
-                           "missing" if trusted is None else "not a list", json.dumps(workdir)))
-    elif workdir not in [workspace_path(entry) for entry in trusted]:
-        problems.append("%s does not include the current workspace %s (agy must not prompt for workspace trust)"
-                        % (json.dumps(TRUSTED_WORKSPACES_KEY), json.dumps(workdir)))
-    return problems
-
-
-def required_settings_snippet(data, workdir):
-    trusted = data.get(TRUSTED_WORKSPACES_KEY)
-    trusted = list(trusted) if isinstance(trusted, list) else []
-    if workdir not in [workspace_path(entry) for entry in trusted]:
-        trusted.append(workdir)
-    snippet = dict((key, required) for key, required, _why in REQUIRED_SETTINGS)
-    snippet[TRUSTED_WORKSPACES_KEY] = trusted
-    return json.dumps(snippet, indent=2, ensure_ascii=False)
-
-
-def settings_refusal(display, edit_path, headline, problems, data, workdir):
-    lines = ["%s: %s" % (display, headline)]
-    lines += ["  - " + problem for problem in problems]
-    lines.append("The wrapper only reads this file; it never creates or edits it. %s %s so that it contains"
-                 " (keep your other settings), then relaunch the wrapper:"
-                 % ("Edit" if data is not None else "Create", edit_path))
-    lines.append(required_settings_snippet(data or {}, workdir))
-    return Refused("\n".join(lines))
-
-
-def cmd_settings(profile_dir, workdir, home, trust_profile, trust_target, trust_refusal):
-    """Read-only check that settings.json allows an unattended sandboxed
-    launch in `workdir`. Never creates, rewrites, chmods or replaces the file
-    (or an approved symlink target), and never creates its parent."""
-    workdir = os.path.normpath(workdir)
-    profile = Profile(profile_dir)
-    settings_path = os.path.join(profile.cli_path, SETTINGS_NAME)
-    cli_fd = profile.cli()
-    if cli_fd is None:
-        headline = "does not exist (nor does its directory %s/; create that first)" % profile.cli_path
-        raise settings_refusal(settings_path, settings_path, headline, [], None, workdir)
-    st = leaf_stat(cli_fd, SETTINGS_NAME)
-    if st is not None and stat.S_ISLNK(st.st_mode):
-        dir_fd, name, edit_path = trusted_settings_target(
-            profile, cli_fd, home, trust_profile, trust_target, trust_refusal)
-        display = "%s (-> %s)" % (settings_path, edit_path)
-    elif st is None or stat.S_ISREG(st.st_mode):
-        dir_fd, name, display, edit_path = cli_fd, SETTINGS_NAME, settings_path, settings_path
-    else:
-        raise Refused("%s exists but is not a regular file; replace it with a JSON settings file." % settings_path)
-    raw, _ = read_regular(dir_fd, name, display)
-    if raw is None:
-        raise settings_refusal(display, edit_path, "does not exist", [], None, workdir)
-    try:
-        data = json.loads(raw.decode("utf-8")) if raw.strip() else {}
-    except (UnicodeDecodeError, ValueError) as exc:
-        raise Refused("%s is not valid JSON (%s). Fix the file by hand (the wrapper never creates or edits it), "
-                      "then relaunch the wrapper." % (display, exc))
-    if not isinstance(data, dict):
-        raise Refused("%s does not hold a JSON object. Fix the file by hand (the wrapper never creates or edits it), "
-                      "then relaunch the wrapper." % display)
-    problems = settings_problems(data, workdir)
-    if problems:
-        raise settings_refusal(display, edit_path, "not ready for a sandboxed agy launch:",
-                               problems, data, workdir)
-    return 0
-
-
-def is_canonical(path):
-    return bool(path) and os.path.isabs(path) and "\n" not in path and os.path.realpath(path) == path
-
-
-def trusted_settings_target(profile, cli_fd, home, trust_profile, trust_target, trust_refusal):
-    """Resolve the approved target of a symlinked settings.json (read only).
-    Returns (dir_fd, name, path)."""
-    settings_path = os.path.join(profile.cli_path, SETTINGS_NAME)
-    link = os.readlink(SETTINGS_NAME, dir_fd=cli_fd)
-    hint = ("Approve exactly this profile and target via the Settings menu "
-            "(AGY_SETTINGS_TRUSTED_PROFILE + AGY_SETTINGS_TRUSTED_TARGET), "
-            "or replace the symlink with a regular file.")
-    if trust_refusal:
-        raise Refused("%s is a symlink and its trusted-target approval cannot be used: %s"
-                      % (settings_path, trust_refusal))
-    if not trust_profile or not trust_target:
-        raise Refused("%s is a symlink (-> %s); refusing to read through it. %s" % (settings_path, link, hint))
-    if trust_profile != profile.path:
-        raise Refused("%s is a symlink, but the trusted-target approval is for profile %s, not the selected profile %s. %s"
-                      % (settings_path, trust_profile, profile.path, hint))
-    if not is_canonical(trust_target):
-        raise Refused("AGY_SETTINGS_TRUSTED_TARGET must be an absolute canonical path without symlinks (got %s)"
-                      % trust_target)
-    resolved = os.path.realpath(link if os.path.isabs(link) else os.path.join(profile.cli_path, link))
-    if resolved != trust_target:
-        raise Refused("%s resolves to %s, not the approved target %s; refusing to read through it."
-                      % (settings_path, resolved, trust_target))
-    home_real = os.path.realpath(home)
-    if not trust_target.startswith(home_real.rstrip("/") + "/"):
-        raise Refused("approved settings target %s is outside $HOME; refusing to use it." % trust_target)
-    for cred in CREDENTIAL_DIRS:
-        cred_path = os.path.join(home_real, cred)
-        if trust_target == cred_path or trust_target.startswith(cred_path + "/"):
-            raise Refused("approved settings target %s is in a credential location; refusing to use it."
-                          % trust_target)
-    dir_path, name = os.path.split(trust_target)
-    dir_fd = open_dir_path(dir_path)
-    st = leaf_stat(dir_fd, name)
-    if st is None:
-        raise Refused("approved settings target %s does not exist (dangling symlink); create that file, then relaunch."
-                      % trust_target)
-    if not stat.S_ISREG(st.st_mode):
-        raise Refused("approved settings target %s is not a regular file; refusing to use it." % trust_target)
-    return dir_fd, name, trust_target
-
-
 def raise_exit(signum, _frame):
     raise SystemExit(128 + signum)
 
 
-COMMANDS = {"list": (cmd_list, 3), "rename": (cmd_rename, 3), "delete": (cmd_delete, 3),
-            "settings": (cmd_settings, 6)}
+COMMANDS = {"list": (cmd_list, 3), "rename": (cmd_rename, 3), "delete": (cmd_delete, 3)}
 
 
 def main(argv):
@@ -944,7 +795,7 @@ def main(argv):
         if hasattr(signal, signame):
             signal.signal(getattr(signal, signame), raise_exit)
     if len(argv) < 1 or argv[0] not in COMMANDS or len(argv) - 1 != COMMANDS[argv[0]][1]:
-        sys.stderr.write("usage: <list|rename|delete|settings> ARGS...\n")
+        sys.stderr.write("usage: <list|rename|delete> ARGS...\n")
         return 2
     try:
         require_capabilities()
@@ -1370,140 +1221,48 @@ _agent_resume_args() {
     done
 }
 
-# Exact trusted target for a symlinked <profile>/antigravity-cli/settings.json.
-# Both values must be set and match: the approval is bound to one resolved
-# profile directory AND one existing canonical file, so switching accounts
-# never reuses another profile's approval. Empty (default) = a symlinked
-# settings.json is refused. Persisted in this workdir's agy preset; refused
-# when that preset is writable from inside the sandbox, or when a plugin
-# hook can add sandbox binds after the check (_AGY_LATE_BIND_HOOKS).
-_AI_SETTINGS_LIST+=(
-    "AGY_SETTINGS_TRUSTED_PROFILE|path||yellow|Trusted settings.json profile|Resolved profile dir (e.g. ~/.gemini) whose antigravity-cli/settings.json symlink may be read through. Pair with the target below; empty refuses a symlinked settings.json.|account"
-    "AGY_SETTINGS_TRUSTED_TARGET|path||yellow|Trusted settings.json target file|Exact existing canonical file that profile's settings.json symlink must resolve to. Only this file is checked (read-only); the symlink is kept.|account"
-)
-
-# Expand a leading "~" in a settings-menu path value.
-_agy_expand_tilde() {
-    local p="${1}"
-    # shellcheck disable=SC2088  # matching a literal "~" on purpose
-    if [[ "${p}" == '~' || "${p}" == '~/'* ]]; then
-        p="${HOME}${p#\~}"
-    fi
-    printf '%s' "${p}"
+# Print STRING as a JSON string literal (quotes included). Pure bash, so
+# no host interpreter runs against a possibly hostile checkout. Bytes are
+# walked in the C locale: `"`, `\` and control characters are escaped,
+# everything else (including UTF-8 sequences) passes through unchanged.
+_agy_json_string() {
+    local LC_ALL=C
+    local input="${1}" out="" ch code i
+    for (( i = 0; i < ${#input}; i++ )); do
+        ch="${input:i:1}"
+        case "${ch}" in
+            '"') out+='\"' ;;
+            '\') out+='\\' ;;
+            [[:cntrl:]])
+                printf -v code '%d' "'${ch}"
+                printf -v ch '\\u%04x' "${code}"
+                out+="${ch}"
+                ;;
+            *) out+="${ch}" ;;
+        esac
+    done
+    printf '"%s"' "${out}"
 }
 
-# Canonicalize PATH even when its tail does not exist yet (preset dirs are
-# created lazily): resolve the deepest existing ancestor, re-append the rest.
-_agy_canonical_path() {
-    local p="${1%/}" rest="" resolved
-    while [[ -n "${p}" && ! -e "${p}" ]]; do
-        rest="/${p##*/}${rest}"
-        p="${p%/*}"
-    done
-    resolved="$(_realpath "${p:-/}" 2>/dev/null)" || resolved="${p}"
-    printf '%s%s' "${resolved%/}" "${rest}"
-}
-
-# Plugin hooks that run after the trust decision and can add RW binds
-# (_extra_post_menu_setup to WRAPPER_FLAGS, _extra_sandbox_setup to the
-# final bwrap/Seatbelt bind lists). What they expose is unknown until launch.
-_AGY_LATE_BIND_HOOKS=(_extra_post_menu_setup _extra_sandbox_setup)
-
-# Succeeds when PATH (canonicalized) lies inside a location the sandbox
-# exposes read-write: WORKDIR, the profile dir, the Linux host dirs whose
-# RW opt-in is on (~/bin, ~/ai-wrapper/.agents, ~/Android; read-only or
-# absent otherwise; the host XDG_RUNTIME_DIR with
-# AI_SANDBOX_ALLOW_XDG_RUNTIME_RW=1), AI_SANDBOX_EXTRA_RW_DIRS, every --bind
-# already in WRAPPER_FLAGS, and the macOS shared temp dirs. A parent grant
-# still covers a protected child. By default the sandbox's runtime dir is a
-# private tmpfs directory, even when it reuses the host path, so the host
-# runtime dir is not a root then. Args: PATH PROFILE_DIR
-_agy_path_sandbox_writable() {
-    local path profile_dir="${2}" root
-    path="$(_agy_canonical_path "${1}")"
-    local -a roots=("$(pwd -P)" "${profile_dir}")
-    # shellcheck disable=SC2154  # _wrapper_os is set by ai_wrapper_lib.bash
-    if [[ "${_wrapper_os}" == "Linux" ]]; then
-        # Canonicalized below, so this is the dir the launch validates and
-        # binds (or refuses to launch with).
-        [[ "${AI_SANDBOX_ALLOW_XDG_RUNTIME_RW:-0}" == "1" ]] && roots+=("${XDG_RUNTIME_DIR:-}")
-        [[ "${AI_SANDBOX_ALLOW_BIN_RW:-0}" == "1" ]] && roots+=("${HOME}/bin")
-        [[ "${AI_SANDBOX_ALLOW_AGENTS_SKILLS_RW:-0}" == "1" ]] && roots+=("${HOME}/ai-wrapper/.agents")
-        [[ "${AI_SANDBOX_ALLOW_ANDROID:-0}" == "1" ]] && roots+=("${HOME}/Android")
+# Session-only agy settings, passed as `--settings '<JSON>'` (agy applies
+# them for this invocation and never saves them), so the host
+# <profile>/antigravity-cli/settings.json is never read, created or
+# rewritten, and concurrent wrappers in different workdirs cannot race:
+#   - toolPermission / artifactReviewPolicy "always-proceed": tool calls and
+#     artifact edits do not block on approval prompts
+#   - allowNonWorkspaceAccess=true: sandbox-bound paths outside WORKDIR
+#     (/tmp, ~/bin, AI_SANDBOX_EXTRA_*_DIRS, worktree common dirs) are usable
+#   - enableTerminalSandbox=false: agy is already confined by the outer
+#     bubblewrap / Seatbelt sandbox; a nested one fails or conflicts
+#   - trustedWorkspaces=[WORKDIR]: no workspace-trust prompt on launch
+# Args: [WORKDIR] (default: the resolved current directory).
+_agy_build_settings_json() {
+    local wd="${1:-}"
+    if [[ -z "${wd}" ]]; then
+        wd="$(_realpath "$(pwd -P)" 2>/dev/null)" || wd="$(pwd -P)"
     fi
-    local -a flags=(${WRAPPER_FLAGS[@]+"${WRAPPER_FLAGS[@]}"})
-    local i
-    for (( i = 0; i < ${#flags[@]}; i++ )); do
-        [[ "${flags[${i}]}" == "--bind" ]] && roots+=("${flags[$((i + 1))]:-}")
-    done
-    if [[ -n "${AI_SANDBOX_EXTRA_RW_DIRS:-}" ]]; then
-        local -a extra=()
-        IFS=',' read -r -a extra <<<"${AI_SANDBOX_EXTRA_RW_DIRS}"
-        for root in ${extra[@]+"${extra[@]}"}; do
-            root="${root#"${root%%[![:space:]]*}"}"
-            root="${root%"${root##*[![:space:]]}"}"
-            [[ -n "${root}" ]] && roots+=("$(_agy_expand_tilde "${root}")")
-        done
-    fi
-    if [[ "${_wrapper_os}" == "Darwin" ]]; then
-        roots+=(/tmp /private/tmp "$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null)" \
-            "$(getconf DARWIN_USER_CACHE_DIR 2>/dev/null)")
-    fi
-    for root in "${roots[@]}"; do
-        [[ -n "${root}" && -e "${root}" ]] || continue
-        root="$(_agy_canonical_path "${root}")"
-        [[ "${path}" == "${root}" || "${path}" == "${root}/"* ]] && return 0
-    done
-    return 1
-}
-
-# Read-only check that the active profile's antigravity-cli/settings.json
-# lets agy run unattended inside the outer OS sandbox (bubblewrap / Seatbelt):
-#   - toolPermission="always-proceed" & artifactReviewPolicy="always-proceed"
-#     so tool calls and artifact edits do not block on interactive prompts
-#   - allowNonWorkspaceAccess=true so extra sandbox-bound paths (/tmp, ~/bin,
-#     AI_SANDBOX_EXTRA_*_DIRS, git worktree common dirs) are accessible
-#   - enableTerminalSandbox=false because agy is already confined by the
-#     outer ai-wrapper OS sandbox (nested bwrap/sandbox-exec fails or
-#     conflicts with outer bind mounts)
-#   - trustedWorkspaces includes the resolved WORKDIR so agy does not
-#     prompt for workspace trust on launch
-# The file (or its approved symlink target) is never created, rewritten,
-# chmod'ed or replaced, and its parent is never created: when anything is
-# missing or invalid the launch fails with what to change and how to retry.
-# A symlinked settings.json is read only through the exact approved
-# AGY_SETTINGS_TRUSTED_TARGET of this profile; otherwise it is refused.
-_agy_validate_settings() {
-    local profile_dir wd
-    profile_dir="$(_agy_canonical_profile_dir "${1}")"
-
-    if ! command -v python3 >/dev/null 2>&1; then
-        echo "ERROR: python3 is required to check ${profile_dir}/antigravity-cli/settings.json safely; install python3 and relaunch." >&2
-        return 1
-    fi
-
-    local trust_profile trust_target trust_refusal="" preset_path preset_dir
-    trust_profile="$(_agy_expand_tilde "${AGY_SETTINGS_TRUSTED_PROFILE:-}")"
-    trust_target="$(_agy_expand_tilde "${AGY_SETTINGS_TRUSTED_TARGET:-}")"
-    if [[ -n "${trust_profile}" || -n "${trust_target}" ]]; then
-        local hook late_hook=""
-        for hook in "${_AGY_LATE_BIND_HOOKS[@]}"; do
-            declare -f "${hook}" >/dev/null 2>&1 && late_hook="${hook}" && break
-        done
-        if [[ -z "${trust_profile}" || -z "${trust_target}" ]]; then
-            trust_refusal="AGY_SETTINGS_TRUSTED_PROFILE and AGY_SETTINGS_TRUSTED_TARGET must both be set"
-        elif [[ -n "${late_hook}" ]]; then
-            trust_refusal="the AI_WRAPPER_EXTRA_PROFILE plugin defines ${late_hook}, which can add sandbox binds after this check, so whether the preset directory is writable inside the sandbox cannot be determined"
-        elif ! preset_path="$(_preset_autosave_path)" || ! preset_dir="$(dirname "${preset_path}")"; then
-            trust_refusal="the per-workdir preset location cannot be determined"
-        elif _agy_path_sandbox_writable "${preset_dir}" "${profile_dir}"; then
-            trust_refusal="the preset directory ${preset_dir} is writable inside the sandbox, so a sandboxed agent could forge the approval"
-        fi
-    fi
-
-    wd="$(_realpath "$(pwd -P)" 2>/dev/null)" || wd="$(pwd -P)"
-    _agy_host_py settings "${profile_dir}" "${wd}" "${HOME}" \
-        "${trust_profile}" "${trust_target}" "${trust_refusal}"
+    printf '{"toolPermission":"always-proceed","artifactReviewPolicy":"always-proceed","allowNonWorkspaceAccess":true,"enableTerminalSandbox":false,"trustedWorkspaces":[%s]}' \
+        "$(_agy_json_string "${wd}")"
 }
 
 # Sync managed ai-wrapper skills into <profile_dir>/config/skills/ so
@@ -1565,8 +1324,28 @@ _agy_sync_profile_skills() {
     return 0
 }
 
-# Resolve AGY_ACCOUNT to the profile dir, check its settings.json, sync
-# global skills, and append its bind (at ~/.gemini) to WRAPPER_FLAGS.
+# ===== PERSISTENT CONTROLS (#48 / #87) =====
+# Paths under the profile dir that every later Antigravity (and Gemini
+# CLI) session loads: settings, hooks, MCP servers, global rules and
+# prompts, workflows, sidecars, custom agents, plugins and skills.
+# _bind_agy_account keeps the ones present at launch read-only via
+# _wrapper_protect_client_controls, after _agy_sync_profile_skills has
+# refreshed the managed skills on the host. Session state stays writable:
+# antigravity-cli/ OAuth token, conversation databases, brain/,
+# conversations/, presence, cache and logs; config/projects (agy's
+# per-project registry) is runtime state too.
+_AGY_CLIENT_CONTROLS=(
+    antigravity-cli/settings.json antigravity-cli/hooks.json
+    config/config.json config/mcp_config.json config/hooks.json
+    config/workflows.json config/AGENTS.md config/GEMINI.md
+    config/agents config/global_workflows config/plugins config/rules
+    config/sidecars config/skills config/workflows
+    jetski/sidecars
+    AGENTS.md GEMINI.md settings.json commands extensions
+)
+
+# Resolve AGY_ACCOUNT to the profile dir, sync global skills, and append its
+# bind (at ~/.gemini) and the read-only persistent controls to WRAPPER_FLAGS.
 # Must run AFTER _preset_autoload and the menu — AGY_ACCOUNT isn't
 # authoritative until then. Exits on invalid input, same contract as
 # _bind_codex_account and _bind_claude_account.
@@ -1613,10 +1392,11 @@ _bind_agy_account() {
     bind_src="$(_realpath "${gemini_dir}")" || bind_src="${gemini_dir}"
     _AGY_ACTIVE_PROFILE_DIR="${bind_src}"
 
-    _agy_validate_settings "${bind_src}" || exit 1
     _agy_sync_profile_skills "${bind_src}" || exit 1
 
     _wrapper_add_bind "${bind_src}" "${HOME}/.gemini"
+    _wrapper_protect_client_controls "agy" "${bind_src}" "${HOME}/.gemini" \
+        "${_AGY_CLIENT_CONTROLS[@]}" || exit 1
 }
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
