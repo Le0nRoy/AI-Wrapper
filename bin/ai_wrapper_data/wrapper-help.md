@@ -601,7 +601,9 @@ of symlinks because sandbox-exec on macOS resolves file rules against the
 canonical real path. Each managed copy carries a
 `.setup_skills_managed` marker file recording its source path, so reruns
 refresh the copy in place; non-managed entries in destination skill
-directories are left untouched.
+directories are left untouched. Each copy is staged and marked before it
+replaces the previous entry, so a failed copy keeps the old one; setup then
+exits nonzero and a rerun completes the sync. `--dry` writes nothing.
 
 Run setup with:
 ```sh
