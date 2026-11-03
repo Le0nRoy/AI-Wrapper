@@ -57,7 +57,8 @@ The sandbox bounds *writes* — it does not bound *reads* or *network*. Be aware
 
 - `AI_SANDBOX_ALLOW_RO_HOMEDIR=1` — widen the read allowlist to `$HOME`
   except the credential exclusions in the SBPL profile (the 9 credential
-  dotfiles, `~/.git-credentials`, `~/.config/git/credentials`,
+  dotfiles, `~/.git-credentials`, `~/.config/git/credentials`, the glab
+  config dirs (readable only with `AI_SANDBOX_PASS_GITLAB=1`),
   `~/Library/Keychains`, `~/Library/{Messages, Mail, Cookies}`,
   Chrome/Chromium/Brave/Arc/Edge/Firefox/Vivaldi profiles,
   `~/Library/Containers/com.apple.Safari`, Slack/Discord state,

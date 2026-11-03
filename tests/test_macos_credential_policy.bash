@@ -10,7 +10,11 @@
 #   - Keychain file and SecurityServer/securityd IPC grants are gated on
 #     AI_SANDBOX_ALLOW_KEYCHAIN (default 0) — profile text on any OS,
 #     a synthetic keychain-db file probe on macOS, and a `security` probe
-#     against a throwaway keychain on CI only.
+#     against a throwaway keychain on CI only;
+#   - glab (GitLab CLI) config dirs (default macOS + relocated XDG paths) are
+#     readable only through AI_SANDBOX_PASS_GITLAB, also under
+#     AI_SANDBOX_ALLOW_RO_HOMEDIR=1 (issue #47) — profile text on any OS,
+#     a HOMEDIR x PASS_GITLAB native read matrix on macOS.
 # Off macOS getconf and sandbox-exec are stubbed; only generated text is
 # checked. No real keychain, credential file or client state is touched:
 # every fixture lives in the fake home.
@@ -152,6 +156,28 @@ assert_contains "${SB}" '(require-not (literal  (string-append (param "HOME_DIR"
     "ALLOW_RO_HOMEDIR excludes ~/.git-credentials"
 assert_contains "${SB}" '(require-not (literal  (string-append (param "HOME_DIR") "/.config/git/credentials")))' \
     "ALLOW_RO_HOMEDIR excludes ~/.config/git/credentials"
+# glab config dirs (#47): excluded from ALLOW_RO_HOMEDIR, granted only by
+# PASS_GITLAB. The documented paths (wrapper-help.md) are the default macOS
+# dir plus the relocated XDG config/data dirs.
+GLAB_DIRS=("/Library/Application Support/glab-cli" "/.config/glab-cli" "/.local/share/glab-cli")
+homedir_when="$(_line_of '(when (equal? (param "ALLOW_RO_HOMEDIR") "1")')"
+homedir_block="$(sed -n "${homedir_when:-1},/^\$/p" <<<"${SB}")"
+gitlab_when="$(_line_of '(when (equal? (param "PASS_GITLAB") "1")')"
+gitlab_block="$(sed -n "${gitlab_when:-1},+4p" <<<"${SB}")"
+for glab_dir in "${GLAB_DIRS[@]}"; do
+    rule="(subpath (string-append (param \"HOME_DIR\") \"${glab_dir}\"))"
+    assert_contains "${homedir_block}" "(require-not ${rule})" "ALLOW_RO_HOMEDIR excludes ~${glab_dir}"
+    assert_contains "${gitlab_block}" "${rule}" "PASS_GITLAB grants ~${glab_dir}"
+    hits="$(grep -nF -- "\"${glab_dir}\"))" <<<"${SB}" | grep -v 'require-not' | cut -d: -f1)"
+    ok=1
+    for h in ${hits}; do [[ -n "${gitlab_when}" && "${h}" -gt "${gitlab_when}" && "${h}" -le "$((gitlab_when + 4))" ]] || ok=0; done
+    [[ -n "${hits}" ]] || ok=0
+    assert_eq "${ok}" "1" "~${glab_dir} granted only under PASS_GITLAB"
+done
+out="$(_dryrun)"
+assert_contains "${out}" "PASS_GITLAB=0" "AI_SANDBOX_PASS_GITLAB defaults to PASS_GITLAB=0"
+out="$(AI_SANDBOX_PASS_GITLAB=1 _dryrun)"
+assert_contains "${out}" "PASS_GITLAB=1" "AI_SANDBOX_PASS_GITLAB=1 passes PASS_GITLAB=1"
 # The keychain grants appear only inside the ALLOW_KEYCHAIN block.
 kc_when="$(_line_of '(when (equal? (param "ALLOW_KEYCHAIN") "1")')"
 assert_eq "$(grep -c '"com.apple.SecurityServer"\|"com.apple.securityd"' <<<"${SB}")" "2" "SecurityServer / securityd named once each"
@@ -195,6 +221,34 @@ for homedir in 0 1; do
     assert_contains "${out}" "DENIED:${FAKE_HOME}/.git-credentials" "native ALLOW_RO_HOMEDIR=${homedir}: ~/.git-credentials denied"
     assert_contains "${out}" "DENIED:${FAKE_HOME}/.config/git/credentials" "native ALLOW_RO_HOMEDIR=${homedir}: ~/.config/git/credentials denied"
     assert_contains "${out}" "READ:${FAKE_HOME}/.config/git/ignore" "native ALLOW_RO_HOMEDIR=${homedir}: ~/.config/git/ignore still readable"
+done
+
+echo "-- native: glab config (ALLOW_RO_HOMEDIR x PASS_GITLAB)"
+# Fixtures sit in the fake home under the real $HOME, outside the /tmp and
+# DARWIN_USER_TEMP_DIR trees the profile grants broadly.
+glab_files=(
+    "${FAKE_HOME}/Library/Application Support/glab-cli/config.yml"
+    "${FAKE_HOME}/.config/glab-cli/config.yml"
+    "${FAKE_HOME}/.local/share/glab-cli/state.yml"
+)
+for glab_file in "${glab_files[@]}"; do
+    mkdir -p "$(dirname "${glab_file}")"
+    printf 'token: synthetic-glab-%s\n' "${RUN_ID}" >"${glab_file}"
+done
+benign_file="${FAKE_HOME}/benign-home-${RUN_ID}.txt"
+printf 'benign\n' >"${benign_file}"
+for homedir in 0 1; do
+    for gitlab in 0 1; do
+        label="native ALLOW_RO_HOMEDIR=${homedir} PASS_GITLAB=${gitlab}"
+        out="$(AI_SANDBOX_ALLOW_RO_HOMEDIR=${homedir} AI_SANDBOX_PASS_GITLAB=${gitlab} \
+            _native "${glab_files[@]}" "${benign_file}")"
+        want_glab="DENIED"; [[ "${gitlab}" == "1" ]] && want_glab="READ"
+        want_benign="DENIED"; [[ "${homedir}" == "1" ]] && want_benign="READ"
+        for glab_file in "${glab_files[@]}"; do
+            assert_contains "${out}" "${want_glab}:${glab_file}" "${label}: ${glab_file#"${FAKE_HOME}"/} ${want_glab}"
+        done
+        assert_contains "${out}" "${want_benign}:${benign_file}" "${label}: benign home file ${want_benign} (control)"
+    done
 done
 
 echo "-- native: Keychain file path"

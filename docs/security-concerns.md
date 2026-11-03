@@ -726,6 +726,14 @@ M3, M1, CC-4.
   profile (WORKDIR, `--bind` / `--ro-bind`, `AI_SANDBOX_EXTRA_*_DIRS`)
   still win, as for every other credential path. glab's on-disk token
   stays with `AI_SANDBOX_PASS_GITLAB` (#47).
+- **glab config under `ALLOW_RO_HOMEDIR` (#47).** The glab config dirs
+  (`~/Library/Application Support/glab-cli`, `~/.config/glab-cli`,
+  `~/.local/share/glab-cli`) were missing from the `ALLOW_RO_HOMEDIR`
+  `(require-not …)` chain, so `AI_SANDBOX_ALLOW_RO_HOMEDIR=1` exposed
+  the glab token while `AI_SANDBOX_PASS_GITLAB=0`. **Resolution.** All
+  three are excluded from the chain; the `PASS_GITLAB` rule is now the
+  only base-profile grant on them. A config relocated outside `$HOME`
+  via `XDG_CONFIG_HOME` / `XDG_DATA_HOME` is not covered by either rule.
 - **Keychain (M1).** Formerly S4: `~/Library/Keychains` was RW and the
   `com.apple.SecurityServer` / `com.apple.securityd` Mach lookups were
   always granted. With `(allow process-exec)`, any process in the sandbox
