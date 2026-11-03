@@ -130,9 +130,12 @@ The wrapper makes `~/.gemini-<name>` appear as `~/.gemini` inside the sandbox
 <!-- os:darwin -->
 
 **macOS limitation:** sandbox-exec has no bind-mount remapping, so a named
-profile is granted at its real path (`~/.gemini-<name>`) while Antigravity
-still reads `~/.gemini`, which is then not granted. Account switching is fully
-functional on Linux only (same limitation as the Claude and Codex wrappers).
+profile cannot appear as `~/.gemini`. The wrapper refuses a named
+`AGY_ACCOUNT` on macOS (from the environment, a saved preset or the
+Settings menu) with an error before its settings.json is checked, skills
+are synced or Antigravity starts. Use `AGY_ACCOUNT=private` (or leave it
+unset) on macOS; named account profiles work on Linux only (same as the
+Claude and Codex wrappers).
 <!-- os:end -->
 
 ## Also shared with the Claude and Codex wrappers

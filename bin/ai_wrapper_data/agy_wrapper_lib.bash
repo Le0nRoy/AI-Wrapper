@@ -32,7 +32,7 @@ source "${WRAPPER_DATA_DIR}/ai_wrapper_lib.bash"
 # databases, settings, and global skills inside ~/.gemini, so no separate
 # top-level file bind is needed. Persisted per-workdir by the preset mechanism.
 _AI_SETTINGS_LIST+=(
-    "AGY_ACCOUNT|str|private|info|Account profile|Which ~/.gemini-<name>/ credential profile to use. 'private' = default ~/.gemini. Type a profile name, or 'private' to reset.|account"
+    "AGY_ACCOUNT|str|private|info|Account profile|Which ~/.gemini-<name>/ credential profile to use. 'private' = default ~/.gemini. Type a profile name, or 'private' to reset. Named profiles are Linux-only; macOS refuses them at launch.|account"
 )
 
 # No source-time `export AGY_ACCOUNT=private`: _preset_autoload treats a set

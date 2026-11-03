@@ -449,11 +449,12 @@ CLI sees its expected config path. On Linux (bubblewrap) this works via
 **macOS limitation:** sandbox-exec / Seatbelt has no bind-mount remapping;
 the path grant is a single-argument ACL, so a named account directory is
 accessible at its real path (`~/.claude-<name>`) but cannot be remapped to
-appear as `~/.claude`. As a result, setting `CLAUDE_ACCOUNT=work` will
-grant read/write access to `~/.claude-work` in the sandbox but Claude
-reads `~/.claude` — the session will silently use the default account
-directory instead of the named one. Account switching is fully
-functional on Linux only.
+appear as `~/.claude`. Rather than silently running on the default account,
+the wrapper refuses a named profile on macOS: `CLAUDE_ACCOUNT=work`
+(from the environment, a saved preset or the Settings menu) exits with
+an error before any directory is created or Claude starts. Use
+`CLAUDE_ACCOUNT=private` (or leave it unset) on macOS; named account
+profiles work on Linux only.
 <!-- os:end -->
 
 ### c) Clear saved settings for this workdir
