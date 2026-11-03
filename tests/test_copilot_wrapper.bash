@@ -53,13 +53,22 @@ _sandbox_pass_env_add A_VAR_EXTRA
 assert_eq "${AI_SANDBOX_PASS_ENV}" "A_VAR,A_VAR_EXTRA" \
     "helper matches whole entries, not name prefixes"
 
+# bash < 4.4 (macOS /bin/bash 3.2) treats "${arr[@]}" of an empty array as
+# unbound under `set -u`, so the bash 5 runs above cannot catch it. The
+# helper's parsed list and the client-controls RO overlay list can both be
+# empty; their expansions must use the guarded "${arr[@]+...}" form.
+unguarded="$(grep -nE '(^|[^+])"\$\{!?(pass_env_vars|ro_src)\[@\]\}"' \
+    "${REPO_ROOT}/bin/ai_agent_universal_wrapper.bash" \
+    "${REPO_ROOT}/bin/ai_wrapper_data/ai_wrapper_lib.bash" || true)"
+assert_eq "${unguarded}" "" "pass_env_vars/ro_src expansions are empty-safe under bash 3.2 set -u"
+
 echo "-- Copilot config binds"
 NL=$'\n'
 _copilot_binds() {
     (
         WRAPPER_FLAGS=()
         _copilot_bind_config_dirs || exit 1
-        printf '%s\n' "${WRAPPER_FLAGS[@]}"
+        printf '%s\n' "${WRAPPER_FLAGS[@]+"${WRAPPER_FLAGS[@]}"}"
     ) 2>&1
 }
 _reset_copilot_home() {

@@ -159,4 +159,4 @@ _apply_post_menu_binds || exit 1
 if declare -f _extra_post_menu_setup >/dev/null 2>&1; then
     _extra_post_menu_setup
 fi
-run_sandboxed_agent "${AI_AGENT_COMMAND}" -- "${WRAPPER_FLAGS[@]}" -- "${AGENT_FLAGS[@]}" "$@"
+run_sandboxed_agent "${AI_AGENT_COMMAND}" -- "${WRAPPER_FLAGS[@]+"${WRAPPER_FLAGS[@]}"}" -- "${AGENT_FLAGS[@]+"${AGENT_FLAGS[@]}"}" "$@"

@@ -26,6 +26,21 @@ source "${WRAPPER_DATA_DIR}/ai_wrapper_lib.bash"
 
 # ===== ORCHESTRATION PROMPT INJECTION =====
 
+# Replace every occurrence of $2 with $3 in the variable named $1.
+# Deliberately not `${var//pat/rep}`: the replacement's quote and
+# backslash handling differs across bash versions — 3.2 (macOS /bin/bash)
+# keeps double quotes in a double-quoted replacement literally, 4.3+
+# removes them, and 5.2's patsub_replacement turns an unquoted `\\` into
+# `\`. Prefix/suffix removal with a quoted pattern is literal everywhere.
+_toml_replace_all() {
+    local rest="${!1}" out=""
+    while [[ "${rest}" == *"${2}"* ]]; do
+        out="${out}${rest%%"${2}"*}${3}"
+        rest="${rest#*"${2}"}"
+    done
+    printf -v "${1}" '%s' "${out}${rest}"
+}
+
 # Encode $1 as a TOML basic string (double-quoted, with escapes) on stdout.
 # codex parses the value of `-c key=value` as TOML and silently falls back
 # to the raw string when parsing fails — relying on that fallback would
@@ -35,18 +50,18 @@ source "${WRAPPER_DATA_DIR}/ai_wrapper_lib.bash"
 # other C0 control plus DEL as \uXXXX. Bash strings cannot contain NUL.
 _toml_basic_string() {
     local s="${1}" bs='\' code ch esc
-    s="${s//"${bs}"/"${bs}${bs}"}"
-    s="${s//\"/"${bs}\""}"
-    s="${s//$'\b'/"${bs}b"}"
-    s="${s//$'\t'/"${bs}t"}"
-    s="${s//$'\n'/"${bs}n"}"
-    s="${s//$'\f'/"${bs}f"}"
-    s="${s//$'\r'/"${bs}r"}"
+    _toml_replace_all s "${bs}" "${bs}${bs}"
+    _toml_replace_all s '"' "${bs}\""
+    _toml_replace_all s $'\b' "${bs}b"
+    _toml_replace_all s $'\t' "${bs}t"
+    _toml_replace_all s $'\n' "${bs}n"
+    _toml_replace_all s $'\f' "${bs}f"
+    _toml_replace_all s $'\r' "${bs}r"
     for code in 1 2 3 4 5 6 7 11 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 127; do
         printf -v ch "\\x$(printf '%02x' "${code}")"
         [[ "${s}" == *"${ch}"* ]] || continue
         printf -v esc '%su%04X' "${bs}" "${code}"
-        s="${s//"${ch}"/"${esc}"}"
+        _toml_replace_all s "${ch}" "${esc}"
     done
     printf '"%s"' "${s}"
 }

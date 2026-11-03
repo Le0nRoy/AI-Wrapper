@@ -320,7 +320,7 @@ _bind() {
         WRAPPER_FLAGS=()
         AGY_ACCOUNT="${1}"
         _bind_agy_account
-        printf '%s\n' "${WRAPPER_FLAGS[@]}" "NAME=${AI_WRAPPER_AGENT_NAME}"
+        printf '%s\n' "${WRAPPER_FLAGS[@]+"${WRAPPER_FLAGS[@]}"}" "NAME=${AI_WRAPPER_AGENT_NAME}"
     ) 2>&1
 }
 # Content, inode, mode and mtime: any rewrite, replace or chmod changes one.

@@ -8,7 +8,7 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "${REPO_ROOT}"
+cd "${REPO_ROOT}" || exit 1
 
 failed=0
 for test_file in tests/test_*.bash; do
@@ -20,11 +20,15 @@ for test_file in tests/test_*.bash; do
 done
 
 # Python unit tests for helpers shipped in bin/ai_wrapper_data (offline).
-echo ""
-echo "### tests/test_network_proxy.py"
-if ! python3 -I -B tests/test_network_proxy.py; then
-    failed=1
-fi
+# test_linux_tty_seccomp.py and test_sandbox_net_forwarder.py also run
+# inside their Linux bash suites; Linux-only cases skip themselves.
+for test_file in tests/test_*.py; do
+    echo ""
+    echo "### ${test_file}"
+    if ! python3 -I -B "${test_file}"; then
+        failed=1
+    fi
+done
 
 # Python unit tests for helpers shipped inside skills (offline, no credentials).
 for test_file in dot_agents/skills/*/scripts/test_*.py; do

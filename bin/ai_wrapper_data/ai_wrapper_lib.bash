@@ -1133,7 +1133,7 @@ _wrapper_protect_client_controls() {
     for p in "${unique[@]}"; do
         _wrapper_client_control_bind _wrapper_add_pin "${base}${p:+/${p}}" "${dst_base}${p:+/${p}}"
     done
-    for i in "${!ro_src[@]}"; do
+    for i in ${ro_src[@]+"${!ro_src[@]}"}; do
         _wrapper_client_control_bind _wrapper_add_ro_bind "${ro_src[i]}" "${ro_dst[i]}"
     done
     return 0
@@ -2149,8 +2149,8 @@ run_orchestrated_session() {
         return 1
     fi
 
-    run_sandboxed_agent "${AI_AGENT_COMMAND}" -- "${WRAPPER_FLAGS[@]}" -- \
-        "${AGENT_FLAGS[@]}" "${AI_SYSTEM_PROMPT_ARGS[@]}"
+    run_sandboxed_agent "${AI_AGENT_COMMAND}" -- "${WRAPPER_FLAGS[@]+"${WRAPPER_FLAGS[@]}"}" -- \
+        "${AGENT_FLAGS[@]+"${AGENT_FLAGS[@]}"}" "${AI_SYSTEM_PROMPT_ARGS[@]}"
 }
 
 # Run a plain agent session (start or resume). Uses AI_RESUME_ARGS if set.
@@ -2176,13 +2176,13 @@ run_agent_session() {
             if [[ "${AI_RESUME_ARGS_FIRST:-0}" == "1" ]]; then
                 # Resume is a subcommand (e.g. `codex resume`): it must
                 # precede the agent flags so they parse as its options.
-                run_sandboxed_agent "${AI_AGENT_COMMAND}" -- "${WRAPPER_FLAGS[@]}" -- "${resume_args[@]}" "${AGENT_FLAGS[@]}"
+                run_sandboxed_agent "${AI_AGENT_COMMAND}" -- "${WRAPPER_FLAGS[@]+"${WRAPPER_FLAGS[@]}"}" -- "${resume_args[@]}" "${AGENT_FLAGS[@]+"${AGENT_FLAGS[@]}"}"
             else
-                run_sandboxed_agent "${AI_AGENT_COMMAND}" -- "${WRAPPER_FLAGS[@]}" -- "${AGENT_FLAGS[@]}" "${resume_args[@]}"
+                run_sandboxed_agent "${AI_AGENT_COMMAND}" -- "${WRAPPER_FLAGS[@]+"${WRAPPER_FLAGS[@]}"}" -- "${AGENT_FLAGS[@]+"${AGENT_FLAGS[@]}"}" "${resume_args[@]}"
             fi
             ;;
         start)
-            run_sandboxed_agent "${AI_AGENT_COMMAND}" -- "${WRAPPER_FLAGS[@]}" -- "${AGENT_FLAGS[@]}"
+            run_sandboxed_agent "${AI_AGENT_COMMAND}" -- "${WRAPPER_FLAGS[@]+"${WRAPPER_FLAGS[@]}"}" -- "${AGENT_FLAGS[@]+"${AGENT_FLAGS[@]}"}"
             ;;
         *)
             wrapper_log "ERROR" "Unknown action: ${action} (expected 'start' or 'resume')"

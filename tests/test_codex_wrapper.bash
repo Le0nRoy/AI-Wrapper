@@ -50,28 +50,41 @@ echo "== codex wrapper parity tests (${OS}) =="
 
 # ---------------------------------------------------------------------------
 echo "-- _toml_basic_string"
-_toml() { ( _load codex; _toml_basic_string "${1}" ); }
+# TOML_COMPAT selects the shell compatibility level for _toml. Level 42
+# makes bash >= 4.3 keep double quotes in a double-quoted ${s//pat/rep}
+# replacement literally, as macOS /bin/bash 3.2 does — so the escaping
+# cases below also guard the Darwin behaviour on a Linux runner.
+TOML_COMPAT=""
+_toml() { ( [[ -n "${TOML_COMPAT}" ]] && BASH_COMPAT="${TOML_COMPAT}"; _load codex; _toml_basic_string "${1}" ); }
 
-assert_eq "$(_toml 'plain text')" '"plain text"' "plain text is just quoted"
-assert_eq "$(_toml 'say "hi"')" '"say \"hi\""' "double quotes escaped"
-assert_eq "$(_toml 'a\b')" '"a\\b"' "backslash escaped"
-assert_eq "$(_toml "l1${NL}l2")" '"l1\nl2"' "newline escaped"
-assert_eq "$(_toml $'t\tr\r')" '"t\tr\r"' "tab and CR escaped"
-assert_eq "$(_toml $'x\x01y\x1fz\x7f')" '"x\u0001y\u001Fz\u007F"' "other controls and DEL as \\uXXXX"
-assert_eq "$(_toml 'unicode → ок')" '"unicode → ок"' "non-ASCII passes through"
-assert_eq "$(_toml '\"')" '"\\\""' "backslash before quote: each escaped once"
+for TOML_COMPAT in "" 42; do
+    sfx=""; [[ -n "${TOML_COMPAT}" ]] && sfx=" (BASH_COMPAT=${TOML_COMPAT})"
+    assert_eq "$(_toml 'plain text')" '"plain text"' "plain text is just quoted${sfx}"
+    assert_eq "$(_toml 'say "hi"')" '"say \"hi\""' "double quotes escaped${sfx}"
+    assert_eq "$(_toml 'a\b')" '"a\\b"' "backslash escaped${sfx}"
+    assert_eq "$(_toml "l1${NL}l2")" '"l1\nl2"' "newline escaped${sfx}"
+    assert_eq "$(_toml $'t\tr\r')" '"t\tr\r"' "tab and CR escaped${sfx}"
+    assert_eq "$(_toml $'x\x01y\x1fz\x7f')" '"x\u0001y\u001Fz\u007F"' "other controls and DEL as \\uXXXX${sfx}"
+    assert_eq "$(_toml 'unicode → ок')" '"unicode → ок"' "non-ASCII passes through${sfx}"
+    assert_eq "$(_toml '\"')" '"\\\""' "backslash before quote: each escaped once${sfx}"
+done
+TOML_COMPAT=""
 
 prompt_file="${REPO_ROOT}/bin/ai_wrapper_data/orchestrator-prompt.md"
 if command -v python3 >/dev/null 2>&1 && python3 -c 'import tomllib' 2>/dev/null; then
     tricky=$'multi\nline "quoted" \\back\\slash\t tab \x01 ctrl \x7f del ünï'
-    for sample_name in tricky orchestrator; do
-        if [[ "${sample_name}" == "tricky" ]]; then sample="${tricky}"; else sample="$(cat "${prompt_file}")"; fi
-        encoded="$(_toml "${sample}")"
-        decoded="$(printf 'v = %s\n' "${encoded}" | python3 -c 'import sys,tomllib; sys.stdout.write(tomllib.loads(sys.stdin.read())["v"])')"
-        rc=$?
-        assert_eq "${rc}" "0" "${sample_name} sample encodes to valid TOML"
-        assert_eq "${decoded}" "${sample}" "${sample_name} sample round-trips through tomllib unchanged"
+    for TOML_COMPAT in "" 42; do
+        sfx=""; [[ -n "${TOML_COMPAT}" ]] && sfx=" (BASH_COMPAT=${TOML_COMPAT})"
+        for sample_name in tricky orchestrator; do
+            if [[ "${sample_name}" == "tricky" ]]; then sample="${tricky}"; else sample="$(cat "${prompt_file}")"; fi
+            encoded="$(_toml "${sample}")"
+            decoded="$(printf 'v = %s\n' "${encoded}" | python3 -c 'import sys,tomllib; sys.stdout.write(tomllib.loads(sys.stdin.read())["v"])')"
+            rc=$?
+            assert_eq "${rc}" "0" "${sample_name} sample encodes to valid TOML${sfx}"
+            assert_eq "${decoded}" "${sample}" "${sample_name} sample round-trips through tomllib unchanged${sfx}"
+        done
     done
+    TOML_COMPAT=""
 else
     echo "  skip - python3 tomllib unavailable; TOML round-trip not checked"
 fi
@@ -149,7 +162,7 @@ _bind() {
         WRAPPER_FLAGS=()
         CODEX_ACCOUNT="${1}"
         _bind_codex_account
-        printf '%s\n' "${WRAPPER_FLAGS[@]}" "NAME=${AI_WRAPPER_AGENT_NAME}"
+        printf '%s\n' "${WRAPPER_FLAGS[@]+"${WRAPPER_FLAGS[@]}"}" "NAME=${AI_WRAPPER_AGENT_NAME}"
     ) 2>&1
 }
 
@@ -239,7 +252,7 @@ if command -v git >/dev/null 2>&1; then
     git_q init "${FAKE_HOME}/repos/main"
     git_q -C "${FAKE_HOME}/repos/main" commit --allow-empty -m init
     git_q -C "${FAKE_HOME}/repos/main" worktree add "${FAKE_HOME}/wt" -b wt
-    _gitbind() { ( set -u; cd "${1}" && _load "${2}"; WRAPPER_FLAGS=(); _wrapper_bind_git_common_dir; printf '%s\n' "${WRAPPER_FLAGS[@]}" ) 2>&1; }
+    _gitbind() { ( set -u; cd "${1}" && _load "${2}"; WRAPPER_FLAGS=(); _wrapper_bind_git_common_dir; printf '%s\n' "${WRAPPER_FLAGS[@]+"${WRAPPER_FLAGS[@]}"}" ) 2>&1; }
     main_git="$(cd "${FAKE_HOME}/repos/main/.git" && pwd -P)"
     for agent in claude codex; do
         out="$(_gitbind "${FAKE_HOME}/wt" "${agent}")"
@@ -256,10 +269,18 @@ else
     echo "  skip - git not installed"
 fi
 
+# bash < 4.4 (macOS /bin/bash 3.2) treats "${arr[@]}" of an empty array
+# as unbound under `set -u`; WRAPPER_FLAGS can be empty (e.g. no binds on
+# macOS) and AGENT_FLAGS is agent-defined, so every expansion in bin/ must
+# use the "${arr[@]+"${arr[@]}"}" form. A plain "${arr[@]}" is matched
+# only when not preceded by `+` (the guarded form's inner expansion).
+unguarded="$(grep -rnE '(^|[^+])"\$\{(WRAPPER|AGENT)_FLAGS\[@\]\}"' "${REPO_ROOT}/bin" || true)"
+assert_eq "${unguarded}" "" "bin/: WRAPPER_FLAGS/AGENT_FLAGS expansions are empty-safe under bash 3.2 set -u"
+
 mkdir -p "${FAKE_HOME}/.config/glab-cli"
-out="$( set -u; cd "${FAKE_HOME}/work" && _load claude; WRAPPER_FLAGS=(); AI_SANDBOX_PASS_GITLAB=1 _apply_post_menu_binds; printf '%s\n' "${WRAPPER_FLAGS[@]}" )"
+out="$( set -u; cd "${FAKE_HOME}/work" && _load claude; WRAPPER_FLAGS=(); AI_SANDBOX_PASS_GITLAB=1 _apply_post_menu_binds; printf '%s\n' "${WRAPPER_FLAGS[@]+"${WRAPPER_FLAGS[@]}"}" )"
 assert_contains "${out}" "--ro-bind${NL}${FAKE_HOME}/.config/glab-cli" "PASS_GITLAB=1 RO-binds glab config"
-out="$( set -u; cd "${FAKE_HOME}/work" && _load codex; WRAPPER_FLAGS=(); AI_SANDBOX_PASS_GITLAB=0 _apply_post_menu_binds; printf '%s\n' "${WRAPPER_FLAGS[@]}" )"
+out="$( set -u; cd "${FAKE_HOME}/work" && _load codex; WRAPPER_FLAGS=(); AI_SANDBOX_PASS_GITLAB=0 _apply_post_menu_binds; printf '%s\n' "${WRAPPER_FLAGS[@]+"${WRAPPER_FLAGS[@]}"}" )"
 assert_eq "${out}" "" "PASS_GITLAB=0 adds no glab bind"
 
 # ---------------------------------------------------------------------------
