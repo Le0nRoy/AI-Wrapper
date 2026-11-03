@@ -372,7 +372,10 @@ assert_eq "${synced}" "0" "macOS backend: no skills synced into the refused prof
 
 out="$(_bind 'alt' Linux)"; rc=$?
 assert_eq "${rc}" "0" "existing named profile binds with a non-sandbox settings.json (${out})"
-assert_eq "${out}" "--bind${NL}${FAKE_HOME}/.gemini-alt${NL}${FAKE_HOME}/.gemini${NL}NAME=Antigravity CLI [alt]" "named profile remapped to ~/.gemini"
+assert_eq "$(printf '%s\n' "${out}" | head -3)" "--bind${NL}${FAKE_HOME}/.gemini-alt${NL}${FAKE_HOME}/.gemini" "named profile remapped to ~/.gemini"
+assert_contains "${out}" "--ro-bind${NL}${FAKE_HOME}/.gemini-alt/antigravity-cli/settings.json${NL}${FAKE_HOME}/.gemini/antigravity-cli/settings.json" \
+    "named profile: host settings.json read-only at ~/.gemini (#87)"
+assert_eq "${out##*${NL}}" "NAME=Antigravity CLI [alt]" "named profile: agent name names the account"
 assert_eq "$(_snap "${alt_file}")" "${alt_before}" "... and its settings.json is untouched (content, inode, mode, mtime)"
 assert_contains "$(cat "${alt_file}")" '"toolPermission": "request-review"' "... keeping the user's own toolPermission"
 assert_eq "$(ls -A "${FAKE_HOME}/.gemini-alt/antigravity-cli")" "settings.json" "... with no temp or backup files beside it"

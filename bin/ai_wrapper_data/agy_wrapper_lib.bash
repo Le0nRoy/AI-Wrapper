@@ -1324,7 +1324,28 @@ _agy_sync_profile_skills() {
     return 0
 }
 
-# Resolve AGY_ACCOUNT to the profile dir, sync global skills, and append its bind (at ~/.gemini) to WRAPPER_FLAGS.
+# ===== PERSISTENT CONTROLS (#48 / #87) =====
+# Paths under the profile dir that every later Antigravity (and Gemini
+# CLI) session loads: settings, hooks, MCP servers, global rules and
+# prompts, workflows, sidecars, custom agents, plugins and skills.
+# _bind_agy_account keeps the ones present at launch read-only via
+# _wrapper_protect_client_controls, after _agy_sync_profile_skills has
+# refreshed the managed skills on the host. Session state stays writable:
+# antigravity-cli/ OAuth token, conversation databases, brain/,
+# conversations/, presence, cache and logs; config/projects (agy's
+# per-project registry) is runtime state too.
+_AGY_CLIENT_CONTROLS=(
+    antigravity-cli/settings.json antigravity-cli/hooks.json
+    config/config.json config/mcp_config.json config/hooks.json
+    config/workflows.json config/AGENTS.md config/GEMINI.md
+    config/agents config/global_workflows config/plugins config/rules
+    config/sidecars config/skills config/workflows
+    jetski/sidecars
+    AGENTS.md GEMINI.md settings.json commands extensions
+)
+
+# Resolve AGY_ACCOUNT to the profile dir, sync global skills, and append its
+# bind (at ~/.gemini) and the read-only persistent controls to WRAPPER_FLAGS.
 # Must run AFTER _preset_autoload and the menu — AGY_ACCOUNT isn't
 # authoritative until then. Exits on invalid input, same contract as
 # _bind_codex_account and _bind_claude_account.
@@ -1374,6 +1395,8 @@ _bind_agy_account() {
     _agy_sync_profile_skills "${bind_src}" || exit 1
 
     _wrapper_add_bind "${bind_src}" "${HOME}/.gemini"
+    _wrapper_protect_client_controls "agy" "${bind_src}" "${HOME}/.gemini" \
+        "${_AGY_CLIENT_CONTROLS[@]}" || exit 1
 }
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
