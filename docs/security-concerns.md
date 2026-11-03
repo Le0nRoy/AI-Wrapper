@@ -434,8 +434,7 @@ explicit grant at or above them still wins (bwrap's later mount
 covers the earlier one): launching from `~/ai-wrapper`, or
 `AI_SANDBOX_EXTRA_RW_DIRS=~/bin`, makes that tree writable whatever
 the toggles say, and a WORKDIR inside `~/bin` stays writable while
-the rest of `~/bin` stays read-only. `_agy_path_sandbox_writable`
-follows the same rules (Linux + opt-in, or a covering grant).
+the rest of `~/bin` stays read-only.
 
 **Residual.**
 - A read-only bind of a UNIX socket stops the socket file being
@@ -485,10 +484,7 @@ permission check fails closed: if it cannot run, the launch is refused.
 `AI_SANDBOX_PASS_DOCKER` still alone controls `DOCKER_HOST` and
 `~/.docker`; a `DOCKER_HOST` that names the shared rootless socket via a
 host spelling the sandbox does not reuse is rewritten to the mounted
-path. `_agy_path_sandbox_writable` no longer treats the runtime dir as a
-writable root (the private dir is a sandbox tmpfs even at the host
-path), except on Linux with the override; WORKDIR, extra RW and
-`--bind` grants that cover it still count.
+path.
 
 **Residual.**
 - A wider explicit grant wins: a WORKDIR, `AI_SANDBOX_EXTRA_RW_DIRS`
@@ -1353,9 +1349,8 @@ symlinked `antigravity-cli/`, `brain/`, `conversations/`, database and
 followed if pre-created as a symlink).
 
 **Mitigation.** One embedded helper (`_agy_host_py`, run as `python3 -I -`)
-does all of it. By owner decision, `settings.json` is no longer written at
-all: the wrapper reads it and fails the launch, listing what to change,
-when a required key or the current workspace's trust is missing. It opens the resolved profile component by component with
+does the conversation operations. `settings.json` is not touched at all
+since #85 (see "Settings are session-only" below). It opens the resolved profile component by component with
 `O_NOFOLLOW` and `*at` calls, refuses symlinked directories, database,
 SQLite sidecars and title files before changing anything, unlinks symlinked
 artifact leaves without traversal, opens SQLite with `mode=rw|ro` (never
@@ -1374,11 +1369,21 @@ are gone.
   refuses the operation if either fails. Tests swap each sidecar for a
   symlink at open and at write time, and swap `antigravity-cli/` for a
   directory holding same-named sidecars; the external bytes stay unchanged.
-- **Settings are read-only.** The wrapper never creates, rewrites, chmods
-  or replaces `settings.json` or an approved symlink target, and never
-  creates `antigravity-cli/`. Tests check that file, target and parent
-  directories keep their content, inode, mode and mtime on success and on
-  every failure.
+- **Settings are session-only (#85).** The sandbox permissions
+  (`toolPermission`/`artifactReviewPolicy` `always-proceed`,
+  `allowNonWorkspaceAccess` true, `enableTerminalSandbox` false,
+  `trustedWorkspaces` = the resolved WORKDIR) are passed as
+  `agy --settings '<JSON>'`, which agy applies to that invocation only and
+  never saves. The wrapper never reads, creates, rewrites, chmods or
+  replaces `settings.json` (or a symlink target) and never creates
+  `antigravity-cli/`, so unwrapped `agy` sessions keep the user's own
+  policy, parallel wrappers in different workdirs cannot race, and a
+  killed wrapper leaves nothing to restore. The JSON is built in pure bash
+  (no host interpreter); the WORKDIR path is JSON-escaped, so it cannot
+  add or override keys. Tests run the real wrapper through a stub `bwrap`
+  (normal, missing, symlinked `settings.json`, four parallel workdirs, a
+  SIGKILL at launch) and check that file and its directory keep their
+  content, inode, mode and mtime.
 - **Title writes (rename).** `.wrapper_title` is replaced by an `O_EXCL`
   temp file + `renameat` in the held directory, after re-checking the file
   (inode, size, mtime) and re-walking the parent; a changed file fails the
@@ -1389,16 +1394,6 @@ are gone.
   taken and the temp file written before the database title changes, so a
   lock or permission failure leaves the database untouched. Failures name
   the path and tell the user to retry.
-- **Trusted settings target.** A symlinked `settings.json` is read only
-  through the target approved by `AGY_SETTINGS_TRUSTED_PROFILE` +
-  `AGY_SETTINGS_TRUSTED_TARGET` (exact resolved profile and canonical
-  existing file under `$HOME`, outside credential dirs). The approval is
-  refused when the preset dir is writable inside the sandbox (WORKDIR, the
-  profile, the wrapper's fixed RW binds, `AI_SANDBOX_EXTRA_RW_DIRS`,
-  `WRAPPER_FLAGS` binds, macOS temp dirs), and also whenever an
-  `AI_WRAPPER_EXTRA_PROFILE` plugin defines `_extra_post_menu_setup` or
-  `_extra_sandbox_setup`: those run after the check and can add binds, so
-  writability cannot be determined.
 
 **Residual limits.**
 

@@ -70,40 +70,18 @@ confines filesystem writes to `WORKDIR`, `~/.gemini`, and `/tmp`, the wrapper
 grants `agy` full autonomy inside the sandbox boundary:
 
 - Passes `--dangerously-skip-permissions` on the command line.
-- Checks, read-only, that `<profile>/antigravity-cli/settings.json` has
+- Passes session-only settings with `--settings '<JSON>'`:
   `toolPermission: "always-proceed"`, `artifactReviewPolicy: "always-proceed"`,
   `allowNonWorkspaceAccess: true`, `enableTerminalSandbox: false` (avoiding
   nested-sandbox conflicts inside the outer `ai-wrapper` sandbox), and the
   resolved working directory in `trustedWorkspaces`.
 
-The wrapper never creates, edits, chmods or replaces `settings.json` (nor
-its `antigravity-cli/` directory). When the file is missing, is not a JSON
-object, or any of the above is missing or different, the launch fails and
-lists each problem plus the JSON to put in the file (keep your other
-settings). Edit the file and launch again. Each new working directory has
-to be added to `trustedWorkspaces` this way. The check runs on the host
-with `python3 -I` (required; there is no `jq` fallback).
-
-### Symlinked settings.json (dotfiles)
-
-If `<profile>/antigravity-cli/settings.json` is a symlink, the launch fails
-unless you approve its exact target for that exact profile in
-`s) Settings` under "Account":
-
-- **Trusted settings.json profile** (`AGY_SETTINGS_TRUSTED_PROFILE`): the
-  resolved profile directory, e.g. `~/.gemini` or `~/.gemini-work`.
-- **Trusted settings.json target file** (`AGY_SETTINGS_TRUSTED_TARGET`): the
-  canonical path (no symlinked parents) of the existing file the symlink
-  points to, inside `$HOME` and outside credential dirs.
-
-The wrapper then checks that file (read-only, as above); edit the target
-itself to fix a failed check. The symlink is left as is. An approval for one profile
-is not used for another account. A missing, dangling, mismatched or
-non-regular target fails the launch. The approval is saved in this
-workdir's preset and is ignored when that preset directory is writable
-inside the sandbox (for example via `AI_SANDBOX_EXTRA_RW_DIRS`), or when an
-`AI_WRAPPER_EXTRA_PROFILE` plugin defines `_extra_post_menu_setup` or
-`_extra_sandbox_setup` (they can add sandbox binds after the check).
+`agy` applies these for that run only and never saves them. The wrapper
+never reads, creates or edits `<profile>/antigravity-cli/settings.json`
+(regular file or dotfiles symlink): your own settings there still apply
+to keys the wrapper does not pass, and `agy` launched outside the wrapper
+keeps your normal permission prompts. Sessions in different working
+directories can run in parallel; each trusts only its own directory.
 
 ## Account switching
 
@@ -132,9 +110,8 @@ The wrapper makes `~/.gemini-<name>` appear as `~/.gemini` inside the sandbox
 **macOS limitation:** sandbox-exec has no bind-mount remapping, so a named
 profile cannot appear as `~/.gemini`. The wrapper refuses a named
 `AGY_ACCOUNT` on macOS (from the environment, a saved preset or the
-Settings menu) with an error before its settings.json is checked, skills
-are synced or Antigravity starts. Use `AGY_ACCOUNT=private` (or leave it
-unset) on macOS; named account profiles work on Linux only (same as the
+Settings menu) with an error before skills are synced or Antigravity
+starts. Use `AGY_ACCOUNT=private` (or leave it unset) on macOS; named account profiles work on Linux only (same as the
 Claude and Codex wrappers).
 <!-- os:end -->
 

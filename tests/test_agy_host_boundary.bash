@@ -7,11 +7,10 @@
 #     symlinked antigravity-cli/brain/conversations ancestors, database and
 #     title file are refused; symlinked artifact leaves are unlinked only;
 #     missing databases are never created
-#   - settings.json is validated read-only: success and every failure leave
-#     the file, an approved symlink target and their parents unchanged;
-#     missing files/dirs are never created; failures say what to change; a
-#     symlinked settings.json is read only through the approved
-#     profile+target pair
+#   - sandbox permissions are invocation-local (`agy --settings '<JSON>'`):
+#     real wrapper runs through a stub bwrap (Linux) never read, create,
+#     rewrite or chmod <profile>/antigravity-cli/settings.json, including
+#     parallel runs from different workdirs and a run killed mid-launch
 #   - rename stays available: it changes the displayed title and reports
 #     lock/permission/conflict failures before touching the index
 #   - deterministic race injection (path swaps, concurrent writers) by
@@ -61,10 +60,6 @@ _is() { if "$@"; then echo yes; else echo no; fi; }
 # Metadata that any create/rewrite/chmod/replace would change: inode, mode,
 # mtime (for a directory, mtime changes when an entry is added or renamed).
 _meta() { python3 -I -c 'import os,sys;st=os.stat(sys.argv[1]);print(st.st_ino,oct(st.st_mode),st.st_mtime_ns)' "${1}"; }
-# Settings JSON that passes validation for the workspaces given as args.
-_valid_settings() {
-    python3 -I -c 'import json,sys;print(json.dumps({"colorScheme":"dark","toolPermission":"always-proceed","artifactReviewPolicy":"always-proceed","allowNonWorkspaceAccess":True,"enableTerminalSandbox":False,"trustedWorkspaces":sys.argv[1:]}))' "$@"
-}
 # Count entries of DIR whose name contains NEEDLE (hidden files included).
 _count_named() {
     local entry n=0
@@ -125,11 +120,9 @@ mkdir -p "${p}/antigravity-cli/brain/${CID}"
     _load
     _agy_list_conversations "${p}" "${checkout}" 20 >/dev/null 2>&1
     _agy_rename_conversation "${p}" "${CID}" "Renamed" >/dev/null 2>&1
-    _agy_validate_settings "${p}" >"${FAKE_HOME}/shadow-settings.out" 2>&1
     _agy_delete_conversation "${p}" "${CID}" >/dev/null 2>&1
 )
 assert_eq "$(ls -A "${canary_dir}")" "" "no checkout module (json.py, sqlite3.py, ...) ran on the host"
-assert_contains "$(cat "${FAKE_HOME}/shadow-settings.out")" "settings.json: does not exist" "... while settings were still validated from the checkout"
 assert_eq "$(_is test -e "${p}/antigravity-cli/brain/${CID}")" "no" "... and the conversation was deleted"
 n_isolated="$(grep -c 'python3 -I -' "${LIB}")"
 n_python="$(grep -cE '(^|[^-])python3 ' "${LIB}" | tr -d ' ')"
@@ -321,313 +314,111 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-echo "-- settings.json: read-only validation of a regular file"
-_settings() { ( cd "${WORK}" && _load && WRAPPER_FLAGS=() && _agy_validate_settings "$@" ) 2>&1; }
-# _unchanged LABEL PATH... : assert content + metadata of each PATH are as captured by _snap.
+echo "-- invocation-local --settings: host settings.json is never touched"
+# Content + metadata (inode, mode, mtime) of each PATH: any create, rewrite,
+# chmod or replace changes it (a directory's mtime changes on new entries).
 _snap() { local f; for f in "$@"; do printf '%s|%s|%s\n' "${f}" "$(_fp "${f}")" "$( [[ -e "${f}" ]] && _meta "${f}")"; done; }
-
-p="$(_profile valid)"
-_valid_settings "${WORK}" >"${p}/antigravity-cli/settings.json"
-chmod 0640 "${p}/antigravity-cli/settings.json"
-before="$(_snap "${p}/antigravity-cli/settings.json" "${p}/antigravity-cli")"
-out="$(_settings "${p}")"; rc=$?
-assert_eq "${rc}" "0" "valid settings.json passes (${out})"
-assert_eq "$(_snap "${p}/antigravity-cli/settings.json" "${p}/antigravity-cli")" "${before}" \
-    "... and the file and its directory are unchanged (content, inode, mode, mtime)"
-
-_valid_settings "file://${WORK}" >"${p}/antigravity-cli/settings.json"
-out="$(_settings "${p}")"; rc=$?
-assert_eq "${rc}" "0" "a file:// trustedWorkspaces entry for the workspace is accepted (${out})"
-
-p="$(_profile newfile)"
-before="$(_snap "${p}/antigravity-cli")"
-out="$(_settings "${p}")"; rc=$?
-assert_eq "${rc}" "1" "missing settings.json fails the launch"
-assert_contains "${out}" "settings.json: does not exist" "... saying it does not exist"
-assert_contains "${out}" '"toolPermission": "always-proceed"' "... showing the settings to create"
-assert_contains "${out}" "\"${WORK}\"" "... including the current workspace"
-assert_contains "${out}" "then relaunch" "... and how to retry"
-assert_eq "$(_is test -e "${p}/antigravity-cli/settings.json")" "no" "... without creating it"
-assert_eq "$(_snap "${p}/antigravity-cli")" "${before}" "... or touching its directory"
-
-p="$(_profile nocli)"
-rm -rf "${p}/antigravity-cli"
-out="$(_settings "${p}")"; rc=$?
-assert_eq "${rc}" "1" "missing antigravity-cli/ fails the launch"
-assert_contains "${out}" "create that first" "... asking for the directory to be created"
-assert_eq "$(_is test -e "${p}/antigravity-cli")" "no" "... without creating the parent directory"
-
-# Each missing/wrong requirement is named; the file is never touched.
-_check_bad() {
-    local label="${1}" json="${2}" needle="${3}"
-    p="$(_profile badsetting)"
-    printf '%s\n' "${json}" >"${p}/antigravity-cli/settings.json"
-    before="$(_snap "${p}/antigravity-cli/settings.json" "${p}/antigravity-cli")"
-    out="$(_settings "${p}")"; rc=$?
-    assert_eq "${rc}" "1" "${label}: fails the launch"
-    assert_contains "${out}" "${needle}" "${label}: ... naming the problem"
-    assert_contains "${out}" "never creates or edits it" "${label}: ... saying the wrapper will not change it"
-    assert_eq "$(_snap "${p}/antigravity-cli/settings.json" "${p}/antigravity-cli")" "${before}" "${label}: ... and leaves it unchanged"
-}
-good_tail="\"allowNonWorkspaceAccess\":true,\"enableTerminalSandbox\":false,\"trustedWorkspaces\":[\"${WORK}\"]"
-_check_bad "toolPermission request-review" "{\"toolPermission\":\"request-review\",\"artifactReviewPolicy\":\"always-proceed\",${good_tail}}" \
-    '"toolPermission" is "request-review"; required: "always-proceed"'
-_check_bad "artifactReviewPolicy missing" "{\"toolPermission\":\"always-proceed\",${good_tail}}" \
-    '"artifactReviewPolicy" is missing'
-_check_bad "allowNonWorkspaceAccess false" "{\"toolPermission\":\"always-proceed\",\"artifactReviewPolicy\":\"always-proceed\",\"allowNonWorkspaceAccess\":false,\"enableTerminalSandbox\":false,\"trustedWorkspaces\":[\"${WORK}\"]}" \
-    '"allowNonWorkspaceAccess" is false; required: true'
-_check_bad "enableTerminalSandbox 0" "{\"toolPermission\":\"always-proceed\",\"artifactReviewPolicy\":\"always-proceed\",\"allowNonWorkspaceAccess\":true,\"enableTerminalSandbox\":0,\"trustedWorkspaces\":[\"${WORK}\"]}" \
-    '"enableTerminalSandbox" is 0; required: false'
-_check_bad "workspace not trusted" "{\"toolPermission\":\"always-proceed\",\"artifactReviewPolicy\":\"always-proceed\",\"allowNonWorkspaceAccess\":true,\"enableTerminalSandbox\":false,\"trustedWorkspaces\":[\"/elsewhere\"]}" \
-    "does not include the current workspace \"${WORK}\""
-_check_bad "invalid JSON" '{"colorScheme": "dark",' "is not valid JSON"
-_check_bad "non-object JSON" '["not", "an", "object"]' "does not hold a JSON object"
-assert_contains "${out}" "Fix the file by hand" "invalid settings: ... with how to fix it"
-
-# Pre-created temp-name symlinks are never followed: nothing is written at all.
-p="$(_profile tmplink)"
-echo canary >"${FAKE_HOME}/canary/tmp-target"
-_valid_settings "${WORK}" >"${p}/antigravity-cli/settings.json"
-(
-    cd "${WORK}" || exit 1
-    _load
-    WRAPPER_FLAGS=()
-    ln -s "${FAKE_HOME}/canary/tmp-target" "${p}/antigravity-cli/settings.json.tmp.$$"
-    ln -s "${FAKE_HOME}/canary/tmp-target" "${p}/antigravity-cli/settings.json.tmp.${BASHPID:-$$}"
-    _agy_validate_settings "${p}"
-) >/dev/null 2>&1
-assert_eq "$(cat "${FAKE_HOME}/canary/tmp-target")" "canary" "pre-created temp-file symlinks never receive settings"
-assert_eq "$(_is test -L "${p}/antigravity-cli/settings.json")" "no" "... and settings.json stays a regular file"
-
-p="$(_profile nondir)"
-rm -rf "${p}/antigravity-cli"
-_valid_settings "${WORK}" >"${FAKE_HOME}/canary/settings.json"
-ln -s "${FAKE_HOME}/canary" "${p}/antigravity-cli"
-out="$(_settings "${p}")"; rc=$?
-assert_eq "${rc}" "1" "symlinked antigravity-cli/ is refused for settings"
-assert_contains "${out}" "refusing symlinked directory" "... with a symlinked-directory refusal"
-rm -f "${FAKE_HOME}/canary/settings.json"
-
-if [[ "$(id -u)" != "0" ]]; then
-    p="$(_profile rodir)"
-    _valid_settings "${WORK}" >"${p}/antigravity-cli/settings.json"
-    chmod 0444 "${p}/antigravity-cli/settings.json"
-    chmod 0500 "${p}/antigravity-cli"
-    out="$(_settings "${p}")"; rc=$?
-    chmod 0700 "${p}/antigravity-cli"
-    assert_eq "${rc}" "0" "read-only settings.json in a read-only dir passes: validation needs no write access (${out})"
+if [[ "$(uname -s)" != "Linux" ]]; then
+    echo "  skip - real wrapper runs through a stub bwrap are Linux-only"
 else
-    echo "  skip - read-only directory check (running as root)"
+    # Stub bwrap: prints its argv (never runs agy). AGY_TEST_KILL_WRAPPER=1
+    # SIGKILLs the calling wrapper at the agent launch to simulate a crash.
+    STUB_DIR="${FAKE_HOME}/stub-bin"
+    mkdir -p "${STUB_DIR}"
+    cat >"${STUB_DIR}/bwrap" <<'STUB'
+#!/bin/bash
+printf 'BWRAP_ARG:%s\n' "$@"
+if [[ "${AGY_TEST_KILL_WRAPPER:-0}" == "1" && " $* " == *" --settings "* ]]; then
+    kill -KILL "${PPID}"
 fi
+exit 0
+STUB
+    chmod +x "${STUB_DIR}/bwrap"
+    # _run_wrapper WORKDIR [NAME=VALUE...]: the real agy wrapper, non-interactive.
+    _run_wrapper() {
+        local wd="${1}"; shift
+        ( cd "${wd}" && env PATH="${STUB_DIR}:${PATH}" "$@" \
+            bash "${REPO_ROOT}/bin/executable_agy_wrapper.bash" chat hi </dev/null 2>&1 )
+    }
+    # trustedWorkspaces of the --settings argument in wrapper output, as JSON.
+    _trusted() {
+        python3 -I -c '
+import json, sys
+args = [l[len("BWRAP_ARG:"):] for l in sys.stdin.read().splitlines() if l.startswith("BWRAP_ARG:")]
+i = args.index("--settings")
+d = json.loads(args[i + 1])
+assert d["toolPermission"] == "always-proceed" and d["artifactReviewPolicy"] == "always-proceed"
+assert d["allowNonWorkspaceAccess"] is True and d["enableTerminalSandbox"] is False
+print(json.dumps(d["trustedWorkspaces"]))' 2>&1
+    }
+    _ws() { python3 -I -c 'import json,sys;print(json.dumps(sys.argv[1:]))' "$@"; }
 
-# ---------------------------------------------------------------------------
-echo "-- settings.json: symlink + trusted target (profile AND file approval)"
-dot="${FAKE_HOME}/dotfiles/agy"
-mkdir -p "${dot}"
-_mklinked() {
-    local p
-    p="$(_profile "${1}")"
-    _valid_settings /x "${WORK}" >"${dot}/settings.json"
-    chmod 0644 "${dot}/settings.json"
-    ln -s "${dot}/settings.json" "${p}/antigravity-cli/settings.json"
-    printf '%s' "${p}"
-}
+    cli="${FAKE_HOME}/.gemini/antigravity-cli"
+    mkdir -p "${cli}"
+    printf '{"colorScheme":"tokyo","toolPermission":"request-review","enableTerminalSandbox":true}\n' >"${cli}/settings.json"
+    chmod 0640 "${cli}/settings.json"
+    before="$(_snap "${cli}/settings.json" "${cli}")"
+    out="$(_run_wrapper "${WORK}")"; rc=$?
+    assert_eq "${rc}" "0" "wrapper launches with the user's own (stricter) settings.json"
+    assert_eq "$(_trusted <<<"${out}")" "$(_ws "${WORK}")" "... passing the sandbox permissions via --settings for WORKDIR"
+    assert_eq "$(_snap "${cli}/settings.json" "${cli}")" "${before}" \
+        "... and settings.json and its directory are unchanged (content, inode, mode, mtime)"
 
-p="$(_mklinked unconfigured)"
-before="$(_fp "${dot}/settings.json")"
-out="$(_settings "${p}")"; rc=$?
-assert_eq "${rc}" "1" "symlinked settings.json without approval fails closed"
-assert_contains "${out}" "AGY_SETTINGS_TRUSTED_TARGET" "... telling the user how to approve it"
-assert_eq "$(_fp "${dot}/settings.json")" "${before}" "... leaving the target unchanged"
-assert_eq "$(_is test -L "${p}/antigravity-cli/settings.json")" "yes" "... and the symlink in place"
+    rm -f "${cli}/settings.json"
+    before="$(_snap "${cli}")"
+    out="$(_run_wrapper "${WORK}")"; rc=$?
+    assert_eq "${rc}" "0" "wrapper launches without any settings.json"
+    assert_eq "$(_is test -e "${cli}/settings.json")" "no" "... without creating it"
+    assert_eq "$(_snap "${cli}")" "${before}" "... or touching antigravity-cli/"
 
-p="$(_mklinked approved)"
-before="$(_snap "${dot}/settings.json" "${dot}" "${p}/antigravity-cli")"
-out="$(AGY_SETTINGS_TRUSTED_PROFILE="${p}" AGY_SETTINGS_TRUSTED_TARGET="${dot}/settings.json" _settings "${p}")"; rc=$?
-assert_eq "${rc}" "0" "approved profile+target with valid settings passes (${out})"
-assert_eq "$(readlink "${p}/antigravity-cli/settings.json")" "${dot}/settings.json" "... the symlink is preserved"
-assert_eq "$(_snap "${dot}/settings.json" "${dot}" "${p}/antigravity-cli")" "${before}" \
-    "... the target, its directory and the profile dir are unchanged"
+    # Dotfiles: a symlinked settings.json is neither followed for writing nor replaced.
+    dot="${FAKE_HOME}/dotfiles/agy"
+    mkdir -p "${dot}"
+    printf '{"colorScheme":"dark"}\n' >"${dot}/settings.json"
+    ln -s "${dot}/settings.json" "${cli}/settings.json"
+    before="$(_snap "${cli}/settings.json" "${dot}/settings.json" "${dot}" "${cli}")"
+    out="$(_run_wrapper "${WORK}")"; rc=$?
+    assert_eq "${rc}" "0" "wrapper launches with a symlinked (dotfiles) settings.json"
+    assert_eq "$(_snap "${cli}/settings.json" "${dot}/settings.json" "${dot}" "${cli}")" "${before}" \
+        "... leaving the symlink, its target and both directories unchanged"
 
-p="$(_mklinked approvedbad)"
-printf '{"colorScheme":"tokyo"}\n' >"${dot}/settings.json"
-before="$(_snap "${dot}/settings.json" "${dot}" "${p}/antigravity-cli")"
-out="$(AGY_SETTINGS_TRUSTED_PROFILE="${p}" AGY_SETTINGS_TRUSTED_TARGET="${dot}/settings.json" _settings "${p}")"; rc=$?
-assert_eq "${rc}" "1" "approved target lacking required settings fails the launch"
-assert_contains "${out}" "Edit ${dot}/settings.json" "... asking for the approved target itself to be edited"
-assert_contains "${out}" '"toolPermission" is missing' "... naming what is missing"
-assert_eq "$(_snap "${dot}/settings.json" "${dot}" "${p}/antigravity-cli")" "${before}" \
-    "... the target, its directory and the profile dir are unchanged"
-assert_eq "$(readlink "${p}/antigravity-cli/settings.json")" "${dot}/settings.json" "... and the symlink stays intact"
+    # Negative control: a refused launch never reaches the agent or the file.
+    out="$(_run_wrapper "${WORK}" AGY_ACCOUNT='x;y')"; rc=$?
+    assert_eq "${rc}" "1" "invalid AGY_ACCOUNT still refuses the launch"
+    assert_not_contains "${out}" "BWRAP_ARG:--settings" "... before any agent argv is built"
+    assert_eq "$(_snap "${cli}/settings.json" "${dot}/settings.json" "${dot}" "${cli}")" "${before}" "... and nothing changes"
 
-p="$(_mklinked tilde)"
-# shellcheck disable=SC2088  # a literal "~" is what the settings menu stores
-out="$(AGY_SETTINGS_TRUSTED_PROFILE="~/.gemini-tilde" AGY_SETTINGS_TRUSTED_TARGET="~/dotfiles/agy/settings.json" _settings "${p}")"; rc=$?
-assert_eq "${rc}" "0" "approval values may use ~ for \$HOME"
+    # Concurrency: parallel runs from different workdirs each get their own
+    # trustedWorkspaces; none can see (or clobber) another's settings.
+    rm -f "${cli}/settings.json"
+    printf '{"toolPermission":"request-review"}\n' >"${cli}/settings.json"
+    before="$(_snap "${cli}/settings.json" "${cli}")"
+    par_dirs=("${FAKE_HOME}/par one" "${FAKE_HOME}/par\"two" "${FAKE_HOME}/par'three" "${FAKE_HOME}/par-four")
+    pids=()
+    for k in 0 1 2 3; do
+        mkdir -p "${par_dirs[${k}]}"
+        _run_wrapper "${par_dirs[${k}]}" >"${FAKE_HOME}/par-${k}.out" &
+        pids+=("$!")
+    done
+    for k in 0 1 2 3; do
+        wait "${pids[${k}]}"; rc=$?
+        assert_eq "${rc}" "0" "parallel run ${k}: launches"
+        assert_eq "$(_trusted <"${FAKE_HOME}/par-${k}.out")" "$(_ws "${par_dirs[${k}]}")" \
+            "parallel run ${k}: trusts only its own workdir $(printf '%q' "${par_dirs[${k}]}")"
+    done
+    assert_eq "$(_snap "${cli}/settings.json" "${cli}")" "${before}" "parallel runs: settings.json and its directory unchanged"
 
-p="$(_mklinked mismatch)"
-before="$(_fp "${dot}/settings.json")"
-echo '{}' >"${dot}/other.json"
-out="$(AGY_SETTINGS_TRUSTED_PROFILE="${p}" AGY_SETTINGS_TRUSTED_TARGET="${dot}/other.json" _settings "${p}")"; rc=$?
-assert_eq "${rc}" "1" "approved target mismatch fails closed"
-assert_contains "${out}" "not the approved target" "... naming the mismatch"
-assert_eq "$(_fp "${dot}/settings.json")/$(_fp "${dot}/other.json")" "${before}/$(_fp "${dot}/other.json")" "... changing neither file"
-rm -f "${dot}/other.json"
-
-out="$(AGY_SETTINGS_TRUSTED_PROFILE="${FAKE_HOME}/.gemini-approved" AGY_SETTINGS_TRUSTED_TARGET="${dot}/settings.json" _settings "${p}")"; rc=$?
-assert_eq "${rc}" "1" "approval for another profile fails closed"
-assert_contains "${out}" "not the selected profile" "... naming the profile mismatch"
-
-out="$(AGY_SETTINGS_TRUSTED_TARGET="${dot}/settings.json" _settings "${p}")"; rc=$?
-assert_eq "${rc}" "1" "target approval without a profile fails closed"
-assert_contains "${out}" "must both be set" "... naming the missing half"
-
-# Account switching: an approval saved while using one account is not
-# reused after switching to another account whose settings.json links to
-# the same file. Pinned to the Linux backend: macOS refuses named profiles
-# before the settings check (#46).
-mkdir -p "${FAKE_HOME}/.gemini-first/antigravity-cli" "${FAKE_HOME}/.gemini-second/antigravity-cli"
-_valid_settings "${WORK}" >"${dot}/settings.json"
-ln -sf "${dot}/settings.json" "${FAKE_HOME}/.gemini-first/antigravity-cli/settings.json"
-ln -sf "${dot}/settings.json" "${FAKE_HOME}/.gemini-second/antigravity-cli/settings.json"
-_bind_acct() {
-    ( cd "${WORK}" && _load && _wrapper_os=Linux && WRAPPER_FLAGS=() && AGY_ACCOUNT="${1}" \
-        AGY_SETTINGS_TRUSTED_PROFILE="${FAKE_HOME}/.gemini-first" \
-        AGY_SETTINGS_TRUSTED_TARGET="${dot}/settings.json" _bind_agy_account ) 2>&1
-}
-out="$(_bind_acct first)"; rc=$?
-assert_eq "${rc}" "0" "account switch: approved account binds (${out})"
-before="$(_fp "${dot}/settings.json")"
-out="$(_bind_acct second)"; rc=$?
-assert_eq "${rc}" "1" "account switch: the other account does not reuse the approval"
-assert_eq "$(_fp "${dot}/settings.json")" "${before}" "account switch: ... and the target is untouched"
-
-p="$(_mklinked dangling)"
-rm -f "${dot}/settings.json"
-out="$(AGY_SETTINGS_TRUSTED_PROFILE="${p}" AGY_SETTINGS_TRUSTED_TARGET="${dot}/settings.json" _settings "${p}")"; rc=$?
-assert_eq "${rc}" "1" "dangling approved symlink fails closed"
-assert_contains "${out}" "create that file, then relaunch" "... with how to fix it"
-assert_eq "$(_is test -e "${dot}/settings.json")" "no" "... without creating the target"
-
-p="$(_mklinked nonregular)"
-rm -f "${dot}/settings.json"; mkdir "${dot}/settings.json"
-out="$(AGY_SETTINGS_TRUSTED_PROFILE="${p}" AGY_SETTINGS_TRUSTED_TARGET="${dot}/settings.json" _settings "${p}")"; rc=$?
-assert_eq "${rc}" "1" "non-regular approved target fails closed"
-rmdir "${dot}/settings.json"
-
-p="$(_mklinked invalid)"
-printf 'export PATH=/evil\n' >"${dot}/settings.json"
-before="$(_fp "${dot}/settings.json")"
-out="$(AGY_SETTINGS_TRUSTED_PROFILE="${p}" AGY_SETTINGS_TRUSTED_TARGET="${dot}/settings.json" _settings "${p}")"; rc=$?
-assert_eq "${rc}" "1" "approved target holding non-JSON fails closed"
-assert_eq "$(_fp "${dot}/settings.json")" "${before}" "... and is not overwritten"
-
-# Symlinked parent: the approval must name the canonical path.
-p="$(_mklinked parentlink)"
-ln -sfn "${dot}" "${FAKE_HOME}/dot-alias"
-ln -sf "${FAKE_HOME}/dot-alias/settings.json" "${p}/antigravity-cli/settings.json"
-out="$(AGY_SETTINGS_TRUSTED_PROFILE="${p}" AGY_SETTINGS_TRUSTED_TARGET="${FAKE_HOME}/dot-alias/settings.json" _settings "${p}")"; rc=$?
-assert_eq "${rc}" "1" "approval naming a path through a symlinked parent fails closed"
-assert_contains "${out}" "canonical" "... asking for the canonical path"
-
-# Outside $HOME / credential locations.
-p="$(_profile outside)"
-_valid_settings "${WORK}" >"${OUTSIDE_HOME}/settings.json"
-ln -s "${OUTSIDE_HOME}/settings.json" "${p}/antigravity-cli/settings.json"
-out="$(AGY_SETTINGS_TRUSTED_PROFILE="${p}" AGY_SETTINGS_TRUSTED_TARGET="${OUTSIDE_HOME}/settings.json" _settings "${p}")"; rc=$?
-assert_eq "${rc}" "1" "approved target outside \$HOME fails closed"
-assert_contains "${out}" "outside \$HOME" "... naming the reason"
-p="$(_profile cred)"
-mkdir -p "${FAKE_HOME}/.ssh"
-_valid_settings "${WORK}" >"${FAKE_HOME}/.ssh/settings.json"
-ln -s "${FAKE_HOME}/.ssh/settings.json" "${p}/antigravity-cli/settings.json"
-out="$(AGY_SETTINGS_TRUSTED_PROFILE="${p}" AGY_SETTINGS_TRUSTED_TARGET="${FAKE_HOME}/.ssh/settings.json" _settings "${p}")"; rc=$?
-assert_eq "${rc}" "1" "approved target in a credential dir fails closed"
-assert_contains "${out}" "credential location" "... naming the reason"
-
-# ---------------------------------------------------------------------------
-echo "-- approval persistence: settings menu catalog, preset, sandbox-writable preset"
-catalog="$( _load; printf '%s\n' "${_AI_SETTINGS_LIST[@]}" )"
-assert_contains "${catalog}" "AGY_SETTINGS_TRUSTED_PROFILE|path||" "trusted profile is a path entry in the agy settings menu"
-assert_contains "${catalog}" "AGY_SETTINGS_TRUSTED_TARGET|path||" "trusted target is a path entry in the agy settings menu"
-assert_not_contains "$( source "${REPO_ROOT}/bin/ai_agent_universal_wrapper.bash"; source "${REPO_ROOT}/bin/ai_wrapper_data/claude_wrapper_lib.bash"; printf '%s\n' "${_AI_SETTINGS_LIST[@]}" )" \
-    "AGY_SETTINGS_TRUSTED" "trusted-target settings are agy-only"
-
-p="$(_mklinked preset)"
-(
-    cd "${WORK}" || exit 1
-    _load
-    AGY_SETTINGS_TRUSTED_PROFILE="${p}" AGY_SETTINGS_TRUSTED_TARGET="${dot}/settings.json" _preset_autosave
-) 2>/dev/null
-out="$(
-    cd "${WORK}" || exit 1
-    _load
-    unset AGY_SETTINGS_TRUSTED_PROFILE AGY_SETTINGS_TRUSTED_TARGET
-    _preset_autoload 2>&1
-    WRAPPER_FLAGS=()
-    _agy_validate_settings "${p}" 2>&1 && echo CONFIGURED
-)"
-assert_contains "${out}" "CONFIGURED" "approval saved via the preset is honoured on reload"
-
-# The preset that carries the approval must not be writable by the agent.
-out="$(
-    cd "${WORK}" || exit 1
-    export XDG_CONFIG_HOME="${WORK}/.config"
-    _load
-    WRAPPER_FLAGS=()
-    AGY_SETTINGS_TRUSTED_PROFILE="${p}" AGY_SETTINGS_TRUSTED_TARGET="${dot}/settings.json" \
-        _agy_validate_settings "${p}" 2>&1
-)"; rc=$?
-assert_eq "${rc}" "1" "approval refused when the preset dir is inside WORKDIR"
-assert_contains "${out}" "writable inside the sandbox" "... explaining that the agent could forge it"
-out="$(
-    cd "${WORK}" || exit 1
-    _load
-    WRAPPER_FLAGS=()
-    AI_SANDBOX_EXTRA_RW_DIRS="/nonexistent, ~/.config" AGY_SETTINGS_TRUSTED_PROFILE="${p}" \
-        AGY_SETTINGS_TRUSTED_TARGET="${dot}/settings.json" _agy_validate_settings "${p}" 2>&1
-)"; rc=$?
-assert_eq "${rc}" "1" "approval refused when an extra RW bind exposes the preset dir"
-out="$(
-    cd "${WORK}" || exit 1
-    _load
-    WRAPPER_FLAGS=(--bind "${FAKE_HOME}/.config" "${FAKE_HOME}/.config")
-    AGY_SETTINGS_TRUSTED_PROFILE="${p}" AGY_SETTINGS_TRUSTED_TARGET="${dot}/settings.json" \
-        _agy_validate_settings "${p}" 2>&1
-)"; rc=$?
-assert_eq "${rc}" "1" "approval refused when a wrapper --bind exposes the preset dir"
-
-# A plugin hook that can add binds after the trust decision makes the
-# preset's writability unknowable, so the approval is refused; a plugin
-# without such hooks does not affect it.
-for hook in _extra_post_menu_setup _extra_sandbox_setup; do
-    plugin="${FAKE_HOME}/plugin-${hook}.bash"
-    printf '%s() { WRAPPER_FLAGS+=(--bind "%s/.config"); bwrap_args+=(--bind "%s/.config" "%s/.config"); binds_rw+=("%s/.config"); }\n' \
-        "${hook}" "${FAKE_HOME}" "${FAKE_HOME}" "${FAKE_HOME}" "${FAKE_HOME}" >"${plugin}"
-    before="$(_fp "${dot}/settings.json")"
-    out="$(
-        cd "${WORK}" || exit 1
-        _load
-        AI_WRAPPER_EXTRA_PROFILE="${plugin}" _load_extra_profile
-        WRAPPER_FLAGS=()
-        AGY_SETTINGS_TRUSTED_PROFILE="${p}" AGY_SETTINGS_TRUSTED_TARGET="${dot}/settings.json" \
-            _agy_validate_settings "${p}" 2>&1
-    )"; rc=$?
-    assert_eq "${rc}" "1" "approval refused when a plugin defines ${hook} (late sandbox binds)"
-    assert_contains "${out}" "cannot be determined" "${hook}: ... explaining that writability is unknown"
-    assert_eq "$(_fp "${dot}/settings.json")" "${before}" "${hook}: ... and the approved target is untouched"
-done
-plugin="${FAKE_HOME}/plugin-header.bash"
-printf '_extra_header_extras() { :; }\n' >"${plugin}"
-out="$(
-    cd "${WORK}" || exit 1
-    _load
-    AI_WRAPPER_EXTRA_PROFILE="${plugin}" _load_extra_profile
-    WRAPPER_FLAGS=()
-    AGY_SETTINGS_TRUSTED_PROFILE="${p}" AGY_SETTINGS_TRUSTED_TARGET="${dot}/settings.json" \
-        _agy_validate_settings "${p}" 2>&1 && echo CONFIGURED
-)"
-assert_contains "${out}" "CONFIGURED" "a plugin without bind hooks does not block the approval"
+    # Crash safety: the wrapper is SIGKILLed at the agent launch; there is
+    # no restore step that could be skipped and no temp file to leak.
+    # stderr: the shell's "Killed" job notice.
+    out="$(_run_wrapper "${WORK}" AGY_TEST_KILL_WRAPPER=1 2>/dev/null)"; rc=$?
+    assert_eq "${rc}" "137" "crash: wrapper killed (SIGKILL) at the agent launch"
+    assert_contains "${out}" "BWRAP_ARG:--settings" "crash: ... after the --settings argv was built"
+    assert_eq "$(_snap "${cli}/settings.json" "${cli}")" "${before}" "crash: ... settings.json and antigravity-cli/ unchanged"
+    assert_eq "$(ls -A "${cli}")" "settings.json" "crash: ... with no leftover temp or backup files"
+    out="$(_run_wrapper "${WORK}")"; rc=$?
+    assert_eq "${rc}" "0" "crash: the next launch works normally"
+fi
 
 # ---------------------------------------------------------------------------
 echo "-- deterministic race injection around the embedded helper"
@@ -891,10 +682,12 @@ assert_eq "$(cat "${p}/antigravity-cli/brain/${CID}/.wrapper_title")" "Wrapper t
 
 # Platforms without dir_fd / O_NOFOLLOW support fail closed.
 p="$(_profile nocap)"
-out="$(_inject no-dir-fd - - settings "${p}" "${WORK}" "${FAKE_HOME}" "" "" "")"; rc=$?
+mkdir -p "${p}/antigravity-cli/brain/${CID}"
+before="$(_fp "${p}")"
+out="$(_inject no-dir-fd - - rename "${p}" "${CID}" "x")"; rc=$?
 assert_eq "${rc}" "1" "missing dir_fd support fails closed"
 assert_contains "${out}" "lacks no-follow directory-relative" "... with an explicit capability error"
-assert_eq "$(_is test -e "${p}/antigravity-cli/settings.json")" "no" "... and creates nothing"
+assert_eq "$(_fp "${p}")" "${before}" "... and creates nothing"
 
 # ---------------------------------------------------------------------------
 echo "-- backends: python3 required, jq/sqlite3 never used as unsafe fallbacks"
@@ -909,20 +702,15 @@ for tool in jq sqlite3; do
 done
 p="$(_profile nopy)"
 _mkdb "${p}/antigravity-cli/conversation_summaries.db" "${CID}" "Kept"
-_valid_settings "${WORK}" >"${p}/antigravity-cli/settings.json"
-before="$(_fp "${p}/antigravity-cli/settings.json")"
 # shellcheck disable=SC2034  # WRAPPER_FLAGS is read by the sourced lib
 out="$( cd "${WORK}" && _load && PATH="${nopy}" && hash -r && WRAPPER_FLAGS=() &&
-    { _agy_validate_settings "${p}"; echo "settings_rc=$?";
-      _agy_rename_conversation "${p}" "${CID}" "x"; echo "rename_rc=$?";
+    { _agy_rename_conversation "${p}" "${CID}" "x"; echo "rename_rc=$?";
       _agy_delete_conversation "${p}" "${CID}"; echo "delete_rc=$?";
       _agy_list_conversations "${p}" "${WORK}" 20; echo "list_rc=$?"; } 2>&1 )"
-assert_contains "${out}" "settings_rc=1" "no python3: settings check fails clearly"
-assert_contains "${out}" "python3 is required" "no python3: ... naming the missing dependency"
 assert_contains "${out}" "rename_rc=1" "no python3: rename fails"
+assert_contains "${out}" "python3 is required" "no python3: ... naming the missing dependency"
 assert_contains "${out}" "delete_rc=1" "no python3: delete fails"
 assert_contains "${out}" "list_rc=0" "no python3: listing degrades to empty with a warning"
-assert_eq "$(_fp "${p}/antigravity-cli/settings.json")" "${before}" "no python3: settings.json untouched"
 assert_eq "$(_dbtitle "${p}/antigravity-cli/conversation_summaries.db" "${CID}")" "Kept" "no python3: database untouched"
 assert_eq "$(_count_named "${FAKE_HOME}/canary" -ran)" "0" "no python3: jq/sqlite3 fallbacks are never invoked"
 
