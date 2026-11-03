@@ -21,6 +21,8 @@ Paths assume the chezmoi destination `~/ai-wrapper` that the scripts expect (`ru
 | `AGENTS.md` | `~/ai-wrapper/AGENTS.md` | System-wide AI agent rules (the sandbox RO-binds `~/AGENTS.md` when present) |
 | `CLAUDE.md` | `~/ai-wrapper/CLAUDE.md` | Claude Code guidelines redirect (the sandbox RO-binds `~/CLAUDE.md` when present) |
 
+The Cursor Agent wrapper was retired (#43). On the next `chezmoi apply`, `run_once_retire_cursor_wrapper.bash` removes unmodified copies of its launcher, lib and help file from `~/ai-wrapper/bin/` and a legacy `~/bin/`, and moves modified copies and symlinks to `~/ai-wrapper/.retired-cursor-wrapper/`. Cursor's own state, saved presets and the `cursor-agent` package are left alone. Preview with `bash run_once_retire_cursor_wrapper.bash --dry` from the source checkout.
+
 ## Prerequisites
 
 - Linux (tested on Arch Linux) or macOS

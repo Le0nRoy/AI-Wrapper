@@ -60,6 +60,7 @@ jobs:
       - run: bash tests/test_catalog_os_scope.bash
       - run: bash tests/test_help_doc_os_scope.bash
       - run: bash tests/test_setup_skills.bash
+      - run: bash tests/test_cursor_retirement.bash
       - run: bash tests/test_live_client_isolation.bash
       - run: bash tests/test_agy_host_boundary.bash
       - run: bash tests/test_preset_identity.bash
