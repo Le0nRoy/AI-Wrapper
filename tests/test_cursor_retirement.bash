@@ -81,6 +81,16 @@ assert_maintained_intact() {
     done
 }
 
+echo "-- script mode: chezmoi runs non-executable scripts with /bin/sh"
+# The script uses bash arrays, so /bin/sh (dash) would fail on Debian/Ubuntu.
+_script_is_executable=0
+[[ -x "${SCRIPT}" ]] && _script_is_executable=1
+_test_report "${_script_is_executable}" "script is executable on disk"
+_git_mode="$(git -C "${REPO_ROOT}" ls-files -s -- "$(basename "${SCRIPT}")" 2>/dev/null | cut -d' ' -f1)"
+if [[ -n "${_git_mode}" ]]; then
+    assert_eq "${_git_mode}" "100755" "script is tracked as executable in git"
+fi
+
 echo "-- fresh install: nothing to retire"
 new_home fresh
 run_retire
