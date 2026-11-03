@@ -305,7 +305,9 @@ fi
 # Each argument is OP:PATH; prints WROTE:<arg> or DENIED:<arg>.
 #   a = append to a file   r = replace a file (tmp + rename)
 #   c = create an entry in a dir   m = rename a path away
-PROBE="$(cat <<'PROBE'
+# read -d '' rather than "$(cat <<'PROBE' ...)": bash 3.2 (macOS /bin/bash)
+# misparses the case-pattern parentheses inside a command substitution.
+IFS= read -r -d '' PROBE <<'PROBE' || true
 ren() { perl -e 'rename($ARGV[0], $ARGV[1]) or exit 1' "$@"; }
 for arg in "$@"; do
     op="${arg%%:*}"; p="${arg#*:}"
@@ -319,7 +321,6 @@ for arg in "$@"; do
 done
 echo PROBES_DONE
 PROBE
-)"
 
 # _native CLIENT CWD PROBE_ARG... — bind with the native backend from CWD
 # and run the probe in the sandbox.
