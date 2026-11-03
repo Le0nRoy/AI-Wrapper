@@ -162,7 +162,7 @@ _bind() {
         WRAPPER_FLAGS=()
         CODEX_ACCOUNT="${1}"
         _bind_codex_account
-        printf '%s\n' "${WRAPPER_FLAGS[@]}" "NAME=${AI_WRAPPER_AGENT_NAME}"
+        printf '%s\n' "${WRAPPER_FLAGS[@]+"${WRAPPER_FLAGS[@]}"}" "NAME=${AI_WRAPPER_AGENT_NAME}"
     ) 2>&1
 }
 
@@ -252,7 +252,7 @@ if command -v git >/dev/null 2>&1; then
     git_q init "${FAKE_HOME}/repos/main"
     git_q -C "${FAKE_HOME}/repos/main" commit --allow-empty -m init
     git_q -C "${FAKE_HOME}/repos/main" worktree add "${FAKE_HOME}/wt" -b wt
-    _gitbind() { ( set -u; cd "${1}" && _load "${2}"; WRAPPER_FLAGS=(); _wrapper_bind_git_common_dir; printf '%s\n' "${WRAPPER_FLAGS[@]}" ) 2>&1; }
+    _gitbind() { ( set -u; cd "${1}" && _load "${2}"; WRAPPER_FLAGS=(); _wrapper_bind_git_common_dir; printf '%s\n' "${WRAPPER_FLAGS[@]+"${WRAPPER_FLAGS[@]}"}" ) 2>&1; }
     main_git="$(cd "${FAKE_HOME}/repos/main/.git" && pwd -P)"
     for agent in claude codex; do
         out="$(_gitbind "${FAKE_HOME}/wt" "${agent}")"
@@ -269,10 +269,18 @@ else
     echo "  skip - git not installed"
 fi
 
+# bash < 4.4 (macOS /bin/bash 3.2) treats "${arr[@]}" of an empty array
+# as unbound under `set -u`; WRAPPER_FLAGS can be empty (e.g. no binds on
+# macOS) and AGENT_FLAGS is agent-defined, so every expansion in bin/ must
+# use the "${arr[@]+"${arr[@]}"}" form. A plain "${arr[@]}" is matched
+# only when not preceded by `+` (the guarded form's inner expansion).
+unguarded="$(grep -rnE '(^|[^+])"\$\{(WRAPPER|AGENT)_FLAGS\[@\]\}"' "${REPO_ROOT}/bin" || true)"
+assert_eq "${unguarded}" "" "bin/: WRAPPER_FLAGS/AGENT_FLAGS expansions are empty-safe under bash 3.2 set -u"
+
 mkdir -p "${FAKE_HOME}/.config/glab-cli"
-out="$( set -u; cd "${FAKE_HOME}/work" && _load claude; WRAPPER_FLAGS=(); AI_SANDBOX_PASS_GITLAB=1 _apply_post_menu_binds; printf '%s\n' "${WRAPPER_FLAGS[@]}" )"
+out="$( set -u; cd "${FAKE_HOME}/work" && _load claude; WRAPPER_FLAGS=(); AI_SANDBOX_PASS_GITLAB=1 _apply_post_menu_binds; printf '%s\n' "${WRAPPER_FLAGS[@]+"${WRAPPER_FLAGS[@]}"}" )"
 assert_contains "${out}" "--ro-bind${NL}${FAKE_HOME}/.config/glab-cli" "PASS_GITLAB=1 RO-binds glab config"
-out="$( set -u; cd "${FAKE_HOME}/work" && _load codex; WRAPPER_FLAGS=(); AI_SANDBOX_PASS_GITLAB=0 _apply_post_menu_binds; printf '%s\n' "${WRAPPER_FLAGS[@]}" )"
+out="$( set -u; cd "${FAKE_HOME}/work" && _load codex; WRAPPER_FLAGS=(); AI_SANDBOX_PASS_GITLAB=0 _apply_post_menu_binds; printf '%s\n' "${WRAPPER_FLAGS[@]+"${WRAPPER_FLAGS[@]}"}" )"
 assert_eq "${out}" "" "PASS_GITLAB=0 adds no glab bind"
 
 # ---------------------------------------------------------------------------

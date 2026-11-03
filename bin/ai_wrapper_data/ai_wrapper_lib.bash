@@ -2149,8 +2149,8 @@ run_orchestrated_session() {
         return 1
     fi
 
-    run_sandboxed_agent "${AI_AGENT_COMMAND}" -- "${WRAPPER_FLAGS[@]}" -- \
-        "${AGENT_FLAGS[@]}" "${AI_SYSTEM_PROMPT_ARGS[@]}"
+    run_sandboxed_agent "${AI_AGENT_COMMAND}" -- "${WRAPPER_FLAGS[@]+"${WRAPPER_FLAGS[@]}"}" -- \
+        "${AGENT_FLAGS[@]+"${AGENT_FLAGS[@]}"}" "${AI_SYSTEM_PROMPT_ARGS[@]}"
 }
 
 # Run a plain agent session (start or resume). Uses AI_RESUME_ARGS if set.
@@ -2176,13 +2176,13 @@ run_agent_session() {
             if [[ "${AI_RESUME_ARGS_FIRST:-0}" == "1" ]]; then
                 # Resume is a subcommand (e.g. `codex resume`): it must
                 # precede the agent flags so they parse as its options.
-                run_sandboxed_agent "${AI_AGENT_COMMAND}" -- "${WRAPPER_FLAGS[@]}" -- "${resume_args[@]}" "${AGENT_FLAGS[@]}"
+                run_sandboxed_agent "${AI_AGENT_COMMAND}" -- "${WRAPPER_FLAGS[@]+"${WRAPPER_FLAGS[@]}"}" -- "${resume_args[@]}" "${AGENT_FLAGS[@]+"${AGENT_FLAGS[@]}"}"
             else
-                run_sandboxed_agent "${AI_AGENT_COMMAND}" -- "${WRAPPER_FLAGS[@]}" -- "${AGENT_FLAGS[@]}" "${resume_args[@]}"
+                run_sandboxed_agent "${AI_AGENT_COMMAND}" -- "${WRAPPER_FLAGS[@]+"${WRAPPER_FLAGS[@]}"}" -- "${AGENT_FLAGS[@]+"${AGENT_FLAGS[@]}"}" "${resume_args[@]}"
             fi
             ;;
         start)
-            run_sandboxed_agent "${AI_AGENT_COMMAND}" -- "${WRAPPER_FLAGS[@]}" -- "${AGENT_FLAGS[@]}"
+            run_sandboxed_agent "${AI_AGENT_COMMAND}" -- "${WRAPPER_FLAGS[@]+"${WRAPPER_FLAGS[@]}"}" -- "${AGENT_FLAGS[@]+"${AGENT_FLAGS[@]}"}"
             ;;
         *)
             wrapper_log "ERROR" "Unknown action: ${action} (expected 'start' or 'resume')"

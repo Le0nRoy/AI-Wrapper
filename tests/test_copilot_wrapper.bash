@@ -59,7 +59,7 @@ _copilot_binds() {
     (
         WRAPPER_FLAGS=()
         _copilot_bind_config_dirs || exit 1
-        printf '%s\n' "${WRAPPER_FLAGS[@]}"
+        printf '%s\n' "${WRAPPER_FLAGS[@]+"${WRAPPER_FLAGS[@]}"}"
     ) 2>&1
 }
 _reset_copilot_home() {
