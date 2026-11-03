@@ -904,15 +904,36 @@ inside the profile, or is neither file nor directory refuses the launch
 inside WORKDIR stay editable (trusted maintenance from their repository);
 a control containing WORKDIR stays writable with a WARN.
 `AI_SANDBOX_ALLOW_SETTINGS=1` (red, Sensitive) skips the protection with
-a WARN, also when restored from a preset. Per-client control inventories
-and wiring: #87.
+a WARN, also when restored from a preset.
+
+**Per-client inventories (#87).** Each wrapper passes its list after the
+RW profile bind and after the menu: `_CLAUDE_CLIENT_CONTROLS`
+(`claude_wrapper_lib.bash`, where `_bind_claude_account` now lives),
+`_CODEX_CLIENT_CONTROLS` (`codex_wrapper_lib.bash`),
+`_COPILOT_CLIENT_CONTROLS` / `_COPILOT_GH_CLIENT_CONTROLS`
+(`copilot_wrapper_lib.bash`; `_copilot_bind_config_dirs` moved after the
+menu) and `_AGY_CLIENT_CONTROLS` (`agy_wrapper_lib.bash`, after the
+managed-skills sync). Writable on purpose: `~/.claude.json`,
+`.credentials.json`, `projects/`; Codex `auth.json`, `history.jsonl`,
+`sessions/`; Copilot `session-state/`, `~/.config/github-copilot/hosts.json`
+and `apps.json`, `~/.local/share/copilot`; AGY's OAuth token,
+conversation databases, `brain/`, `conversations/`, `config/projects`.
 
 **Residual.** Controls absent at launch stay creatable (nothing is
 created on the host); a client may also read controls from places its
-inventory does not list. Tests: `tests/test_bind_hardening.bash` (flag
+inventory does not list, or that a listed setting points at (e.g. a
+statusline or hook script elsewhere in `$HOME`). Clients that rewrite a
+protected file themselves (Copilot `config.json` on in-sandbox `/login`
+or a trust grant, Claude `settings.json` on `/model`, Codex
+`config.toml` on project trust, Codex refreshing bundled
+`skills/.system`, agy `config/config.json` from settings commands) fail
+that write; run the change outside the sandbox or with
+`AI_SANDBOX_ALLOW_SETTINGS=1`. Tests: `tests/test_bind_hardening.bash` (flag
 generation; native bwrap/Seatbelt write, replace and rename probes where
 a backend is installed), `tests/test_macos_ro_overlays.bash` (SBPL
-rendering).
+rendering), `tests/test_client_persistent_controls.bash` (each wrapper's
+binder; native write, replace, rename denial plus auth, session and
+WORKDIR writes for all four clients).
 
 ## Local bugs / brittleness
 

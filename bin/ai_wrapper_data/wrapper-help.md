@@ -121,6 +121,18 @@ The sandbox bounds *writes* — it does not bound *reads* or *network*. Be aware
   inside the profile) refuses the launch. Controls inside WORKDIR stay
   editable, so maintaining them from their own repository works. A value
   set at launch wins over the saved per-workdir preset. Red banner.
+  Protected per client: Claude `~/.claude` settings(.local).json,
+  CLAUDE.md, AGENTS.md, RTK.md, agents, commands, hooks, output-styles,
+  plugins, skills; Codex `~/.codex` config.toml, config.json, hooks.json,
+  AGENTS(.override).md, agents, hooks, plugins, prompts, rules, skills;
+  Copilot `~/.copilot` config.json, settings.json, mcp-config.json,
+  copilot-instructions.md, AGENTS.md, agents, hooks, installed-plugins,
+  plugins, skills (and `~/.config/github-copilot/config.json`); AGY
+  `~/.gemini` antigravity-cli/settings.json and hooks.json, the config/
+  settings, MCP, hooks, rules, prompts, workflows, sidecars, agents,
+  plugins and skills, GEMINI.md, AGENTS.md, settings.json, commands,
+  extensions. A client command that saves one of these (e.g. Copilot
+  `/login` into config.json, Claude `/model`) fails in the sandbox.
 - `AI_SANDBOX_ALLOW_EXTERNAL_WORKTREES=1` — let git work in a linked
   worktree whose repository's shared `.git` lies outside `$HOME` (e.g.
   `/Data/projects/app/.git`). Off by default: only shared `.git` dirs

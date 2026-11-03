@@ -77,11 +77,19 @@ grants `agy` full autonomy inside the sandbox boundary:
   resolved working directory in `trustedWorkspaces`.
 
 `agy` applies these for that run only and never saves them. The wrapper
-never reads, creates or edits `<profile>/antigravity-cli/settings.json`
-(regular file or dotfiles symlink): your own settings there still apply
-to keys the wrapper does not pass, and `agy` launched outside the wrapper
-keeps your normal permission prompts. Sessions in different working
-directories can run in parallel; each trusts only its own directory.
+never reads, creates or edits `<profile>/antigravity-cli/settings.json`:
+your own settings there still apply to keys the wrapper does not pass,
+and `agy` launched outside the wrapper keeps your normal permission
+prompts. Sessions in different working directories can run in parallel;
+each trusts only its own directory.
+
+The profile's persistent controls (that `settings.json`, hooks, MCP
+config, rules, workflows, plugins, skills and prompt files; see
+`AI_SANDBOX_ALLOW_SETTINGS` in the general help) are read-only inside the
+sandbox. A symlinked one (e.g. a dotfiles-managed `settings.json`) refuses
+the launch, because the link itself could still be replaced: make it a
+regular file, or set `AI_SANDBOX_ALLOW_SETTINGS=1` to leave the controls
+writable.
 
 ## Account switching
 
