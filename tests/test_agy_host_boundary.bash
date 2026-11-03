@@ -363,6 +363,8 @@ print(json.dumps(d["trustedWorkspaces"]))' 2>&1
     assert_eq "$(_trusted <<<"${out}")" "$(_ws "${WORK}")" "... passing the sandbox permissions via --settings for WORKDIR"
     assert_eq "$(_snap "${cli}/settings.json" "${cli}")" "${before}" \
         "... and settings.json and its directory are unchanged (content, inode, mode, mtime)"
+    assert_contains "${out}" "BWRAP_ARG:--ro-bind"$'\n'"BWRAP_ARG:${cli}/settings.json"$'\n'"BWRAP_ARG:${cli}/settings.json" \
+        "... and the host settings.json is read-only in the sandbox (#87)"
 
     rm -f "${cli}/settings.json"
     before="$(_snap "${cli}")"
@@ -377,8 +379,17 @@ print(json.dumps(d["trustedWorkspaces"]))' 2>&1
     printf '{"colorScheme":"dark"}\n' >"${dot}/settings.json"
     ln -s "${dot}/settings.json" "${cli}/settings.json"
     before="$(_snap "${cli}/settings.json" "${dot}/settings.json" "${dot}" "${cli}")"
+    # A symlinked persistent control cannot be kept read-only (the link
+    # itself stays replaceable), so the launch is refused (#86 / #87);
+    # AI_SANDBOX_ALLOW_SETTINGS=1 launches with it left writable.
     out="$(_run_wrapper "${WORK}")"; rc=$?
-    assert_eq "${rc}" "0" "wrapper launches with a symlinked (dotfiles) settings.json"
+    assert_eq "${rc}" "1" "symlinked (dotfiles) settings.json refuses the launch by default"
+    assert_contains "${out}" "is a symlink" "... with an ERROR naming the cause"
+    assert_not_contains "${out}" "BWRAP_ARG:--settings" "... before any agent argv is built"
+    assert_eq "$(_snap "${cli}/settings.json" "${dot}/settings.json" "${dot}" "${cli}")" "${before}" \
+        "... leaving the symlink, its target and both directories unchanged"
+    out="$(_run_wrapper "${WORK}" AI_SANDBOX_ALLOW_SETTINGS=1)"; rc=$?
+    assert_eq "${rc}" "0" "wrapper launches with a symlinked (dotfiles) settings.json under AI_SANDBOX_ALLOW_SETTINGS=1"
     assert_eq "$(_snap "${cli}/settings.json" "${dot}/settings.json" "${dot}" "${cli}")" "${before}" \
         "... leaving the symlink, its target and both directories unchanged"
 
