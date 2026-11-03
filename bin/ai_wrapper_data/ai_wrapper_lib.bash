@@ -56,7 +56,7 @@ ORCHESTRATOR_PROMPT="${WRAPPER_DATA_DIR}/orchestrator-prompt.md"
 # profile. _wrapper_check_account_supported refuses such selections before
 # any host-side change (see #46).
 #
-# Shared across all three wrappers (Claude/Codex/Cursor) — every wrapper
+# Shared across every wrapper (Claude/Codex/Antigravity/Copilot) — each
 # sources this file, so a single `uname -s` check here covers them all.
 _wrapper_os="$(uname -s)"
 

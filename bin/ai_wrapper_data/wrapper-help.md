@@ -497,8 +497,8 @@ per-agent operation — no naming, no confirmation, no sub-menu required.
   where `<hash>` is the first 12 hex chars of the SHA-256 of the
   resolved (physical) working directory path, computed with
   `sha256sum` (GNU coreutils, Linux) or `shasum -a 256` (macOS) — one
-  of them must be on `PATH` — and `<agent>` is `claude`, `codex` or
-  `cursor`. One file per workdir and agent, so running the Claude and
+  of them must be on `PATH` — and `<agent>` is `claude`, `codex`,
+  `agy` or `copilot`. One file per workdir and agent, so running the Claude and
   Codex wrappers in the same directory never clobbers the other's
   settings.
 - **Auto-load** — fires when the menu opens, and before a

@@ -63,6 +63,7 @@ that launch a real sandbox.
 | `test_agy_host_boundary.bash` | fake home under `$HOME`, temp dir, sqlite dbs, symlinks, stub `bwrap`; checks wrapper runs (parallel, killed mid-launch) never touch settings.json | bash, python3 | full | conversation/helper parts; wrapper runs skipped |
 | `test_preset_identity.bash` | fake home under `$HOME`, stub `sha256sum`/`shasum` dirs, preset files | bash, python3 | full | full |
 | `test_setup_skills.bash` | fake home under `$TMPDIR` | bash, coreutils | full | full |
+| `test_cursor_retirement.bash` | fake homes under `$TMPDIR` with fixture copies of the retired Cursor files, symlinks, a read-only dir (permission case skipped as root) | bash, coreutils | full | full |
 | `dot_agents/skills/tortuga/scripts/test_gh.py` | none (mocked `subprocess`) | python3 | full | full |
 | `test_network_proxy.py` | loopback mock upstreams and proxies on ephemeral ports, UNIX sockets under a temp dir in `/tmp`, proxy subprocesses (stopped by signal); fake resolver, no DNS or internet | python3 | full | full |
 | `test_sandbox_common.bash`, `test_extra_bind_dirs.bash` | launches the real sandbox, fake home | bwrap + userns, python3 + libseccomp / sandbox-exec | fails without bwrap, user namespaces or the filter prerequisites | full |

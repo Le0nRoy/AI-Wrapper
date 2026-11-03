@@ -1167,8 +1167,7 @@ agent may be able to write — cannot authorize access; an explicit launch
 value, including `=0`, is kept. The common-dir bind therefore moved from
 before the menu into `_apply_post_menu_binds` (common dir, then WORKDIR
 metadata, then this worktree's submodules, then credential binds) in the
-claude, codex, agy and copilot wrappers. The cursor-agent wrapper never
-bound the common dir and still does not. The host shell configuration
+claude, codex, agy and copilot wrappers. The host shell configuration
 that may set the variable is not proven tamper-proof; separating
 persistent controls from agent-writable state is #48.
 
@@ -1221,9 +1220,8 @@ unsandboxed, on the user's next git command there.
 
 **Mitigation.** `_wrapper_protect_workdir_git` (`ai_wrapper_lib.bash`),
 called from `_apply_post_menu_binds` after the preset and menu in the
-claude, codex, agy and copilot wrappers (and directly in the
-cursor-agent wrapper). A refusal exits the wrapper before the client
-starts. It protects only entries that exist at launch:
+claude, codex, agy and copilot wrappers. A refusal exits the wrapper
+before the client starts. It protects only entries that exist at launch:
 
 | WORKDIR | Always | Protected mode only |
 |---|---|---|
