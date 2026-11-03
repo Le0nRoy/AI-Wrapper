@@ -882,6 +882,38 @@ agent and Docker sockets, still gated by their own settings).
   denied, proxy port reachable and refusing host loopback, opt-out as
   control; CI `smoke-macos` and `smoke-linux`).
 
+### S-π — client profiles' persistent controls writable (IN PROGRESS, 2026-11, #48)
+
+**Problem.** Client profile dirs (`~/.claude`, `~/.codex`, Copilot and
+AGY state) are bound RW for session, history and login state, but they
+also hold settings, skills, plugins, hooks and prompts that every later
+session (also unsandboxed) loads. An agent could plant persistent
+instructions or hooks there.
+
+**Core (#86).** `_wrapper_protect_client_controls TAG SRC_BASE DST_BASE
+CONTROL...` (`ai_wrapper_lib.bash`) pins the profile base and every
+directory between it and a control (`_wrapper_add_pin`), then over-mounts
+each control present at launch read-only (`_wrapper_add_ro_bind`), all
+pins first. bwrap: mount points, so writes fail with `EROFS` and
+rename/unlink of a control or pinned dir with `EBUSY`. Seatbelt:
+`_append_ro_deny_rules` / `_append_pin_rules` write denies including the
+ancestors below `$HOME`. A remapped Linux account is covered at both its
+sandbox and host path. A control that is a symlink, sits behind one
+inside the profile, or is neither file nor directory refuses the launch
+(binding the target would protect or expose another path). Controls
+inside WORKDIR stay editable (trusted maintenance from their repository);
+a control containing WORKDIR stays writable with a WARN.
+`AI_SANDBOX_ALLOW_SETTINGS=1` (red, Sensitive) skips the protection with
+a WARN, also when restored from a preset. Per-client control inventories
+and wiring: #87.
+
+**Residual.** Controls absent at launch stay creatable (nothing is
+created on the host); a client may also read controls from places its
+inventory does not list. Tests: `tests/test_bind_hardening.bash` (flag
+generation; native bwrap/Seatbelt write, replace and rename probes where
+a backend is installed), `tests/test_macos_ro_overlays.bash` (SBPL
+rendering).
+
 ## Local bugs / brittleness
 
 ### B-α — `mkdir -p ~/.claude` follows symlinks (RESOLVED, 2026-05-24, WS3)
