@@ -380,6 +380,17 @@ Red-banner opt-ins (raw credential material):
   vars (e.g. `PASS_ENV=ANTHROPIC_API_KEY` to forward an Anthropic key
   when Claude is not authenticated via `~/.claude.json`). Names must
   match `[A-Za-z_][A-Za-z0-9_]*`; whitespace ignored.
+- Claude Code UI settings — `CLAUDE_CODE_NO_FLICKER`,
+  `CLAUDE_CODE_DISABLE_MOUSE`, `CLAUDE_CODE_DISABLE_MOUSE_CLICKS`,
+  `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN`, `CLAUDE_CODE_SCROLL_SPEED` —
+  reach the Claude client whenever they are set (non-empty) in the launch
+  environment, e.g. `CLAUDE_CODE_NO_FLICKER=1 claude_wrapper.bash` for the
+  fullscreen renderer with mouse-wheel scrolling. Claude wrapper only;
+  other agents never receive them. Unset names are not passed.
+<!-- os:linux -->
+  The Claude wrapper adds the set ones to `AI_SANDBOX_PASS_ENV` for this
+  launch only (not saved in the workdir preset).
+<!-- os:end -->
 
 Additional passthrough / bind rules can be registered by a downstream
 plugin's `_extra_sandbox_setup` — see "Extensions via

@@ -113,6 +113,7 @@ jobs:
       - run: bash tests/test_macos_credential_policy.bash
       - run: bash tests/test_agy_wrapper.bash
       - run: bash tests/test_copilot_wrapper.bash
+      - run: bash tests/test_claude_wrapper.bash
       - run: bash tests/test_client_persistent_controls.bash
       - run: bash tests/test_linux_host_binds.bash
       - run: bash tests/test_linux_runtime_dir.bash
@@ -149,4 +150,5 @@ jobs:
       - run: bash tests/test_codex_wrapper.bash
       - run: bash tests/test_agy_wrapper.bash
       - run: bash tests/test_copilot_wrapper.bash
+      - run: bash tests/test_claude_wrapper.bash
       - run: bash tests/run-preset-tests.sh
