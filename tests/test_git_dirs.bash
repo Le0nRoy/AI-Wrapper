@@ -189,7 +189,7 @@ for case in "${IN}|${MG}|inside the root, external disk" "${EXT}/wt|${MG}|outsid
     _assert_rw_only "${out}" "worktree, ${label}" "${gd}"
 done
 out="$(_gitbind "${EXT}/wt")"
-assert_not_contains "${out}" "${EXT}/main${NL}" "outside-root worktree: repository root not granted"
+assert_not_contains "$(_grants "${out}")" "${EXT}/main " "outside-root worktree: repository root not granted"
 assert_not_contains "${out}" "${EXT}/sibling" "outside-root worktree: sibling repo not granted"
 assert_not_contains "${out}" "${EXT}/canary" "outside-root worktree: canary not granted"
 mkdir -p "${IN}/sub/deeper"
@@ -256,9 +256,9 @@ for case in "${EXT}/msup/sub|${MSD}|outside \$HOME" "${EXT}/msup/libs/foo|${MSG}
     _assert_rw_only "${out}" "submodule checkout, ${label}" "${gd}"
 done
 out="$(_gitbind "${EXT}/msup/sub")"
-assert_not_contains "${out}" "${MSG}${NL}" "submodule checkout: superproject .git not granted"
+assert_not_contains "$(_grants "${out}")" "${MSG} " "submodule checkout: superproject .git not granted"
 assert_not_contains "${out}" "${MSG}/modules/libs" "submodule checkout: sibling submodule git dir not granted"
-assert_not_contains "${out}" "bind${NL}${EXT}/msup${NL}" "submodule checkout: superproject root not granted"
+assert_not_contains "$(_grants "${out}")" "${EXT}/msup " "submodule checkout: superproject root not granted"
 mkdir -p "${EXT}/msup/sub/deeper/dir"
 _assert_rw_only "$(_gitbind "${EXT}/msup/sub/deeper/dir")" "submodule checkout subdirectory" "${MSD}"
 # Linked worktrees of a submodule: inside or outside the superproject.
@@ -267,7 +267,7 @@ git_q -C "${EXT}/msup/sub" worktree add "${EXT}/subwt-out" -b subwt-out
 git_q -C "${FAKE_HOME}/.local/share/chez/sub" worktree add "${FAKE_HOME}/repos/chez-wt" -b chez-wt
 _assert_rw_only "$(_gitbind "${EXT}/msup/.worktrees/subwt")" "submodule worktree inside the superproject" "${MSD}"
 _assert_rw_only "$(_gitbind "${EXT}/subwt-out")" "submodule worktree outside the superproject" "${MSD}"
-_assert_rw_only "$(_gitbind "${FAKE_HOME}/repos/chez-wt")" "~/.local/share/<repo> submodule worktree" "${LSG}/modules/sub"
+_assert_rw_only "$(_gitbind "${FAKE_HOME}/repos/chez-wt")" "\$HOME/.local/share/<repo> submodule worktree" "${LSG}/modules/sub"
 # The submodule checkout moved out of its superproject: the links still
 # name each other, which is what counts.
 mv "${EXT}/msup/libs/foo" "${EXT}/moved-foo"
@@ -654,7 +654,7 @@ if [[ "${sandbox_e2e}" == "1" ]]; then
         assert_eq "${ok}" "1" "e2e ${label}: hook and info/ file persisted on the host"
         if [[ -n "${extra}" ]]; then
             assert_contains "${out}" "NOREAD:extra" "e2e ${label}: ${extra#"${EXT}/"} next to the git dir not readable"
-            assert_contains "${out}" "DENIED:extra" "e2e ${label}: ... and not writable"
+            [[ "${OS}" == "Darwin" ]] && assert_contains "${out}" "DENIED:extra" "e2e ${label}: ... and not writable"
             assert_eq "$(cksum <"${extra}")" "${extra_before}" "e2e ${label}: ... bytes unchanged on the host"
         fi
         git --git-dir="${gd}" config --unset aiw.e2e

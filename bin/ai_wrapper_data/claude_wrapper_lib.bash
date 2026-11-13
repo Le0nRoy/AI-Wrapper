@@ -194,7 +194,7 @@ _CLAUDE_UI_ENV_VARS=(
 # setting, so adding to it earlier would hide a saved list from autoload
 # and persist these names into the workdir preset.
 _claude_pass_ui_env() {
-    [[ "${_wrapper_os}" == "Darwin" ]] && return 0
+    [[ "${_wrapper_os:-}" == "Darwin" ]] && return 0
     local name
     for name in "${_CLAUDE_UI_ENV_VARS[@]}"; do
         [[ -n "${!name:-}" ]] && _sandbox_pass_env_add "${name}"

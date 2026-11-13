@@ -35,7 +35,8 @@ _ui_pass_env() {
         local os="${1}" var; shift
         for var in ${UI_VARS}; do unset "${var}"; done
         unset AI_SANDBOX_PASS_ENV
-        [[ $# -gt 0 ]] && export "$@"
+        local pair
+        for pair in "$@"; do export "${pair?}"; done
         # shellcheck disable=SC2034  # read by _claude_pass_ui_env
         _wrapper_os="${os}"
         _claude_pass_ui_env
@@ -82,9 +83,14 @@ STUB
     # NAME=VALUE env in "$@". Sets rc and argv (one bwrap arg per line).
     _wrapper_argv() {
         local client="${1}"; shift
+        local pair
         rm -f "${ARGV_FILE}"
-        (cd "${FAKE_HOME}/work" && export PATH="${STUB_DIR}:${FAKE_HOME}/stubbin:${PATH}" "$@" \
-            && bash "${REPO_ROOT}/bin/executable_${client}_wrapper.bash" x </dev/null >/dev/null 2>&1)
+        (
+            cd "${FAKE_HOME}/work" || exit 1
+            export PATH="${STUB_DIR}:${FAKE_HOME}/stubbin:${PATH}"
+            for pair in "$@"; do export "${pair?}"; done
+            bash "${REPO_ROOT}/bin/executable_${client}_wrapper.bash" x </dev/null >/dev/null 2>&1
+        )
         rc=$?
         argv="$(cat "${ARGV_FILE}" 2>/dev/null)"
     }
