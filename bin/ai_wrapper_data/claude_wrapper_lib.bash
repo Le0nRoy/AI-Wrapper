@@ -35,7 +35,7 @@ source "${WRAPPER_DATA_DIR}/ai_wrapper_lib.bash"
 # account (today's unsuffixed ~/.claude) — CLAUDE_ACCOUNT=private and
 # CLAUDE_ACCOUNT=<unset> are treated identically.
 _AI_SETTINGS_LIST+=(
-    "CLAUDE_ACCOUNT|str|private|info|Account profile|Which ~/.claude-<name>/ credential profile to use. 'private' = default ~/.claude. Type a profile name, or 'private' to reset. Named profiles are Linux-only; macOS refuses them at launch.|account"
+    "CLAUDE_ACCOUNT|str|private|info|Account profile|Which ~/.claude-<name>/ credential profile to use. 'private' = default ~/.claude. Type a profile name, or 'private' to reset. Named profiles are Linux-only; macOS refuses them at launch. Use when: this session should run under another login, e.g. a work account kept in ~/.claude-work.|account"
 )
 
 # No source-time `export CLAUDE_ACCOUNT=private`: _preset_autoload treats a set

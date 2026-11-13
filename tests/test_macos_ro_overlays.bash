@@ -5,15 +5,19 @@
 # bin/ai_wrapper_data/macos_sandbox_exec.bash.
 #
 # Three layers:
-#   1. rule rendering (_append_ro_deny_rules), from the real worktree bind
-#      list _wrapper_bind_git_common_dir builds for Darwin — any OS;
+#   1. rule rendering (_append_ro_deny_rules) for a nested bind list (an RO
+#      tree with RW data dirs inside it and RO files inside an RW child) —
+#      any OS; plus the real Darwin git bind list, which has no RO entries
+#      (the git dir is fully writable, docs/security-concerns.md B-ρ) and
+#      is an --under-bind: never an exception to an RO write deny, so an
+#      RO overlay equal to, inside or holding the git dir stays read-only;
 #   2. backend wiring via AI_SANDBOX_DRYRUN (--ro-bind, AI_SANDBOX_EXTRA_*,
 #      _extra_sandbox_setup) — native on macOS; off macOS getconf and
 #      sandbox-exec are stubbed, so it checks generated text only;
-#   3. native sandbox-exec writes (ordering, extension hook, extra dirs) —
-#      macOS only, and a missing sandbox-exec there is a failure.
-# The full worktree probe (truncate, rename, unlink, links, git commit)
-# through the codex wrapper lives in tests/test_bind_hardening.bash.
+#   3. native sandbox-exec writes (ordering, extension hook, extra dirs,
+#      git in a linked worktree with its shared .git writable, RO overlays
+#      on top of an --under-bind) — macOS only, and a missing sandbox-exec
+#      there is a failure.
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -49,15 +53,21 @@ fi
 git_q() { git -c init.defaultBranch=main -c user.name=t -c user.email=t@t "$@" >/dev/null 2>&1; }
 git_q init "${FAKE_HOME}/repos/main"
 git_q -C "${FAKE_HOME}/repos/main" commit --allow-empty -m init
-git_q -C "${FAKE_HOME}/repos/main" worktree add "${FAKE_HOME}/repos/wt" -b wt
-git_q -C "${FAKE_HOME}/repos/main" worktree add "${FAKE_HOME}/repos/wt2" -b wt2
+git_q -C "${FAKE_HOME}/repos/main" worktree add "${FAKE_HOME}/repos/main/wt" -b wt
+git_q -C "${FAKE_HOME}/repos/main" worktree add "${FAKE_HOME}/repos/main/wt2" -b wt2
 mg="${FAKE_HOME}/repos/main/.git"
 wt_entry="${mg}/worktrees/wt"
 
-# Darwin-shaped (single-arg) worktree flags from the real wrapper helper.
-_worktree_flags() {
-    ( cd "${FAKE_HOME}/repos/wt" && _load_backend && _wrapper_os=Darwin && WRAPPER_FLAGS=() \
+# Darwin-shaped (single-arg) git flags from the real wrapper helper.
+_git_flags() {
+    ( cd "${FAKE_HOME}/repos/main/wt" && _load_backend && _wrapper_os=Darwin && WRAPPER_FLAGS=() \
         && _wrapper_bind_git_common_dir && printf '%s\n' "${WRAPPER_FLAGS[@]}" )
+}
+# Nested RO/RW bind list over the worktree fixture: the common dir RO, its
+# data dirs and one worktree entry RW, the entry's link files RO again.
+_nested_flags() {
+    printf '%s\n' --ro-bind "${mg}" --bind "${mg}/objects" --bind "${mg}/refs" --bind "${mg}/logs" \
+        --bind "${wt_entry}" --ro-bind "${wt_entry}/commondir" --ro-bind "${wt_entry}/gitdir"
 }
 # Render deny rules for the flag list on stdin (one token per line).
 _render_from_flags() {
@@ -75,23 +85,35 @@ _render_from_flags() {
 _render() { ( _load_backend; _append_ro_deny_rules test "${FAKE_HOME}" "$@" ) 2>&1; }
 
 # ---------------------------------------------------------------------------
-echo "-- rule rendering for the worktree bind list"
-flags="$(_worktree_flags 2>&1)"
-assert_not_contains "${flags}" "WARN" "worktree bind on Darwin: no 'hooks and config are writable' WARN"
+echo "-- git bind list on Darwin: the shared .git is fully writable"
+git_flags="$(_git_flags 2>&1)"
+assert_not_contains "${git_flags}" "WARN" "worktree git bind on Darwin: no WARN"
+assert_contains "${git_flags}" "--under-bind${NL}${mg}${NL}" "worktree git bind on Darwin: shared .git bound RW (--under-bind)"
+assert_not_contains "${git_flags}" "--ro-bind" "worktree git bind on Darwin: no read-only overlay"
+assert_not_contains "${git_flags}" "--pin" "worktree git bind on Darwin: no pin"
+assert_eq "$(printf '%s\n' "${git_flags}" | _render_from_flags 2>&1)" "" "worktree git bind on Darwin: no deny rules rendered"
+
+echo "-- rule rendering for a nested RO/RW bind list"
+flags="$(_nested_flags)"
 rules="$(printf '%s\n' "${flags}" | _render_from_flags 2>&1)"
 echo "  (rendered rules:${rules})"
-assert_contains "${rules}" "(deny ${DENY_OPS} (literal \"${mg}/config\"))" "config: literal write deny"
-assert_contains "${rules}" "(deny ${DENY_OPS} (subpath \"${mg}/hooks\"))" "hooks/: subpath write deny without exceptions (broader RW common dir is no exception)"
-wt_re="$( _load_backend; _regex_escape "${wt_entry}" )"
-assert_contains "${rules}" "(deny ${DENY_OPS} (require-all (subpath \"${mg}/worktrees\") (require-not (regex #\"^${wt_re}/\"))))" \
-    "worktrees/: denied except below this worktree's own entry"
-assert_contains "${rules}" "(deny ${DENY_OPS} (literal \"${wt_entry}/commondir\"))" "own commondir: literal write deny"
-assert_contains "${rules}" "(deny ${DENY_OPS} (literal \"${wt_entry}/gitdir\"))" "own gitdir: literal write deny"
-assert_not_contains "${rules}" "(subpath \"${mg}\")" "the RW common dir itself is not write-denied as a subpath"
+# The RO root is denied as a whole with exceptions only for the RW
+# children nested strictly inside it.
+_re() { ( _load_backend; _regex_escape "${1}" ); }
+mg_rule="(deny ${DENY_OPS} (require-all (subpath \"${mg}\")"
+for rw in "${mg}/objects" "${mg}/refs" "${mg}/logs" "${wt_entry}"; do
+    mg_rule+=" (require-not (regex #\"^$(_re "${rw}")/\"))"
+done
+mg_rule+="))"
+assert_contains "${rules}" "${mg_rule}" "RO root: subpath write deny except the nested RW dirs"
+assert_eq "$(printf '%s\n' "${rules}" | grep -c "(subpath \"${mg}\")")" "1" "RO root: exactly one subpath rule"
+assert_contains "${rules}" "(deny ${DENY_OPS} (literal \"${wt_entry}/commondir\"))" "RO file inside an RW child: literal write deny"
+assert_contains "${rules}" "(deny ${DENY_OPS} (literal \"${wt_entry}/gitdir\"))" "second RO file inside an RW child: literal write deny"
 pins="$(printf '%s\n' "${rules}" | grep '^(deny file-write\* (literal' || true)"
-assert_contains "${pins}" "(literal \"${wt_entry}\")" "own entry dir pinned (cannot be renamed away and back)"
-assert_contains "${pins}" "(literal \"${mg}\")" "common dir pinned"
-assert_contains "${pins}" "(literal \"${mg}/worktrees\")" "worktrees/ pinned"
+assert_contains "${pins}" "(literal \"${wt_entry}\")" "RW child holding RO files pinned (cannot be renamed away and back)"
+assert_contains "${pins}" "(literal \"${mg}/objects\")" "nested RW dir pinned"
+assert_contains "${pins}" "(literal \"${mg}\")" "RO root pinned"
+assert_contains "${pins}" "(literal \"${mg}/worktrees\")" "intermediate dir pinned"
 assert_eq "$(printf '%s\n' "${rules}" | grep -c '^(deny file-write\* (literal')" "1" "ancestor pins rendered once, de-duplicated"
 assert_contains "${pins}" "(literal \"${FAKE_HOME}/repos\")" "ancestor below \$HOME pinned"
 assert_not_contains "${pins}" "(literal \"${FAKE_HOME}\")" "\$HOME itself is not pinned"
@@ -101,10 +123,13 @@ assert_not_contains "${pins}" "(literal \"${FAKE_HOME%/*}\")" "\$HOME's parent i
 # precedence does not depend on flag order.
 reversed="$(printf '%s\n' "${flags}" | paste - - | tail -r 2>/dev/null || printf '%s\n' "${flags}" | paste - - | tac)"
 rules_rev="$(printf '%s\n' "${reversed}" | tr '\t' '\n' | _render_from_flags 2>&1)"
-assert_eq "$(printf '%s\n' "${rules_rev}" | grep -v '^(deny file-write\* (literal' | sort)" \
-    "$(printf '%s\n' "${rules}" | grep -v '^(deny file-write\* (literal' | sort)" "reversed bind order renders the same deny rules"
+# Exceptions inside one rule follow the RW flag order; compare them as a
+# set (Seatbelt's require-all does not depend on their order).
+_norm_rules() { grep -v '^(deny file-write\* (literal' | sed 's/ (require-not/\n&/g' | sed 's/)*$//' | sort; }
+assert_eq "$(printf '%s\n' "${rules_rev}" | _norm_rules)" \
+    "$(printf '%s\n' "${rules}" | _norm_rules)" "reversed bind order renders the same deny rules"
 rules_dup="$(printf '%s\n%s\n%s\n' "${flags}" --bind "${mg}" | _render_from_flags 2>&1)"
-assert_contains "${rules_dup}" "(deny ${DENY_OPS} (literal \"${mg}/config\"))" "trailing duplicate RW common dir does not reopen config"
+assert_contains "${rules_dup}" "${mg_rule}" "trailing duplicate RW grant on the RO root does not reopen it"
 
 echo "-- rule rendering edge cases"
 mkdir -p "${FAKE_HOME}/area/rw/deeper" "${FAKE_HOME}/area/other"
@@ -218,7 +243,7 @@ out="$(_dryrun -- --bind "${mg}" -- hi)"
 profile="${out#*=== Rendered SBPL profile ===}"
 assert_not_contains "${profile}" "(deny ${DENY_OPS}" "no --ro-bind: no write-deny rules"
 assert_not_contains "${profile}" "(deny file-write*" "no --ro-bind / --pin: no pin rules"
-# --pin alone (relaxed WORKDIR git metadata: no RO child to derive a pin).
+# --pin alone (a directory with no RO child to derive a pin from).
 out="$(_dryrun -- --pin "${FAKE_HOME}/project/ro-sub" -- hi)"; rc=$?
 assert_eq "${rc}" "0" "dry-run with --pin renders"
 profile="${out#*=== Rendered SBPL profile ===}"
@@ -231,7 +256,6 @@ assert_eq "${order_ok}" "1" "--pin rule rendered after every allow rule"
 out="$(_dryrun -- --pin "${FAKE_HOME}/nope" -- hi)"; rc=$?
 assert_eq "${rc}" "1" "missing --pin source fails"
 assert_contains "${out}" "--pin source missing" "... with the source-missing message"
-
 # _extra_sandbox_setup (AI_WRAPPER_EXTRA_PROFILE callback) keeps appending
 # to binds_ro / binds_rw, and its RO entries are enforced too.
 _ext_dryrun() {
@@ -245,6 +269,33 @@ profile="${out#*=== Rendered SBPL profile ===}"
 assert_contains "${profile}" "(deny file-write* (literal \"${FAKE_HOME}/ext-rw\"))" "extension hook: binds_pin rendered"
 assert_contains "${profile}" "(allow file* (subpath \"${FAKE_HOME}/ext-rw\"))" "extension hook: binds_rw still rendered"
 assert_contains "${profile}" "(deny ${DENY_OPS} (subpath \"${FAKE_HOME}/project/ro-sub\"))" "extension hook: binds_ro write-denied"
+
+# --under-bind (the git dir): an RW allow that never becomes an exception
+# to an --ro-bind write deny, whether the RO path holds it, equals it or
+# sits inside it. A plain --bind nested in an RO dir still carves one.
+mkdir -p "${FAKE_HOME}/project/ctl/repo/.git/hooks"
+ug="${FAKE_HOME}/project/ctl/repo/.git"
+out="$(_dryrun -- --under-bind "${ug}" --ro-bind "${FAKE_HOME}/project/ctl" --ro-bind "${ug}/hooks" -- hi)"; rc=$?
+assert_eq "${rc}" "0" "dry-run with --under-bind renders"
+profile="${out#*=== Rendered SBPL profile ===}"
+assert_contains "${profile}" "(allow file* (subpath \"${ug}\"))" "--under-bind: read-write allow on the git dir"
+assert_contains "${profile}" "(deny ${DENY_OPS} (subpath \"${FAKE_HOME}/project/ctl\"))" "--under-bind inside an RO dir: plain subpath deny, no exception"
+assert_contains "${profile}" "(deny ${DENY_OPS} (subpath \"${ug}/hooks\"))" "RO dir inside an --under-bind: write-denied"
+assert_not_contains "$(printf '%s\n' "${profile}" | grep -F "(deny ${DENY_OPS}" || true)" "require-not" "--under-bind: no RO exception in any write deny"
+last_allow="$(printf '%s\n' "${profile}" | grep -n '^(allow' | tail -1 | cut -d: -f1)"
+first_deny="$(printf '%s\n' "${profile}" | grep -nF "(deny ${DENY_OPS}" | head -1 | cut -d: -f1)"
+order_ok=0; [[ -n "${last_allow}" && -n "${first_deny}" && "${first_deny}" -gt "${last_allow}" ]] && order_ok=1
+assert_eq "${order_ok}" "1" "--under-bind: write-deny rules rendered after its allow"
+out="$(_dryrun -- --under-bind "${ug}" --ro-bind "${ug}" -- hi)"
+profile="${out#*=== Rendered SBPL profile ===}"
+assert_contains "${profile}" "(deny ${DENY_OPS} (subpath \"${ug}\"))" "--under-bind equal to an RO dir: RO wins"
+out="$(_dryrun -- --bind "${ug}" --ro-bind "${FAKE_HOME}/project/ctl" -- hi)"
+profile="${out#*=== Rendered SBPL profile ===}"
+assert_contains "${profile}" "(require-not (regex #\"^$(_re "${ug}")/\"))" "contrast: a plain --bind inside an RO dir is carved out"
+out="$(_dryrun -- --under-bind "${FAKE_HOME}/nope" -- hi)"; rc=$?
+assert_eq "${rc}" "1" "missing --under-bind source fails"
+assert_contains "${out}" "--under-bind source missing" "... with the source-missing message"
+rm -rf "${FAKE_HOME}/project/ctl"
 
 # Flag parsing and validation are unchanged.
 out="$(_dryrun -- --ro-bind "${FAKE_HOME}/nope" -- hi)"; rc=$?
@@ -262,26 +313,27 @@ elif ! command -v sandbox-exec >/dev/null 2>&1; then
 else
     # Writes run inside the sandbox; results are judged by host-side bytes.
     _native() {
-        ( cd "${FAKE_HOME}/repos/wt" && _load_backend && _run_sandboxed_agent_impl /bin/sh "$@" ) 2>&1
+        ( cd "${FAKE_HOME}/repos/main/wt" && _load_backend && _run_sandboxed_agent_impl /bin/sh "$@" ) 2>&1
     }
     _write_probe() { printf 'for f in "$@"; do (echo probe >>"$f") 2>/dev/null && echo "WROTE:$f" || echo "DENIED:$f"; done'; }
     config_before="$(cksum <"${mg}/config")"
-    # Worktree flags exactly as the wrapper builds them, then reversed, then
-    # with a trailing RW grant on the whole common dir.
+    # The nested bind list, then reversed, then with a trailing RW grant on
+    # the whole RO root.
     flag_list=()
     while IFS= read -r line; do flag_list+=("${line}"); done < <(printf '%s\n' "${flags}" | grep -v WARN)
     rev_list=()
     while IFS=$'\t' read -r f p; do rev_list+=("${f}" "${p}"); done < <(printf '%s\n' "${reversed}")
-    for variant in wrapper reversed dup-rw; do
+    for variant in nested reversed dup-rw; do
         case "${variant}" in
-            wrapper)  vflags=("${flag_list[@]}") ;;
+            nested)   vflags=("${flag_list[@]}") ;;
             reversed) vflags=("${rev_list[@]}") ;;
             dup-rw)   vflags=("${flag_list[@]}" --bind "${mg}") ;;
         esac
         out="$(_native -- "${vflags[@]}" -- -c "$(_write_probe)" _ \
-            "${mg}/config" "${mg}/worktrees/wt2/commondir" "${wt_entry}/gitdir" "${wt_entry}/probe-file" "${mg}/objects/probe-file")"
+            "${mg}/config" "${mg}/worktrees/wt2/commondir" "${wt_entry}/gitdir" "${wt_entry}/probe-file" "${mg}/objects/probe-file" \
+            "${mg}/commondir" "${mg}/config.worktree")"
         echo "  (native ${variant} output: ${out})"
-        for f in "${mg}/config" "${mg}/worktrees/wt2/commondir" "${wt_entry}/gitdir"; do
+        for f in "${mg}/config" "${mg}/worktrees/wt2/commondir" "${wt_entry}/gitdir" "${mg}/commondir" "${mg}/config.worktree"; do
             assert_contains "${out}" "DENIED:${f}" "native ${variant}: write to ${f#"${mg}"/} denied"
         done
         for f in "${wt_entry}/probe-file" "${mg}/objects/probe-file"; do
@@ -289,16 +341,45 @@ else
         done
         rm -f "${wt_entry}/probe-file" "${mg}/objects/probe-file"
     done
+    planted=0; [[ -e "${mg}/commondir" || -e "${mg}/config.worktree" ]] && planted=1
+    assert_eq "${planted}" "0" "native: no commondir or config.worktree created in the common dir on the host"
     assert_eq "$(cksum <"${mg}/config")" "${config_before}" "native: config bytes unchanged on the host"
 
-    # Path discovery works inside the sandbox with the RO denies in place:
-    # git lstat()s every component from / down (CI once failed here with
-    # "Invalid path '<HOME parent>': Operation not permitted").
-    out="$(_native -- "${flag_list[@]}" -- -c 'git rev-parse --git-common-dir --absolute-git-dir && stat "$1" >/dev/null && echo STAT_OK' _ "${FAKE_HOME%/*}")"
-    echo "  (native discovery output: ${out})"
+    # The wrapper's git flags: path discovery works (git lstat()s every
+    # component from / down; CI once failed here with "Invalid path '<HOME
+    # parent>': Operation not permitted"), and the shared .git is writable
+    # as a whole, config and hooks/ included.
+    git_flag_list=()
+    while IFS= read -r line; do git_flag_list+=("${line}"); done < <(printf '%s\n' "${git_flags}")
+    out="$(_native -- "${git_flag_list[@]}" -- -c 'git rev-parse --git-common-dir --absolute-git-dir && stat "$1" >/dev/null && echo STAT_OK
+        git -c user.name=t -c user.email=t@t commit -q --allow-empty -m native-rw && echo COMMIT_OK
+        git config --local aiw.probe yes && echo CONFIG_OK
+        (echo "#!/bin/sh" >"$2/hooks/post-checkout") 2>/dev/null && echo HOOK_OK' _ "${FAKE_HOME%/*}" "${mg}")"
+    echo "  (native git output: ${out})"
     assert_contains "${out}" "${mg}${NL}${wt_entry}" "native: git rev-parse resolves the common dir and own entry"
     assert_contains "${out}" "STAT_OK" "native: stat on HOME's parent works"
     assert_not_contains "${out}" "Invalid path" "native: no realpath EPERM"
+    for ok in COMMIT_OK CONFIG_OK HOOK_OK; do
+        assert_contains "${out}" "${ok}" "native: shared .git writable (${ok})"
+    done
+    assert_eq "$(git -C "${FAKE_HOME}/repos/main" config --get aiw.probe)" "yes" "native: config change persisted on the host"
+    git -C "${FAKE_HOME}/repos/main" config --unset aiw.probe
+    rm -f "${mg}/hooks/post-checkout"
+
+    # --under-bind under RO overlays: an RO dir holding the git dir and an
+    # RO dir inside it stay read-only; the rest of the git dir is writable.
+    ctl="${FAKE_HOME}/ctl-area"
+    mkdir -p "${ctl}/repo/.git/hooks" "${ctl}/repo/.git/objects" "${ctl}/other"
+    out="$(_native -- --bind "${ctl}/other" --under-bind "${ctl}/repo/.git" --ro-bind "${ctl}/repo/.git/hooks" -- -c "$(_write_probe)" _ \
+        "${ctl}/repo/.git/hooks/x" "${ctl}/repo/.git/objects/x")"
+    echo "  (native --under-bind output: ${out})"
+    assert_contains "${out}" "DENIED:${ctl}/repo/.git/hooks/x" "native --under-bind: RO dir inside it stays read-only"
+    assert_contains "${out}" "WROTE:${ctl}/repo/.git/objects/x" "native --under-bind: rest of the git dir writable"
+    out="$(_native -- --under-bind "${ctl}/repo/.git" --ro-bind "${ctl}" -- -c "$(_write_probe)" _ "${ctl}/repo/.git/objects/y")"
+    assert_contains "${out}" "DENIED:${ctl}/repo/.git/objects/y" "native --under-bind: an RO dir holding it keeps it read-only"
+    ok=0; [[ ! -e "${ctl}/repo/.git/hooks/x" && ! -e "${ctl}/repo/.git/objects/y" ]] && ok=1
+    assert_eq "${ok}" "1" "native --under-bind: denied files absent on the host"
+    rm -rf "${ctl}"
 
     # Synthetic probe of the ancestor pin alone: RW area, RO area/sub/ro.
     # area/sub is pinned (literal write deny). It must stay stat-able and
@@ -343,25 +424,25 @@ else
     assert_eq "${pin_ok}" "1" "native --pin probe: pinned dir still in place on the host"
 
     # AI_SANDBOX_EXTRA_RO_DIRS inside WORKDIR, and an RW extra dir equal to
-    # the common dir, are enforced.
-    mkdir -p "${FAKE_HOME}/repos/wt/ro-sub"
-    out="$(AI_SANDBOX_EXTRA_RO_DIRS="${FAKE_HOME}/repos/wt/ro-sub" AI_SANDBOX_EXTRA_RW_DIRS="${mg}" \
+    # the RO root of the nested list, are enforced.
+    mkdir -p "${FAKE_HOME}/repos/main/wt/ro-sub"
+    out="$(AI_SANDBOX_EXTRA_RO_DIRS="${FAKE_HOME}/repos/main/wt/ro-sub" AI_SANDBOX_EXTRA_RW_DIRS="${mg}" \
         _native -- "${flag_list[@]}" -- -c "$(_write_probe)" _ \
-        "${FAKE_HOME}/repos/wt/ro-sub/x" "${FAKE_HOME}/repos/wt/rw-file" "${mg}/config")"
+        "${FAKE_HOME}/repos/main/wt/ro-sub/x" "${FAKE_HOME}/repos/main/wt/rw-file" "${mg}/config")"
     echo "  (native extra-dirs output: ${out})"
-    assert_contains "${out}" "DENIED:${FAKE_HOME}/repos/wt/ro-sub/x" "native: AI_SANDBOX_EXTRA_RO_DIRS inside WORKDIR is read-only"
-    assert_contains "${out}" "WROTE:${FAKE_HOME}/repos/wt/rw-file" "native: rest of WORKDIR stays writable"
-    assert_contains "${out}" "DENIED:${mg}/config" "native: AI_SANDBOX_EXTRA_RW_DIRS=<common dir> does not reopen config"
-    rm -f "${FAKE_HOME}/repos/wt/rw-file"
+    assert_contains "${out}" "DENIED:${FAKE_HOME}/repos/main/wt/ro-sub/x" "native: AI_SANDBOX_EXTRA_RO_DIRS inside WORKDIR is read-only"
+    assert_contains "${out}" "WROTE:${FAKE_HOME}/repos/main/wt/rw-file" "native: rest of WORKDIR stays writable"
+    assert_contains "${out}" "DENIED:${mg}/config" "native: AI_SANDBOX_EXTRA_RW_DIRS equal to an RO-bound dir does not reopen it"
+    rm -f "${FAKE_HOME}/repos/main/wt/rw-file"
 
     # _extra_sandbox_setup binds are enforced natively.
-    out="$( cd "${FAKE_HOME}/repos/wt" && _load_backend
+    out="$( cd "${FAKE_HOME}/repos/main/wt" && _load_backend
         # shellcheck disable=SC2317,SC2329  # invoked by the backend
-        _extra_sandbox_setup() { binds_ro+=("${FAKE_HOME}/repos/wt/ro-sub"); binds_rw+=("${FAKE_HOME}/ext-rw"); }
+        _extra_sandbox_setup() { binds_ro+=("${FAKE_HOME}/repos/main/wt/ro-sub"); binds_rw+=("${FAKE_HOME}/ext-rw"); }
         _run_sandboxed_agent_impl /bin/sh -- -- -c "$(_write_probe)" _ \
-            "${FAKE_HOME}/repos/wt/ro-sub/y" "${FAKE_HOME}/ext-rw/z" 2>&1 )"
+            "${FAKE_HOME}/repos/main/wt/ro-sub/y" "${FAKE_HOME}/ext-rw/z" 2>&1 )"
     echo "  (native extension-hook output: ${out})"
-    assert_contains "${out}" "DENIED:${FAKE_HOME}/repos/wt/ro-sub/y" "native extension hook: binds_ro is read-only"
+    assert_contains "${out}" "DENIED:${FAKE_HOME}/repos/main/wt/ro-sub/y" "native extension hook: binds_ro is read-only"
     assert_contains "${out}" "WROTE:${FAKE_HOME}/ext-rw/z" "native extension hook: binds_rw is writable"
 fi
 

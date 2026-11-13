@@ -251,12 +251,13 @@ if command -v git >/dev/null 2>&1; then
     git_q() { git -c init.defaultBranch=main -c user.name=t -c user.email=t@t "$@" >/dev/null 2>&1; }
     git_q init "${FAKE_HOME}/repos/main"
     git_q -C "${FAKE_HOME}/repos/main" commit --allow-empty -m init
-    git_q -C "${FAKE_HOME}/repos/main" worktree add "${FAKE_HOME}/wt" -b wt
+    git_q -C "${FAKE_HOME}/repos/main" worktree add "${FAKE_HOME}/repos/main/wt" -b wt
     _gitbind() { ( set -u; cd "${1}" && _load "${2}"; WRAPPER_FLAGS=(); _wrapper_bind_git_common_dir; printf '%s\n' "${WRAPPER_FLAGS[@]+"${WRAPPER_FLAGS[@]}"}" ) 2>&1; }
     main_git="$(cd "${FAKE_HOME}/repos/main/.git" && pwd -P)"
     for agent in claude codex; do
-        out="$(_gitbind "${FAKE_HOME}/wt" "${agent}")"
-        assert_contains "${out}" "--bind${NL}${main_git}" "${agent}: worktree binds the shared .git RW"
+        out="$(_gitbind "${FAKE_HOME}/repos/main/wt" "${agent}")"
+        assert_contains "${out}" "--under-bind${NL}${main_git}${NL}" "${agent}: worktree binds the shared .git read-write, under every RO overlay"
+        assert_not_contains "${out}" "--ro-bind" "${agent}: ... with no read-only overlay"
         if [[ "${OS}" == "Darwin" ]]; then
             assert_contains "${out}" "--meta-bind${NL}$(cd "${FAKE_HOME}/repos" && pwd -P)" "${agent}: meta-binds intermediate dirs on macOS"
         else
@@ -411,14 +412,14 @@ STUB
     # Whole-script check of the refactored worktree bind for BOTH wrappers:
     # git inside the sandbox can only read a worktree's history if the
     # shared .git (outside WORKDIR) was bound.
-    if [[ -d "${FAKE_HOME}/wt" ]]; then
+    if [[ -d "${FAKE_HOME}/repos/main/wt" ]]; then
         for agent in claude codex; do
             cat >"${FAKE_HOME}/bin/${agent}" <<'STUB'
 #!/bin/bash
 git log --format='LOG:%s' -1 2>&1
 STUB
             chmod +x "${FAKE_HOME}/bin/${agent}"
-            out="$(cd "${FAKE_HOME}/wt" && PATH="${FAKE_HOME}/bin:${PATH}" \
+            out="$(cd "${FAKE_HOME}/repos/main/wt" && PATH="${FAKE_HOME}/bin:${PATH}" \
                 bash "${REPO_ROOT}/bin/executable_${agent}_wrapper.bash" x </dev/null 2>&1)"
             assert_contains "${out}" "LOG:init" "${agent} wrapper: git works in a worktree inside the sandbox"
         done

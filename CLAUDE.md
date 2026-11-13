@@ -25,5 +25,6 @@ This is the **`ai-wrapper`** chezmoi-managed repository containing:
 | Chezmoi naming/workflow | `AGENTS.md` → This Repository |
 | Code standards | `AGENTS.md` § 2 |
 | Test writing and safe test commands | `AGENTS.md` § 4, `docs/testing.md` |
+| Owner-accepted security exceptions | `docs/owner-accepted-exceptions.md` |
 | Orchestration workflow | `orchestrator-mode` skill |
 | Tortuga task operations | Shared `tortuga` skill; only on request |

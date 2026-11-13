@@ -60,7 +60,7 @@ that launch a real sandbox.
 | File | Side effects | Needs | Linux | macOS |
 |------|--------------|-------|-------|-------|
 | `test_live_client_isolation.bash` | fake home under `$HOME`, temp dir | bash | full; bwrap e2e if available | host checks; e2e skipped |
-| `test_catalog_os_scope.bash`, `test_help_doc_os_scope.bash` | none | bash | full | full |
+| `test_catalog_os_scope.bash`, `test_help_doc_os_scope.bash` | catalog: temp dir with a fake home; drives `show_header` and `s) Settings` (incl. `?N` help) through a private pty | bash; python3 for the menu render (skip line without) | full | full |
 | `test_agy_host_boundary.bash` | fake home under `$HOME`, temp dir, sqlite dbs, symlinks, stub `bwrap`; checks wrapper runs (parallel, killed mid-launch) never touch settings.json | bash, python3 | full | conversation/helper parts; wrapper runs skipped |
 | `test_preset_identity.bash` | fake home under `$HOME`, stub `sha256sum`/`shasum` dirs, preset files | bash, python3 | full | full |
 | `test_setup_skills.bash` | fake home under `$TMPDIR` | bash, coreutils | full | full |
@@ -71,10 +71,10 @@ that launch a real sandbox.
 | `test_sandbox_common.bash`, `test_extra_bind_dirs.bash` | launches the real sandbox, fake home | bwrap + userns, python3 + libseccomp / sandbox-exec | fails without bwrap, user namespaces or the filter prerequisites | full |
 | `test_sandbox_macos_only.bash` | sandbox-exec dry-run | sandbox-exec | exits 0 with a skip line | full |
 | `test_macos_credential_policy.bash` | fake home under `$HOME` with synthetic git credential files and a fake `*.keychain-db`; stub `getconf`/`sandbox-exec` off macOS; on CI or with `AI_WRAPPER_TEST_SYNTHETIC_KEYCHAIN=1` a throwaway keychain in the fake home (added to and removed from the user keychain search list) | bash; sandbox-exec and `security` for native probes | profile-check unit tests + rendered profile; native part skipped | full: native git-credential and Keychain denial (missing sandbox-exec fails) |
-| `test_macos_ro_overlays.bash` | git repos in fake home; stub `getconf`/`sandbox-exec` off macOS | git; sandbox-exec for native checks | rule rendering + mocked dry-run; native part skipped | full, native write denial (missing sandbox-exec fails) |
+| `test_macos_ro_overlays.bash` | git repos in fake home; stub `getconf`/`sandbox-exec` off macOS | git; sandbox-exec for native checks | rule rendering (nested RO/RW bind list, pins, client controls; the git bind list has no RO entries and is an `--under-bind`, never an RO exception) + mocked dry-run; native part skipped | full, native write denial (also RO overlays inside and around an `--under-bind`), plus git in a linked worktree with its shared `.git` writable (missing sandbox-exec fails) |
 | `test_claude_wrapper.bash` | fake home under `$HOME`, stub `claude`/`copilot` and stub `bwrap`/`sysctl` in temp dirs; bwrap e2e with a stub claude | bash; bwrap for e2e | full: Claude UI env allowlist, bwrap argv (claude vs copilot), e2e with bwrap | allowlist logic only; argv and e2e skipped |
 | `test_codex_wrapper.bash`, `test_agy_wrapper.bash`, `test_copilot_wrapper.bash` | git repos, sqlite db, stub clients in fake home; bwrap e2e | git, python3 (sqlite3, tomllib optional), bwrap for e2e | full with bwrap; e2e skipped without | argv/unit parts, native named-account refusal (#46); bwrap e2e skipped |
-| `test_bind_hardening.bash` | git repos (incl. a worktree with nested submodules via local file:// clones), stub codex/claude in fake home, symlinks into the fake home's `.ssh`/`.config`/`.bashrc` and to `/etc` (never followed by a write), stub `bwrap`/`sysctl` dir (Linux argv), temp alias dir under `/tmp` (macOS) | git, perl; bwrap or sandbox-exec for e2e | full with bwrap (path-resolution argv and config-symlink policy run without it); e2e skipped without | full: native worktree write-denial e2e (missing sandbox-exec fails) |
+| `test_bind_hardening.bash` | git repos and crafted checkouts (pointers into a fake `.ssh`, `.gnupg`, keyrings, `$HOME`, the system temp dir), stub codex/claude in fake home, symlinks into the fake home's `.ssh`/`.config`/`.bashrc` and to `/etc` (never followed by a write), stub `bwrap`/`sysctl` dir (Linux argv) | git, perl; bwrap or sandbox-exec for e2e | full with bwrap (git pointer sanity, path-resolution argv and config-symlink policy run without it); e2e skipped without | full: native client-control denial (missing sandbox-exec fails) |
 | `test_client_persistent_controls.bash` | fake home under `$HOME` with synthetic Claude / Codex / Copilot / AGY profiles (controls, auth and session files, a symlinked skills dir), work dir in the fake home | bash, perl; bwrap or sandbox-exec for native probes | full: per-client flag generation, refusal, `AI_SANDBOX_ALLOW_SETTINGS`, WORKDIR exception; native write/replace/rename denial and auth/session/WORKDIR writes (skipped without bwrap) | full: plus native Seatbelt probes (skipped without sandbox-exec) |
 | `test_linux_host_binds.bash` | fake home under `$HOME` (synthetic `~/bin`, skills, Android, Kind and kube dirs), stub `bwrap`/`sysctl` dir, a synthetic UNIX socket served by python3 | bash, python3; bwrap for native probes | full: argv gates, native denial/persistence (missing bwrap fails) | skipped |
 | `test_linux_runtime_dir.bash` | fake home under `$HOME`, synthetic runtime dirs under `/tmp`, stub `bwrap`/`sysctl` dir, synthetic UNIX socket servers (bus, systemd, Docker, Podman, SSH agent) served by python3 | bash, python3; bwrap for native probes | full: argv, native socket denial/grants, private dir mode/owner, broad-override persistence (missing bwrap fails) | skipped |
@@ -84,8 +84,7 @@ that launch a real sandbox.
 | `test_linux_network_isolation.bash` | fake home under `$HOME`, fake `/proc/sys` knobs, stub `bwrap` and failing/hanging proxy stand-ins in a temp dir; real `ai_network_proxy.py` subprocesses on UNIX sockets in private dirs under `/tmp` (stopped after each launch); a host test server on an abstract UNIX socket and a `127.0.0.1` ephemeral port; forwarder tests on ephemeral loopback ports; no DNS or internet (the one public-address connect is expected to be unroutable) | bash, python3 (+ libseccomp for the launch); bwrap for native probes | full: forwarder unit tests (`test_sandbox_net_forwarder.py`), `--unshare-net` / `--share-net` argv, proxy variables, socket and forwarder binds, proxy lifecycle (own session, cleanup after success and failure, caller EXIT trap kept), fail-closed startup, native host abstract-socket / loopback / direct-egress denial and the proxy path, with `AI_SANDBOX_ALLOW_UNRESTRICTED_NET=1` as control (missing bwrap fails) | skipped (Linux-only) |
 | `test_macos_network_isolation.bash` | fake home under `$HOME`; stub `sandbox-exec` (records argv/env, runs the client unsandboxed) and failing/hanging proxy stand-ins in a temp dir; stub `getconf` off macOS; real `ai_network_proxy.py` subprocesses on ephemeral `127.0.0.1` ports with private dirs under the (fake) `DARWIN_USER_TEMP_DIR`; a host test server on a `127.0.0.1` ephemeral port (macOS); no DNS or internet (the one public-address connect is expected to be denied by Seatbelt) | bash, python3; sandbox-exec and system perl for native probes | profile text, `-D ALLOW_UNRESTRICTED_NET`/`PROXY_PORT`, proxy variables (last, passthrough-proof), proxy lifecycle (cleanup after success, failure, dry run and a killed wrapper; caller EXIT trap kept; a parent's EXIT trap not run by a subshell or command substitution, with and without `BASHPID` and under macOS `/bin/bash`), fail-closed startup; native part skipped | full: plus native host-loopback / direct-egress denial and the proxy path, with `AI_SANDBOX_ALLOW_UNRESTRICTED_NET=1` as control (missing sandbox-exec fails) |
 | `test_sensitive_path_parity.bash` | fake home under `$HOME`; stub `getconf`/`sandbox-exec` off macOS; refusals from `/etc` (never granted to a client) | bash; bwrap or sandbox-exec for native refusals | classifier tables + mocked macOS backend; native Linux refusals need bwrap (missing bwrap fails) | full, native refusals incl. `/private/etc` |
-| `test_external_worktree.bash` | git repos in fake home and in a sibling dir outside it (real `$HOME` or the checkout's `tests/`), one in the system temp dir, preset files, stub codex; drives the interactive menu through a pty | git, perl, python3; bwrap or sandbox-exec for e2e | full with bwrap; e2e skipped without | full: native external-worktree write/read denial (missing sandbox-exec fails) |
-| `test_workdir_git_protection.bash` | git repos (normal, worktree, bare, scaffold, nested submodules via local file:// clones) and stub clients in fake home | git, perl, python3; bwrap or sandbox-exec for e2e | full with bwrap; missing bwrap fails | full: native WORKDIR git metadata write denial (missing sandbox-exec fails) |
+| `test_git_dirs.bash` | git repos (plain, worktrees inside and outside their root, bare `<name>.git` and `.bare` repos, symlinked paths, superprojects with nested and slash-named submodules via local file:// clones, one under `~/.local/share`, one in `~/.config/gh`, one in `~/.password-store`) in fake home and in a sibling dir outside it (real `$HOME` or the checkout's `tests/`), some in the system temp dir, crafted pointers, a planted git dir in a synthetic client profile (`~/.claude`), read-only extra dirs inside and around a git dir, preset files, stub codex, stub `bwrap` (Linux argv, `--bind-fd` on and off) | git | full with bwrap (bind lists, pointer refusals, former location refusals and a git dir in an agent profile now accepted, bwrap argv order and descriptor binds through the stub, and retired-preset handling run without it) | full: native commit / config / hook / `info/` writes in a plain repo, an outside-root worktree and a submodule checkout, files next to the git dir unreachable, read-only extra dirs inside or around the git dir read-only (missing sandbox-exec fails) |
 | `run-preset-tests.sh` | rewritten lib copy and scratch dirs under `$TMPDIR` (fallback `tests/preset/_scratch/`, git-ignored), removed on exit | BSD `stat -f` | exits 2 (not run) | full |
 
 ## CI mapping
@@ -102,8 +101,8 @@ or is not listed above.
   helper, live-client isolation canaries, agy host-side boundary, preset
   identity, suite inventory, network proxy engine.
 - `smoke-linux`: bubblewrap installed; sandbox, extra-binds, isolation
-  canaries (with e2e), codex, bind-hardening, external worktrees,
-  WORKDIR git metadata, macOS RO-overlay and credential-policy rendering, agy, copilot, Linux
+  canaries (with e2e), codex, bind-hardening, git dirs (plain repos,
+  worktrees, submodule checkouts), macOS RO-overlay and credential-policy rendering, agy, copilot, Linux
   host-path gates (native ~/bin / skills / Android / Tailscale / Kind probes),
   user runtime dir (native socket denial and named grants), process
   isolation (nested user namespaces, terminal-injection filter and its
@@ -113,7 +112,7 @@ or is not listed above.
   `test_sandbox_net_forwarder.py` unit tests), macOS network isolation (profile text, proxy wiring with a stub
   `sandbox-exec`).
 - `smoke-macos`: sandbox, macOS-only, extra-binds, bind-hardening,
-  external worktrees, WORKDIR git metadata and RO overlays (native write denial),
+  git dirs (native git writes) and RO overlays (native write denial),
   credential policy (native git-credential and Keychain denial, synthetic
   keychain probe), network isolation (native Seatbelt egress and loopback
   denial through the egress proxy), client persistent controls (native
@@ -133,10 +132,12 @@ or is not listed above.
 
 ## Native-OS limits
 
-- Worktree common-dir (inside and, with the opt-in, outside `$HOME`)
-  and WORKDIR git metadata write denial run natively on both OSes
-  (`test_bind_hardening.bash`, `test_external_worktree.bash`,
-  `test_workdir_git_protection.bash`, `test_macos_ro_overlays.bash`). Other
+- Git in the sandbox (commit, config, hooks and `info/` writes persisting
+  in a plain repository, a worktree outside its root and a submodule
+  checkout outside `$HOME`; files next to the git dir unreachable; a
+  refused pointer leaves git unavailable; read-only overlays stay read-only inside or around the
+  git dir; docs/security-concerns.md B-ρ) runs natively on both OSes (`test_git_dirs.bash`, and the linked
+  worktree case in `test_macos_ro_overlays.bash`). Other
   wrapper e2e tests (account remap, credential-dir write denial) run on
   Linux bwrap only; on macOS argv snapshots that contain `--bind` do not
   prove enforcement.
@@ -149,9 +150,9 @@ or is not listed above.
   `AI_SANDBOX_PASS_GITLAB=1` (#47; `test_macos_credential_policy.bash`).
   All use synthetic fixtures in a fake home, never real credentials.
 - Settings, presets and warnings are covered as logic, not by a real
-  client: explicit-env precedence over saved presets, session-only
-  settings never persisted, and restored-risky-setting warnings
-  (`run-preset-tests.sh`, macOS only; `test_external_worktree.bash`,
+  client: explicit-env precedence over saved presets, retired settings in
+  old presets, and restored-risky-setting warnings
+  (`run-preset-tests.sh`, macOS only; `test_git_dirs.bash`,
   `test_catalog_os_scope.bash`, `test_agy_wrapper.bash`).
 
 ## Manual gates

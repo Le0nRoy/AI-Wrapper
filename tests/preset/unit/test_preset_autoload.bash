@@ -288,23 +288,30 @@ assert_unmatch "UNIT-AUTOLOAD-13-info" "AI_SANDBOX_DEBUG" "${err}" || ok=0
 if (( ok == 1 )); then PASS=$((PASS+1)); echo "PASS UNIT-AUTOLOAD-13"; else FAIL=$((FAIL+1)); fi
 clean_scratch
 
-# UNIT-AUTOLOAD-14: session-only AI_SANDBOX_ALLOW_EXTERNAL_WORKTREES (#13)
-# is never loaded from the preset, even when the caller left it unset.
+# UNIT-AUTOLOAD-14: retired git settings (_AI_RETIRED_SETTINGS) in an old
+# preset are skipped: never exported, no unknown-setting WARN; a saved
+# non-default value prints one NOTE, a saved 0 nothing; other keys load.
 mk_scratch; guard_home
 unset XDG_CONFIG_HOME
 export XDG_CONFIG_HOME="${TEST_SCRATCH}/config"
 clear_catalog_env
+unset AI_SANDBOX_ALLOW_GIT_CONFIG AI_SANDBOX_ALLOW_EXTERNAL_WORKTREES AI_SANDBOX_BLOCK_LINKED_GIT_DIRS
 source_lib
 path="$(_preset_autosave_path)"
 mkdir -p "$(dirname "${path}")"
-printf 'AI_SANDBOX_ALLOW_EXTERNAL_WORKTREES=1\n' > "${path}"
-unset AI_SANDBOX_ALLOW_EXTERNAL_WORKTREES
+printf 'AI_SANDBOX_ALLOW_GIT_CONFIG=0\nAI_SANDBOX_ALLOW_EXTERNAL_WORKTREES=1\nAI_SANDBOX_BLOCK_LINKED_GIT_DIRS=1\nAI_SANDBOX_DEBUG=1\n' > "${path}"
 err_file="${TEST_SCRATCH}/stderr"
-_preset_autoload 2>"${err_file}"
-err="$(cat "${err_file}")"
+_preset_autoload 2>"${err_file}" >"${TEST_SCRATCH}/stdout"
+err="$(cat "${err_file}" "${TEST_SCRATCH}/stdout")"
 ok=1
-assert_eq "UNIT-AUTOLOAD-14" "unset" "${AI_SANDBOX_ALLOW_EXTERNAL_WORKTREES-unset}" || ok=0
-assert_match "UNIT-AUTOLOAD-14-warn" "Ignoring AI_SANDBOX_ALLOW_EXTERNAL_WORKTREES" "${err}" || ok=0
+assert_eq "UNIT-AUTOLOAD-14-git-config" "unset" "${AI_SANDBOX_ALLOW_GIT_CONFIG-unset}" || ok=0
+assert_eq "UNIT-AUTOLOAD-14-worktrees" "unset" "${AI_SANDBOX_ALLOW_EXTERNAL_WORKTREES-unset}" || ok=0
+assert_eq "UNIT-AUTOLOAD-14-block" "unset" "${AI_SANDBOX_BLOCK_LINKED_GIT_DIRS-unset}" || ok=0
+assert_eq "UNIT-AUTOLOAD-14-other" "1" "${AI_SANDBOX_DEBUG-unset}" || ok=0
+assert_match "UNIT-AUTOLOAD-14-note-worktrees" "Ignoring retired setting AI_SANDBOX_ALLOW_EXTERNAL_WORKTREES=1" "${err}" || ok=0
+assert_match "UNIT-AUTOLOAD-14-note-block" "Ignoring retired setting AI_SANDBOX_BLOCK_LINKED_GIT_DIRS=1" "${err}" || ok=0
+assert_unmatch "UNIT-AUTOLOAD-14-default-silent" "AI_SANDBOX_ALLOW_GIT_CONFIG" "${err}" || ok=0
+assert_unmatch "UNIT-AUTOLOAD-14-no-unknown" "unknown setting" "${err}" || ok=0
 assert_unmatch "UNIT-AUTOLOAD-14-restored" "Restored" "${err}" || ok=0
 if (( ok == 1 )); then PASS=$((PASS+1)); echo "PASS UNIT-AUTOLOAD-14"; else FAIL=$((FAIL+1)); fi
 clean_scratch

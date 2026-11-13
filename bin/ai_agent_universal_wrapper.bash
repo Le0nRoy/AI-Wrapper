@@ -11,9 +11,11 @@
 # Usage:
 #   run_sandboxed_agent COMMAND -- [BIND_FLAGS...] -- [CMD_ARGS...]
 #
-# BIND_FLAGS on Linux are bwrap-shaped: --bind SRC DST / --ro-bind SRC DST.
+# BIND_FLAGS on Linux are bwrap-shaped: --bind SRC DST / --ro-bind SRC DST,
+# plus --under-bind SRC DST (read-write, mounted before every read-only
+# overlay and pin, by descriptor when bwrap has --bind-fd).
 # BIND_FLAGS on macOS are single-arg (see macos_sandbox_exec.bash header):
-# --bind SRC / --ro-bind SRC / --meta-bind SRC / --pin SRC.
+# --bind SRC / --ro-bind SRC / --meta-bind SRC / --pin SRC / --under-bind SRC.
 # Callers that need to run on both OSes must branch on `uname -s` themselves
 # when building BIND_FLAGS, same as executable_claude_wrapper.bash does.
 
@@ -138,7 +140,7 @@ _realpath() {
 # HOME (trailing slashes are stripped here). Single source for both
 # backends' WORKDIR and AI_SANDBOX_EXTRA_{RW,RO}_DIRS refusals (Linux below,
 # macOS in macos_sandbox_exec.bash; each backend keeps its own override
-# policy) and the wrapper-side git-worktree bind guard (ai_wrapper_lib.bash).
+# policy) and the wrapper-side git dir pointer checks (ai_wrapper_lib.bash).
 # System entries are exact roots, not subtrees. On macOS /tmp, /var and
 # /etc are listed with their canonical /private/... targets, since callers
 # pass realpath-resolved paths.
@@ -206,26 +208,30 @@ _sandbox_resolve_extra_dir() {
     printf '%s\n' "${resolved}"
 }
 
-# Warn when an accepted AI_SANDBOX_EXTRA_RW_DIRS entry DIR is a git dir or
-# a work tree with a .git dir: the raw grant gets none of the read-only
-# config / hooks/ overlays the wrapper puts on git metadata it binds
-# itself. Silent for the metadata that does get them (WORKDIR's own .git,
-# the validated worktree common dir in _WRAPPER_GIT_COMMON_PROTECTED, set
-# by _wrapper_bind_git_common_dir). A warning only — the grant stays.
-# Args: AGENT_TAG DIR
-_sandbox_warn_extra_rw_git() {
-    local tag="${1}" dir="${2}" resolved gd="" wd IFS=$' \t\n'
-    resolved="$(cd "${dir}" 2>/dev/null && pwd -P)" || return 0
-    if [[ -f "${resolved}/HEAD" && -d "${resolved}/objects" && -d "${resolved}/refs" ]]; then
-        gd="${resolved}"
-    elif [[ -d "${resolved}/.git" ]]; then
-        gd="$(cd "${resolved}/.git" 2>/dev/null && pwd -P)" || return 0
+# Linux only. Returns 0 when the bwrap on PATH accepts --bind-fd
+# (bubblewrap 0.8 and newer).
+_sandbox_bwrap_has_bind_fd() {
+    local help
+    help="$(bwrap --help 2>&1)" || return 1
+    [[ "${help}" == *"--bind-fd"* ]]
+}
+
+# Linux only. Open DIR (a resolved path) read-only in this shell and set
+# _AI_SANDBOX_DIR_FD to the descriptor. Returns 1 (nothing left open) when
+# DIR is not a directory, is a symlink, or the opened directory is not the
+# one at DIR: /proc/self/fd names the object actually opened, so a
+# symlink or another directory swapped in on the way is caught.
+_sandbox_open_dir_fd() {
+    local dir="${1}" fd opened
+    _AI_SANDBOX_DIR_FD=""
+    [[ -d "${dir}" && ! -L "${dir}" ]] || return 1
+    { exec {fd}<"${dir}"; } 2>/dev/null || return 1
+    opened="$(readlink "/proc/self/fd/${fd}" 2>/dev/null)" || opened=""
+    if [[ "${opened}" != "${dir}" || ! -d "/proc/self/fd/${fd}" ]]; then
+        exec {fd}<&-
+        return 1
     fi
-    [[ -n "${gd}" ]] || return 0
-    [[ -n "${_WRAPPER_GIT_COMMON_PROTECTED:-}" && "${gd}" == "${_WRAPPER_GIT_COMMON_PROTECTED}" ]] && return 0
-    wd="$(pwd -P)"
-    [[ "${gd}" == "${wd%/}/.git" ]] && return 0
-    echo_log "WARNING" "[${tag}] AI_SANDBOX_EXTRA_RW_DIRS: '${dir}' exposes git metadata ${gd} read-write without the read-only config / hooks/ overlays: the agent can plant hooks or config (core.hooksPath, core.fsmonitor, aliases) that run on the host the next time you use git there. For a linked worktree, launch from the worktree instead (with AI_SANDBOX_ALLOW_EXTERNAL_WORKTREES=1 if the repository is outside \$HOME): its shared .git is then bound after link validation with config and hooks/ read-only."
+    _AI_SANDBOX_DIR_FD="${fd}"
 }
 
 run_sandboxed_agent() {
@@ -668,7 +674,6 @@ _run_sandboxed_agent_linux() {
             _user_extra_bwrap_flags+=(--bind "${_d_resolved}" "${_d_resolved}")
             _user_extra_bind_dirs+=("${_d_resolved}")
             _user_extra_bind_names+=("${_d}")
-            _sandbox_warn_extra_rw_git "${agent_name}" "${_d_resolved}"
         done
         IFS="${_extra_dirs_ifs}"
     fi
@@ -690,10 +695,10 @@ _run_sandboxed_agent_linux() {
     fi
 
     # User RW extras mount BEFORE the wrapper's own binds: bwrap's later
-    # mount wins, so an extra RW dir equal to or above WORKDIR (or a
-    # worktree's shared .git) must not cover the wrapper's read-only git
-    # metadata layers. User RO extras stay after them, so the wrapper's RW
-    # binds (git dir pin, worktree common dir) cannot reopen a directory
+    # mount wins, so an extra RW dir equal to or above a client profile
+    # must not cover the wrapper's read-only overlays on its persistent
+    # controls. User RO extras stay after them, so the wrapper's RW binds
+    # (profile pins, a linked worktree's git dir) cannot reopen a directory
     # the user asked to be read-only. (The macOS backend renders RO as
     # order-independent denies instead.)
     extra_bwrap_flags=("${_user_extra_bwrap_flags[@]+"${_user_extra_bwrap_flags[@]}"}" \
@@ -790,12 +795,27 @@ _run_sandboxed_agent_linux() {
 
     # Validate and filter paths in extra_bwrap_flags
     local strict_mode="${BWRAP_STRICT:-0}"
-    local -a validated_bwrap_flags=()
+    local -a validated_bwrap_flags=() under_bwrap_flags=()
     local i=0
     local bind_errors=0
 
     while [[ ${i} -lt ${#extra_bwrap_flags[@]} ]]; do
         local flag="${extra_bwrap_flags[$i]}"
+
+        # --under-bind SRC DST (_wrapper_add_under_bind): a read-write bind
+        # mounted before every read-only overlay and pin below, so those
+        # stay on top of it (bwrap: the later mount wins). Bound by
+        # descriptor at launch when bwrap has --bind-fd (see "Under-binds
+        # by descriptor" below). A missing source is skipped.
+        if [[ "${flag}" == "--under-bind" ]]; then
+            if [[ -e "${extra_bwrap_flags[$((i+1))]}" ]]; then
+                under_bwrap_flags+=(--bind "${extra_bwrap_flags[$((i+1))]}" "${extra_bwrap_flags[$((i+2))]}")
+            else
+                echo_log "WARNING" "[$agent_name] Bind source path does not exist (skipping): ${extra_bwrap_flags[$((i+1))]}"
+            fi
+            i=$((i + 3))
+            continue
+        fi
 
         # Check if this is a bind flag that requires path validation
         if [[ "${flag}" =~ ^--(ro-)?bind$ ]]; then
@@ -892,14 +912,21 @@ _run_sandboxed_agent_linux() {
         --tmpfs /var
         --proc /proc
         --dev /dev
+    )
+    # Under-binds (a linked worktree's or submodule's git dir) come before
+    # every read-only overlay and pin: ~/bin and the skill source just
+    # below, AGENTS.md / CLAUDE.md, client persistent controls in the
+    # wrapper flags, credential overlays and AI_SANDBOX_EXTRA_RO_DIRS. Their
+    # position is kept for the descriptor swap before the launch.
+    local under_bind_index=${#bwrap_args[@]}
+    bwrap_args+=(
+        "${under_bwrap_flags[@]+"${under_bwrap_flags[@]}"}"
         "${protected_home_binds[@]+"${protected_home_binds[@]}"}"
         # Working directory (read-write), from its resolved path
         --bind "${resolved_workdir}" "${resolved_workdir}"
     )
     # A cwd reached through a symlink is also mounted at the logical path,
-    # so --chdir below keeps the cwd tooling and the user expect. The git
-    # metadata overlays (_wrapper_git_ro_bind / _wrapper_git_pin) cover
-    # both paths.
+    # so --chdir below keeps the cwd tooling and the user expect.
     [[ "${WORKDIR}" == "${resolved_workdir}" ]] || bwrap_args+=(--bind "${resolved_workdir}" "${WORKDIR}")
 
     # Nested user namespaces: by default the agent cannot create its own
@@ -1270,12 +1297,43 @@ _run_sandboxed_agent_linux() {
         bwrap_args+=(--add-seccomp-fd "${tty_filter_fd}")
     fi
 
+    # Under-binds by descriptor (#14): each source was validated by path
+    # earlier, and a concurrent session that can write next to it could
+    # swap it for a symlink (e.g. to ~/.ssh) before bwrap resolves the path.
+    # Opened here (after the proxy started, so only bwrap inherits them) and
+    # kept only when the opened directory is still the one at the checked
+    # path; bwrap mounts the descriptor, checks that the mount matches it
+    # and closes it before the client runs. Without --bind-fd (bubblewrap
+    # older than 0.8) the path is bound as before.
+    local -a under_fds=() fd_under_flags=()
+    local _u
+    if (( ${#under_bwrap_flags[@]} > 0 )); then
+        if _sandbox_bwrap_has_bind_fd; then
+            for (( _u = 0; _u < ${#under_bwrap_flags[@]}; _u += 3 )); do
+                if _sandbox_open_dir_fd "${under_bwrap_flags[_u+1]}"; then
+                    under_fds+=("${_AI_SANDBOX_DIR_FD}")
+                    fd_under_flags+=(--bind-fd "${_AI_SANDBOX_DIR_FD}" "${under_bwrap_flags[_u+2]}")
+                else
+                    echo_log "WARNING" "[$agent_name] Not binding ${under_bwrap_flags[_u+1]}: it changed after it was checked (now a symlink, missing or another directory). git won't work in this checkout."
+                fi
+            done
+            bwrap_args=("${bwrap_args[@]:0:under_bind_index}" \
+                "${fd_under_flags[@]+"${fd_under_flags[@]}"}" \
+                "${bwrap_args[@]:under_bind_index+${#under_bwrap_flags[@]}}")
+        else
+            echo_log "INFO" "[$agent_name] This bubblewrap has no --bind-fd: the git dir is bound by path, so a concurrent change between check and mount is not detected. Upgrade bubblewrap (0.8 or newer) to close that window."
+        fi
+    fi
+
     # ===== EXECUTE — no more setpriv/prlimit wrapper =====
 
     bwrap "${bwrap_args[@]}" "${launch_cmd[@]}" "${cmd_args[@]}"
 
     local exit_code=$?
     [[ -n "${tty_filter_fd}" ]] && exec {tty_filter_fd}<&-
+    for _u in "${under_fds[@]+"${under_fds[@]}"}"; do
+        exec {_u}<&-
+    done
     if [[ "${allow_unrestricted_net}" != "1" ]]; then
         _sandbox_stop_network_proxy "${agent_name}"
         # Hand this shell's own EXIT trap back (none: clear ours).

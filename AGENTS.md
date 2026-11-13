@@ -238,3 +238,4 @@ Squash already done — you have 1 clean commit to review.
   `bin/ai_wrapper_data/claude_wrapper.sb`, `bin/ai_wrapper_data/ai_wrapper_lib.bash`,
   `bin/ai_wrapper_data/*_wrapper_lib.bash`, `bin/executable_*_wrapper.bash`.
 - **Tests:** `docs/testing.md`. Write bash that also runs on macOS bash 3.2.
+- **Owner-accepted security exceptions** (ai-wrapper repo only): `docs/owner-accepted-exceptions.md`. Read it before changing git-dir handling or sandbox restrictions.

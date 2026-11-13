@@ -182,10 +182,10 @@ _run_sandboxed_agent_impl() {
     # agent runs without access it was promised, which surfaces as confusing
     # failures deep inside the sandboxed command. Callers must gate optional
     # binds at the call site (e.g. `[[ -e X ]] && WRAPPER_FLAGS+=(--bind X)`).
-    local -a binds_rw=() binds_ro=() binds_meta=() binds_pin=()
+    local -a binds_rw=() binds_ro=() binds_meta=() binds_pin=() binds_under=()
     while [[ $# -gt 0 && "${1}" != "--" ]]; do
         case "${1}" in
-            --bind|--ro-bind|--meta-bind|--pin)
+            --bind|--ro-bind|--meta-bind|--pin|--under-bind)
                 # Single positional SRC. sandbox-exec cannot remap paths, so
                 # there's no DST. A legacy two-arg call `--bind SRC DST` would
                 # now consume DST as the next flag in the loop and almost
@@ -203,6 +203,12 @@ _run_sandboxed_agent_impl() {
                 # directory inside a writable area cannot be renamed,
                 # removed or replaced; its children are unaffected. The
                 # Linux equivalent is a self-bind (_wrapper_add_pin).
+                #
+                # --under-bind grants what --bind grants, but every
+                # --ro-bind write deny and pin stays in force inside it:
+                # it never becomes an exception in _append_ro_deny_rules.
+                # The Seatbelt form of an RW bind mounted before the RO
+                # overlays on bwrap (_wrapper_add_under_bind).
                 if [[ $# -lt 2 ]]; then
                     echo_log "ERROR" "[${tag}] ${1} requires SRC (got: ${*})"
                     return 2
@@ -223,6 +229,7 @@ _run_sandboxed_agent_impl() {
                     --ro-bind)   binds_ro+=("${2}") ;;
                     --meta-bind) binds_meta+=("${2}") ;;
                     --pin)       binds_pin+=("${2}") ;;
+                    --under-bind) binds_under+=("${2}") ;;
                 esac
                 shift 2
                 ;;
@@ -233,7 +240,7 @@ _run_sandboxed_agent_impl() {
                 # old two-arg form catches callers migrating from the
                 # pre-WS1 bubblewrap-shape vocabulary.
                 if [[ -e "${1}" ]]; then
-                    echo_log "ERROR" "[${tag}] Unexpected path '${1}' in flag position. Hint: --bind / --ro-bind / --meta-bind / --pin are single-arg (SRC only)."
+                    echo_log "ERROR" "[${tag}] Unexpected path '${1}' in flag position. Hint: --bind / --ro-bind / --meta-bind / --pin / --under-bind are single-arg (SRC only)."
                 else
                     echo_log "ERROR" "[${tag}] Unsupported sandbox flag: ${1}"
                 fi
@@ -280,7 +287,6 @@ _run_sandboxed_agent_impl() {
             binds_rw+=("${_d_resolved}")
             _user_extra_bind_dirs+=("${_d_resolved}")
             _user_extra_bind_names+=("${_d}")
-                _sandbox_warn_extra_rw_git "${tag}" "${_d_resolved}"
         done
         IFS="${_extra_dirs_ifs}"
     fi
@@ -481,7 +487,8 @@ _run_sandboxed_agent_impl() {
     # as extra (allow file-read-metadata (literal …)) rules).
     if [[ -n "${resolved_home}" ]]; then
         local _bind_target _bind_parent _bind_resolved
-        for _bind_target in "${binds_rw[@]+"${binds_rw[@]}"}" "${binds_ro[@]+"${binds_ro[@]}"}"; do
+        for _bind_target in "${binds_rw[@]+"${binds_rw[@]}"}" "${binds_ro[@]+"${binds_ro[@]}"}" \
+                "${binds_under[@]+"${binds_under[@]}"}"; do
             _bind_resolved="$(_realpath "${_bind_target}" 2>/dev/null)" || _bind_resolved="${_bind_target}"
             [[ "${_bind_resolved}" == "${resolved_home}"/* ]] || continue
             _bind_parent="${_bind_resolved%/*}"
@@ -853,9 +860,9 @@ _run_sandboxed_agent_impl() {
 
     # Downstream extension hook (see AI_WRAPPER_EXTRA_PROFILE in
     # bin/executable_claude_wrapper.bash). Fires before binds are baked into
-    # the SBPL profile so the callback can append to binds_rw / binds_ro / binds_pin /
-    # binds_meta and mutate env_allowlist. Runs in the outer function scope
-    # (not the subshell), matching the arrays' scope.
+    # the SBPL profile so the callback can append to binds_rw / binds_ro /
+    # binds_pin / binds_under / binds_meta and mutate env_allowlist. Runs in
+    # the outer function scope (not the subshell), matching the arrays' scope.
     if declare -f _extra_sandbox_setup >/dev/null 2>&1; then
         _extra_sandbox_setup
     fi
@@ -863,6 +870,10 @@ _run_sandboxed_agent_impl() {
     local extra_rules
     if [[ ${#binds_rw[@]} -gt 0 ]]; then
         extra_rules="$(_append_bind_rules "${tag}" "file*" "--bind" "${binds_rw[@]}")" || return 1
+        profile+="${extra_rules}"
+    fi
+    if [[ ${#binds_under[@]} -gt 0 ]]; then
+        extra_rules="$(_append_bind_rules "${tag}" "file*" "--under-bind" "${binds_under[@]}")" || return 1
         profile+="${extra_rules}"
     fi
     if [[ ${#binds_ro[@]} -gt 0 ]]; then
@@ -878,7 +889,8 @@ _run_sandboxed_agent_impl() {
         profile+="${extra_rules}"
     fi
     # --ro-bind write denial, rendered last so it overrides every allow
-    # above (base profile, WORKDIR, --bind). See _append_ro_deny_rules for
+    # above (base profile, WORKDIR, --bind, --under-bind). binds_under is
+    # deliberately not passed as RW exceptions. See _append_ro_deny_rules for
     # the nesting rule that replaces bwrap's mount-order semantics.
     if [[ ${#binds_pin[@]} -gt 0 ]]; then
         extra_rules="$(_append_pin_rules "${tag}" "${resolved_home}" "${binds_pin[@]}")" || return 1
@@ -1145,8 +1157,8 @@ _SBPL_RO_DENY_OPS="file-write* file-link"
 # literally, and the parser keeps RW and RO binds in separate arrays. The
 # rules are order-independent instead: an RO path is write-denied except
 # below an RW bind nested strictly inside it ("most specific bind wins").
-# That reproduces the worktree layout (RW common dir -> RO worktrees/ -> RW
-# own entry -> RO commondir/gitdir) and means a broader or equal RW bind
+# That reproduces bwrap's result for an RW bind mounted inside an RO one
+# and means a broader or equal RW bind
 # (WORKDIR, AI_SANDBOX_EXTRA_RW_DIRS) never neutralises an RO overlay.
 # The rules are appended after every allow, and Seatbelt applies the last
 # matching rule.
