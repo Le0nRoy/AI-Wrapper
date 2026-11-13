@@ -22,13 +22,13 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
     exit 0
 fi
 
-FAKE_HOME="$(mktemp -d)"
+FAKE_HOME="$(_safe_mktemp_d)" || exit 1
 isolate_test_env "${FAKE_HOME}"
 # shellcheck source=../bin/ai_agent_universal_wrapper.bash
 source "${REPO_ROOT}/bin/ai_agent_universal_wrapper.bash"
 mkdir -p "${FAKE_HOME}/project"
 
-cleanup() { rm -rf "${FAKE_HOME}"; }
+cleanup() { _safe_rm_rf "${FAKE_HOME}"; }
 trap cleanup EXIT
 
 echo "== macOS-only sandbox tests =="

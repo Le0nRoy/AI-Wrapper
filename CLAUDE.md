@@ -26,5 +26,6 @@ This is the **`ai-wrapper`** chezmoi-managed repository containing:
 | Code standards | `AGENTS.md` § 2 |
 | Test writing and safe test commands | `AGENTS.md` § 4, `docs/testing.md` |
 | Owner-accepted security exceptions | `docs/owner-accepted-exceptions.md` |
+| Temp dirs, cleanup, `rm -rf` in scripts | Repo-local `safe-destructive-scripts` skill (`.claude/skills/`) |
 | Orchestration workflow | `orchestrator-mode` skill |
 | Tortuga task operations | Shared `tortuga` skill; only on request |

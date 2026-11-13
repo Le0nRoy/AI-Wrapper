@@ -91,6 +91,9 @@ Seatbelt), and `docs/security-concerns.md` for known gaps and decisions.
 - Report skipped or unavailable checks as skipped, never as passed
 - In this repo: see `docs/testing.md` (safe commands, `isolate_test_env`,
   per-OS scope, CI mapping)
+- In this repo: scripts that mktemp, cd or `rm -rf` follow the repo-local
+  `safe-destructive-scripts` skill (`.claude/skills/`); never run bash
+  suites inside an agent sandbox without checking their cleanup first
 
 ---
 

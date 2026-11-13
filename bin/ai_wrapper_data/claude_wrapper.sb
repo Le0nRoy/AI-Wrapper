@@ -72,8 +72,9 @@
 ;;                              and link-local addresses (e.g. AWS IMDS at
 ;;                              169.254.169.254) are NOT covered.
 ;;   ALLOW_KEYCHAIN          — "1" grants RW on ~/Library/Keychains and the
-;;                              com.apple.SecurityServer / com.apple.securityd
-;;                              Mach lookups (keychain items). Default "0".
+;;                              com.apple.SecurityServer / com.apple.securityd /
+;;                              com.apple.securityd.xpc Mach lookups (file and
+;;                              Data Protection keychain items). Default "0".
 ;;   ALLOW_DOCKER            — "1" emits the Docker/Colima socket + ~/.docker
 ;;                              RW rules. Default "0"; set "1" to opt in when
 ;;                              the session needs `docker` from inside the
@@ -146,14 +147,18 @@
     (global-name "com.apple.tccd.system"))
 
 ;; Keychain item brokers (#67 / M1). The SecItem API and `security`
-;; reach keychain items through these two daemons; ALLOW_KEYCHAIN=1
-;; (AI_SANDBOX_ALLOW_KEYCHAIN, default 0) grants them together with the
+;; reach file-keychain items through SecurityServer / securityd; SecItem
+;; queries with kSecUseDataProtectionKeychain (e.g. incident.io's CLI) go to
+;; secd over com.apple.securityd.xpc and fail with errSecNotAvailable
+;; (-25291) without it. ALLOW_KEYCHAIN=1 (AI_SANDBOX_ALLOW_KEYCHAIN,
+;; default 0) grants all three together with the
 ;; ~/Library/Keychains file rule further down. trustd (TLS certificate
 ;; evaluation) above stays reachable either way.
 (when (equal? (param "ALLOW_KEYCHAIN") "1")
     (allow mach-lookup
         (global-name "com.apple.SecurityServer")             ; legacy SecKeychain* path
-        (global-name "com.apple.securityd")))                ; modern securityd
+        (global-name "com.apple.securityd")                  ; modern securityd (file-based login keychain)
+        (global-name "com.apple.securityd.xpc")))            ; secd: Data Protection keychain (kSecUseDataProtectionKeychain)
 
 ;; Services intentionally NOT in the allowlist (high-risk if granted):
 ;;   com.apple.coreservices.launchservicesd  → would enable `open -a` escape

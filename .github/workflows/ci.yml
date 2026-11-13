@@ -47,7 +47,8 @@ jobs:
   # wrapper-help.md OS-conditional doc filter, skill deployment/retirement
   # into a fake HOME, agy host-side path confinement, per-workdir preset
   # identity (sha256sum/shasum, fail-closed), the CI/run_all/docs suite
-  # inventory, and the Tortuga gh helper. No real sandbox launch, so
+  # inventory, the temp-dir / cleanup guard helpers, and the Tortuga gh
+  # helper. No real sandbox launch, so
   # these need no setup — but still run on both OSes since they exercise
   # real bash string/array handling, not just the app logic.
   logic-tests:
@@ -66,6 +67,7 @@ jobs:
       - run: bash tests/test_agy_host_boundary.bash
       - run: bash tests/test_preset_identity.bash
       - run: bash tests/test_suite_inventory.bash
+      - run: bash tests/test_safe_temp_helpers.bash
       - run: python3 -B dot_agents/skills/tortuga/scripts/test_gh.py
       - run: python3 -I -B tests/test_network_proxy.py
 

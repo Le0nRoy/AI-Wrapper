@@ -23,12 +23,12 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=./lib_test_helpers.bash
 source "${REPO_ROOT}/tests/lib_test_helpers.bash"
 
-FAKE_HOME="$(mktemp -d "${HOME}/ai-wrapper-test.XXXXXX")"
+FAKE_HOME="$(_safe_mktemp_d "${HOME}/ai-wrapper-test.XXXXXX")" || exit 1
 FAKE_HOME="$(cd "${FAKE_HOME}" && pwd -P)"
 isolate_test_env "${FAKE_HOME}"
-OUTSIDE_HOME="$(mktemp -d)"
+OUTSIDE_HOME="$(_safe_mktemp_d)" || exit 1
 OUTSIDE_HOME="$(cd "${OUTSIDE_HOME}" && pwd -P)"
-cleanup() { chmod -R u+rwx "${FAKE_HOME}" 2>/dev/null; rm -rf "${FAKE_HOME}" "${OUTSIDE_HOME}"; }
+cleanup() { chmod -R u+rwx "${FAKE_HOME}" 2>/dev/null; _safe_rm_rf "${FAKE_HOME}" "${OUTSIDE_HOME}"; }
 trap cleanup EXIT
 
 LIB="${REPO_ROOT}/bin/ai_wrapper_data/agy_wrapper_lib.bash"
@@ -435,7 +435,7 @@ fi
 echo "-- deterministic race injection around the embedded helper"
 HELPER="${FAKE_HOME}/agy_host_helper.py"
 awk 'index($0, "_agy_host_py() {") == 1 {f=1; next} f && $0 == "PY" {exit} f && p {print} f && /<<.PY.$/ {p=1}' "${LIB}" >"${HELPER}"
-HARNESS_DIR="$(mktemp -d "${FAKE_HOME}/harness.XXXXXX")"
+HARNESS_DIR="$(_safe_mktemp_d "${FAKE_HOME}/harness.XXXXXX")" || exit 1
 cat >"${HARNESS_DIR}/inject.py" <<'PY'
 """Run the embedded helper with one os/sqlite3 call wrapped by a scenario."""
 import fcntl, os, sqlite3, sys, time

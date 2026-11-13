@@ -13,10 +13,10 @@ FIXTURES="${REPO_ROOT}/tests/fixtures/cursor-retirement"
 # shellcheck source=./lib_test_helpers.bash
 source "${REPO_ROOT}/tests/lib_test_helpers.bash"
 
-TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/ai-wrapper-cursor-retire-test.XXXXXX")"
+TEST_ROOT="$(_safe_mktemp_d "${TMPDIR:-/tmp}/ai-wrapper-cursor-retire-test.XXXXXX")" || exit 1
 cleanup() {
     chmod -R u+w "${TEST_ROOT}" 2>/dev/null
-    rm -rf "${TEST_ROOT}"
+    _safe_rm_rf "${TEST_ROOT}"
 }
 trap cleanup EXIT
 

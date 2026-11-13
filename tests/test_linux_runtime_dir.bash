@@ -25,24 +25,24 @@ OS="$(uname -s)"
 # Resolve the real bwrap before the stub dir shadows it on PATH.
 REAL_BWRAP="$(type -P bwrap || true)"
 
-FAKE_HOME="$(mktemp -d "${HOME}/ai-wrapper-test.XXXXXX")"
+FAKE_HOME="$(_safe_mktemp_d "${HOME}/ai-wrapper-test.XXXXXX")" || exit 1
 FAKE_HOME="$(cd "${FAKE_HOME}" && pwd -P)"
-STUB_DIR="$(mktemp -d)"
+STUB_DIR="$(_safe_mktemp_d)" || exit 1
 isolate_test_env "${FAKE_HOME}"
 # Synthetic runtime dirs: RT below /tmp (reused as the sandbox path),
 # OUT_RT for SSH sockets outside the runtime dir, WD_RT for a WORKDIR
 # overlap. mktemp -d creates them 0700 and owned by the test user.
-RT="$(mktemp -d /tmp/ai-wrapper-rt.XXXXXX)"
+RT="$(_safe_mktemp_d /tmp/ai-wrapper-rt.XXXXXX)" || exit 1
 RT="$(cd "${RT}" && pwd -P)"
-OUT_RT="$(mktemp -d /tmp/ai-wrapper-ssh.XXXXXX)"
+OUT_RT="$(_safe_mktemp_d /tmp/ai-wrapper-ssh.XXXXXX)" || exit 1
 OUT_RT="$(cd "${OUT_RT}" && pwd -P)"
-WD_RT="$(mktemp -d /tmp/ai-wrapper-wdrt.XXXXXX)"
+WD_RT="$(_safe_mktemp_d /tmp/ai-wrapper-wdrt.XXXXXX)" || exit 1
 WD_RT="$(cd "${WD_RT}" && pwd -P)"
 SERVER_PIDS=()
 cleanup() {
     local pid
     for pid in "${SERVER_PIDS[@]+"${SERVER_PIDS[@]}"}"; do kill "${pid}" 2>/dev/null; done
-    rm -rf "${FAKE_HOME}" "${STUB_DIR}" "${RT}" "${OUT_RT}" "${WD_RT}"
+    _safe_rm_rf "${FAKE_HOME}" "${STUB_DIR}" "${RT}" "${OUT_RT}" "${WD_RT}"
 }
 trap cleanup EXIT
 
@@ -218,13 +218,13 @@ assert_eq "$(_setenv_value DOCKER_HOST)" "unix://${SYNTH_RT}/docker.sock" "non-r
 _run XDG_RUNTIME_DIR="${HOME_RT}" AI_SANDBOX_PASS_DOCKER=1 DOCKER_HOST="unix://${HOME_RT}/docker.sock"
 assert_eq "$(_setenv_value DOCKER_HOST)" "unix://${HOME_RT}/docker.sock" "DOCKER_HOST not rewritten when no socket is shared"
 # Not a socket / a symlink to a socket: never bound.
-SOCK_RT="$(mktemp -d /tmp/ai-wrapper-rt.XXXXXX)"
+SOCK_RT="$(_safe_mktemp_d /tmp/ai-wrapper-rt.XXXXXX)" || exit 1
 echo x >"${SOCK_RT}/docker.sock"
 mkdir -p "${SOCK_RT}/podman" && ln -s "${RT}/podman/podman.sock" "${SOCK_RT}/podman/podman.sock"
 _run XDG_RUNTIME_DIR="${SOCK_RT}" AI_SANDBOX_ALLOW_DOCKER=1
 assert_not_contains "${ARGV}" "${SOCK_RT}/docker.sock" "regular file named docker.sock not bound"
 assert_not_contains "${ARGV}" "${SOCK_RT}/podman/podman.sock" "symlinked podman.sock not bound"
-rm -rf "${SOCK_RT}"
+_safe_rm_rf "${SOCK_RT}"
 _run XDG_RUNTIME_DIR="${RT}" AI_SANDBOX_PASS_SSH_AGENT=1 SSH_AUTH_SOCK="${RT}/ssh-agent.socket"
 assert_eq "$(_yes _has_seq --bind "${RT}/ssh-agent.socket" "${RT}/ssh-agent.socket")" yes "PASS_SSH_AGENT=1: agent socket at its exact path"
 assert_eq "$(_setenv_value SSH_AUTH_SOCK)" "${RT}/ssh-agent.socket" "PASS_SSH_AGENT=1: SSH_AUTH_SOCK passed"
@@ -245,7 +245,7 @@ _run XDG_RUNTIME_DIR="${H}/rt-link-${RUN_ID}" AI_SANDBOX_ALLOW_XDG_RUNTIME_RW=1
 assert_eq "$(_yes _has_seq --bind "${RT}" "${RT}")" yes "broad alias: canonical dir bound"
 _run XDG_RUNTIME_DIR="${HOME_RT}" AI_SANDBOX_ALLOW_XDG_RUNTIME_RW=1
 assert_eq "$(_yes _has_seq --bind "${HOME_RT}" "${HOME_RT}")" yes "broad: legitimate non-/run runtime dir kept"
-WRITABLE_RT="$(mktemp -d /tmp/ai-wrapper-rt.XXXXXX)"
+WRITABLE_RT="$(_safe_mktemp_d /tmp/ai-wrapper-rt.XXXXXX)" || exit 1
 chmod 0777 "${WRITABLE_RT}"
 mkdir -p "${H}/.cfg-${RUN_ID}"
 REAL_PARENT="$(dirname "${H}")"
@@ -277,7 +277,7 @@ _broad() {
         printf '%s\nRC=%s\n' "${out}" "${rc}"
     )
 }
-PERM_RT="$(mktemp -d /tmp/ai-wrapper-rt.XXXXXX)"
+PERM_RT="$(_safe_mktemp_d /tmp/ai-wrapper-rt.XXXXXX)" || exit 1
 PERM_RT="$(cd "${PERM_RT}" && pwd -P)"
 res="$(_broad "${PERM_RT}")"
 assert_contains "${res}" "RC=0" "broad helper: valid 0700 dir accepted"
@@ -299,7 +299,7 @@ assert_contains "${res}" "find: simulated error" "broad helper: checker diagnost
 res="$(_broad "${PERM_RT}" 'find() { printf "%s\n" "${@:1:1}"; return 1; }')"
 assert_contains "${res}" "RC=1" "broad helper: failing checker with plausible output refused"
 assert_contains "${res}" "cannot check permissions of ${PERM_RT}" "broad helper: plausible-output failure is actionable"
-rm -rf "${PERM_RT}"
+_safe_rm_rf "${PERM_RT}"
 
 # ---------------------------------------------------------------------------
 echo "-- native bubblewrap probes"

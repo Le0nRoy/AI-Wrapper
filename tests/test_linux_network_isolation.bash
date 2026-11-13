@@ -34,14 +34,14 @@ PROXY_HELPER="${REPO_ROOT}/bin/ai_wrapper_data/ai_network_proxy.py"
 NET_DIR=/run/ai-sandbox-net
 PROXY_URL=http://127.0.0.1:3128
 
-FAKE_HOME="$(mktemp -d "${HOME}/ai-wrapper-test.XXXXXX")"
+FAKE_HOME="$(_safe_mktemp_d "${HOME}/ai-wrapper-test.XXXXXX")" || exit 1
 FAKE_HOME="$(cd "${FAKE_HOME}" && pwd -P)"
-STUB_DIR="$(mktemp -d)"
+STUB_DIR="$(_safe_mktemp_d)" || exit 1
 isolate_test_env "${FAKE_HOME}"
 HOST_SERVER_PID=""
 cleanup() {
     [[ -n "${HOST_SERVER_PID}" ]] && kill "${HOST_SERVER_PID}" 2>/dev/null
-    rm -rf "${FAKE_HOME}" "${STUB_DIR}"
+    _safe_rm_rf "${FAKE_HOME}" "${STUB_DIR}"
 }
 trap cleanup EXIT
 
@@ -198,6 +198,32 @@ assert_eq "$(_gone "${pid:-0}")" gone "default: proxy stopped after the launch"
 assert_eq "$(_yes test -e "$(dirname "${SOCK:-/nonexistent/x}")")" no "default: proxy dir removed after the launch"
 assert_contains "${OUT}" "refused 1 request(s)" "default: blocked requests reported at exit"
 assert_contains "${OUT}" "[BLOCKED] CONNECT 127.0.0.1:9" "default: AI_SANDBOX_DEBUG=1 prints the proxy log"
+
+# Private hosts (--allow-private-host): AI_SANDBOX_PRIVATE_HOSTS, the
+# _extra_sandbox_setup hook and AI_SANDBOX_PASS_GITLAB (glab config.yml in
+# the fake home; gitlab.com is public and never added) reach the live
+# proxy, which logs the suffixes it allows (dumped at AI_SANDBOX_DEBUG=1).
+_allowed_hosts() { sed -n 's/.*private LAN ranges allowed for hosts under: //p' <<<"${OUT}" | head -n 1; }
+mkdir -p "${FAKE_HOME}/.config/glab-cli"
+printf 'git_protocol: ssh\nhosts:\n  gitlab.com:\n    token: fake-token\n  gitlab.example.test:\n    token: fake-token\n    api_host: gitlab.example.test\n' \
+    >"${FAKE_HOME}/.config/glab-cli/config.yml"
+_stub "" AI_SANDBOX_PASS_GITLAB=1
+assert_eq "${RC}" 0 "PASS_GITLAB=1: launch succeeds"
+assert_eq "$(_allowed_hosts)" "gitlab.example.test" "PASS_GITLAB=1: glab host passed as --allow-private-host (gitlab.com skipped)"
+_stub ""
+assert_eq "$(_allowed_hosts)" "" "PASS_GITLAB off: no --allow-private-host"
+assert_not_contains "${OUT}" "gitlab.example.test" "PASS_GITLAB off: glab host not opened"
+_stub "" "AI_SANDBOX_PRIVATE_HOSTS=corp.example,Other.Example. corp.example"
+assert_eq "$(_allowed_hosts)" "corp.example, other.example" "AI_SANDBOX_PRIVATE_HOSTS: entries normalised, deduplicated, passed through"
+_stub "" "AI_SANDBOX_PRIVATE_HOSTS=10.0.0.1 *.wild.example single corp.example"
+assert_eq "${RC}" 0 "AI_SANDBOX_PRIVATE_HOSTS: invalid entries do not refuse the launch"
+assert_eq "$(_allowed_hosts)" "corp.example" "AI_SANDBOX_PRIVATE_HOSTS: IP, wildcard and single-label entries dropped"
+assert_contains "${OUT}" "AI_SANDBOX_PRIVATE_HOSTS: ignoring '10.0.0.1'" "AI_SANDBOX_PRIVATE_HOSTS: invalid entry warned"
+_stub '_extra_sandbox_setup() { AI_SANDBOX_PRIVATE_HOSTS+=" hook.example.test"; }' AI_SANDBOX_PRIVATE_HOSTS=corp.example
+assert_eq "$(_allowed_hosts)" "corp.example, hook.example.test" "hook appending to AI_SANDBOX_PRIVATE_HOSTS reaches the proxy"
+rm -f -- "${FAKE_HOME}/.config/glab-cli/config.yml"
+_stub "_AI_SANDBOX_TAILSCALE_SOCKET=${STUB_DIR}/no-tailscale.sock" AI_SANDBOX_PASS_TAILSCALE=1
+assert_eq "$(_allowed_hosts)" "ts.net" "PASS_TAILSCALE=1: MagicDNS suffix passed as --allow-private-host"
 assert_not_contains "${OUT}" "AI_SANDBOX_ALLOW_UNRESTRICTED_NET=1:" "default: no unrestricted warning"
 
 # The proxy variables come last: an AI_SANDBOX_PASS_ENV passthrough

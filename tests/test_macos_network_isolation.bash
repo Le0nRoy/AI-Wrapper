@@ -33,15 +33,15 @@ PROFILE="${REPO_ROOT}/bin/ai_wrapper_data/claude_wrapper.sb"
 PROXY_VARS="http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY"
 
 # Under the real $HOME for the reason given in tests/test_sandbox_common.bash.
-FAKE_HOME="$(mktemp -d "${HOME}/ai-wrapper-test.XXXXXX")"
+FAKE_HOME="$(_safe_mktemp_d "${HOME}/ai-wrapper-test.XXXXXX")" || exit 1
 FAKE_HOME="$(cd "${FAKE_HOME}" && pwd -P)"
-STUB_DIR="$(mktemp -d)"
+STUB_DIR="$(_safe_mktemp_d)" || exit 1
 STUB_DIR="$(cd "${STUB_DIR}" && pwd -P)"
 isolate_test_env "${FAKE_HOME}"
 HOST_SERVER_PID=""
 cleanup() {
     [[ -n "${HOST_SERVER_PID}" ]] && kill "${HOST_SERVER_PID}" 2>/dev/null
-    rm -rf "${FAKE_HOME}" "${STUB_DIR}"
+    _safe_rm_rf "${FAKE_HOME}" "${STUB_DIR}"
 }
 trap cleanup EXIT
 
@@ -196,6 +196,30 @@ assert_not_contains "${CHILD_ENV}" "evil.invalid" "PASS_ENV: no passthrough prox
 _stub '_extra_sandbox_setup() { env_allowlist+=("http_proxy=http://hook.invalid:1"); }'
 assert_eq "$(grep -c '^http_proxy=' <<<"${CHILD_ENV}")" 1 "hook-added http_proxy replaced"
 assert_not_contains "${CHILD_ENV}" "hook.invalid" "hook cannot point clients around the proxy"
+
+# Private hosts (--allow-private-host): AI_SANDBOX_PRIVATE_HOSTS, the
+# _extra_sandbox_setup hook and AI_SANDBOX_PASS_GITLAB (glab config.yml in
+# the fake home; gitlab.com is public and never added) reach the live
+# proxy, which logs the suffixes it allows (dumped at AI_SANDBOX_DEBUG=1).
+_allowed_hosts() { sed -n 's/.*private LAN ranges allowed for hosts under: //p' <<<"${OUT}" | head -n 1; }
+mkdir -p "${FAKE_HOME}/.config/glab-cli"
+printf 'git_protocol: ssh\nhosts:\n  gitlab.com:\n    token: fake-token\n  gitlab.example.test:\n    token: fake-token\n    api_host: gitlab.example.test\n' \
+    >"${FAKE_HOME}/.config/glab-cli/config.yml"
+_stub "" AI_SANDBOX_PASS_GITLAB=1
+assert_eq "${RC}" 0 "PASS_GITLAB=1: launch succeeds"
+assert_eq "$(_allowed_hosts)" "gitlab.example.test" "PASS_GITLAB=1: glab host passed as --allow-private-host (gitlab.com skipped)"
+_stub ""
+assert_eq "$(_allowed_hosts)" "" "PASS_GITLAB off: no --allow-private-host"
+assert_not_contains "${OUT}" "gitlab.example.test" "PASS_GITLAB off: glab host not opened"
+_stub "" "AI_SANDBOX_PRIVATE_HOSTS=corp.example,Other.Example. corp.example"
+assert_eq "$(_allowed_hosts)" "corp.example, other.example" "AI_SANDBOX_PRIVATE_HOSTS: entries normalised, deduplicated, passed through"
+_stub "" "AI_SANDBOX_PRIVATE_HOSTS=10.0.0.1 *.wild.example single corp.example"
+assert_eq "${RC}" 0 "AI_SANDBOX_PRIVATE_HOSTS: invalid entries do not refuse the launch"
+assert_eq "$(_allowed_hosts)" "corp.example" "AI_SANDBOX_PRIVATE_HOSTS: IP, wildcard and single-label entries dropped"
+assert_contains "${OUT}" "AI_SANDBOX_PRIVATE_HOSTS: ignoring '10.0.0.1'" "AI_SANDBOX_PRIVATE_HOSTS: invalid entry warned"
+_stub '_extra_sandbox_setup() { AI_SANDBOX_PRIVATE_HOSTS+=" hook.example.test"; }' AI_SANDBOX_PRIVATE_HOSTS=corp.example
+assert_eq "$(_allowed_hosts)" "corp.example, hook.example.test" "hook appending to AI_SANDBOX_PRIVATE_HOSTS reaches the proxy"
+rm -f -- "${FAKE_HOME}/.config/glab-cli/config.yml"
 
 STUB_LAUNCH_RC=3 _stub ""
 assert_eq "${RC}" 3 "client exit status returned unchanged"

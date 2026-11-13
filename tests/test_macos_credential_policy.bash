@@ -33,7 +33,7 @@ if [[ "${CI:-}" == "true" || "${AI_WRAPPER_TEST_SYNTHETIC_KEYCHAIN:-0}" == "1" ]
 fi
 
 # Under the real $HOME for the reason given in tests/test_sandbox_common.bash.
-FAKE_HOME="$(mktemp -d "${HOME}/ai-wrapper-test.XXXXXX")"
+FAKE_HOME="$(_safe_mktemp_d "${HOME}/ai-wrapper-test.XXXXXX")" || exit 1
 FAKE_HOME="$(cd "${FAKE_HOME}" && pwd -P)"
 isolate_test_env "${FAKE_HOME}"
 
@@ -49,7 +49,7 @@ cleanup() {
     if [[ "${keychain_created}" == "1" ]]; then
         security delete-keychain "${SYNTH_KEYCHAIN}" >/dev/null 2>&1 || true
     fi
-    rm -rf "${FAKE_HOME}"
+    _safe_rm_rf "${FAKE_HOME}"
 }
 trap cleanup EXIT
 
@@ -180,8 +180,8 @@ out="$(AI_SANDBOX_PASS_GITLAB=1 _dryrun)"
 assert_contains "${out}" "PASS_GITLAB=1" "AI_SANDBOX_PASS_GITLAB=1 passes PASS_GITLAB=1"
 # The keychain grants appear only inside the ALLOW_KEYCHAIN block.
 kc_when="$(_line_of '(when (equal? (param "ALLOW_KEYCHAIN") "1")')"
-assert_eq "$(grep -c '"com.apple.SecurityServer"\|"com.apple.securityd"' <<<"${SB}")" "2" "SecurityServer / securityd named once each"
-for name in '"com.apple.SecurityServer"' '"com.apple.securityd"' '"/Library/Keychains")))'; do
+assert_eq "$(grep -c '"com.apple.SecurityServer"\|"com.apple.securityd"\|"com.apple.securityd.xpc"' <<<"${SB}")" "3" "SecurityServer / securityd / securityd.xpc named once each"
+for name in '"com.apple.SecurityServer"' '"com.apple.securityd"' '"com.apple.securityd.xpc"' '"/Library/Keychains")))'; do
     hits="$(grep -nF -- "${name}" <<<"${SB}" | grep -v 'require-not' | cut -d: -f1)"
     ok=1
     for h in ${hits}; do [[ -n "${kc_when}" && "${h}" -gt "${kc_when}" ]] || ok=0; done

@@ -22,11 +22,11 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=./lib_test_helpers.bash
 source "${REPO_ROOT}/tests/lib_test_helpers.bash"
 
-FAKE_HOME="$(mktemp -d "${HOME}/ai-wrapper-test.XXXXXX")"
+FAKE_HOME="$(_safe_mktemp_d "${HOME}/ai-wrapper-test.XXXXXX")" || exit 1
 isolate_test_env "${FAKE_HOME}"
 mkdir -p "${FAKE_HOME}/work"
 
-cleanup() { rm -rf "${FAKE_HOME}"; }
+cleanup() { _safe_rm_rf "${FAKE_HOME}"; }
 trap cleanup EXIT
 
 OS="$(uname -s)"
@@ -220,7 +220,7 @@ assert_eq "${created}" "1" "default ~/.codex is created when absent"
 assert_eq "${out##*${NL}}" "NAME=Codex CLI" "default account keeps the plain agent name"
 assert_eq "$(_bind '')" "$(_bind 'private')" "empty CODEX_ACCOUNT behaves like 'private'"
 
-outside="$(mktemp -d)"
+outside="$(_safe_mktemp_d)" || exit 1
 rm -rf "${FAKE_HOME}/.codex"
 ln -s "${outside}" "${FAKE_HOME}/.codex"
 out="$(_bind 'private')"; rc=$?
@@ -402,7 +402,7 @@ STUB
     assert_contains "${out}" "ARGV:--dangerously-bypass-approvals-and-sandbox exec hello" "non-interactive argv is AGENT_FLAGS + user args"
     assert_contains "${out}" "alt-profile" "\$HOME/.codex-alt is visible at \$HOME/.codex inside the sandbox"
 
-    _fresh_dir="$(mktemp -d "${FAKE_HOME}/work-invalid-XXXXXX")"
+    _fresh_dir="$(_safe_mktemp_d "${FAKE_HOME}/work-invalid-XXXXXX")" || exit 1
     out="$(cd "${_fresh_dir}" && PATH="${FAKE_HOME}/bin:${PATH}" CODEX_ACCOUNT='x;y' \
         bash "${REPO_ROOT}/bin/executable_codex_wrapper.bash" exec hello </dev/null 2>&1)"
     rc=$?

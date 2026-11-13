@@ -38,7 +38,8 @@ _regex_escape() {
 # stops what it started (_sandbox_stop_network_proxy), sets
 # _AI_SANDBOX_NET_PROXY_ERROR and returns 1. Runs in the calling shell,
 # never in $(...): the proxy's parent must be the shell that launches the
-# sandbox. Args: BASE
+# sandbox. Private-range host names come from
+# _sandbox_private_host_args (--allow-private-host). Args: BASE
 _sandbox_start_network_proxy_tcp() {
     local base="${1:-/tmp}" python_bin dir shell_pid port="" polls=0 reason
     _AI_SANDBOX_NET_PROXY_ERROR=""
@@ -57,10 +58,12 @@ _sandbox_start_network_proxy_tcp() {
         _AI_SANDBOX_NET_PROXY_ERROR="cannot make ${dir} private"; return 1
     fi
     _AI_SANDBOX_NET_PROXY_DIR="${dir}"
+    _sandbox_private_host_args
     # Read before the fork: an async command's words expand in the child.
     # bash 3.2 has no BASHPID; see _sandbox_read_own_exit_trap.
     shell_pid="${BASHPID:-$(exec sh -c 'echo "${PPID}"')}"
     "${python_bin}" -I "${_AI_SANDBOX_NET_PROXY_HELPER}" --host 127.0.0.1 --port 0 --parent-pid "${shell_pid}" \
+        "${_AI_SANDBOX_PRIVATE_HOST_ARGS[@]+"${_AI_SANDBOX_PRIVATE_HOST_ARGS[@]}"}" \
         >"${dir}/ready" 2>"${dir}/proxy.log" </dev/null &
     _AI_SANDBOX_NET_PROXY_PID=$!
     while [[ -z "${port}" ]]; do
@@ -643,7 +646,8 @@ _run_sandboxed_agent_impl() {
     [[ "${allow_docker}" == "1" ]] || allow_docker=0
 
     # ALLOW_KEYCHAIN gates the ~/Library/Keychains file grant and the
-    # SecurityServer / securityd Mach lookups in the SBPL profile (#67 / M1).
+    # SecurityServer / securityd / securityd.xpc (secd) Mach lookups in the
+    # SBPL profile (#67 / M1).
     # Default "0": the agent can neither open keychain files nor ask
     # securityd for items. Any non-"1" value normalises to "0".
     local allow_keychain="${AI_SANDBOX_ALLOW_KEYCHAIN:-0}"
@@ -863,6 +867,10 @@ _run_sandboxed_agent_impl() {
     # the SBPL profile so the callback can append to binds_rw / binds_ro /
     # binds_pin / binds_under / binds_meta and mutate env_allowlist. Runs in
     # the outer function scope (not the subshell), matching the arrays' scope.
+    # The hook may append host suffixes to AI_SANDBOX_PRIVATE_HOSTS for the
+    # egress proxy; the local copy keeps them to this launch (never saved to
+    # the preset).
+    local AI_SANDBOX_PRIVATE_HOSTS="${AI_SANDBOX_PRIVATE_HOSTS:-}"
     if declare -f _extra_sandbox_setup >/dev/null 2>&1; then
         _extra_sandbox_setup
     fi
@@ -897,7 +905,7 @@ _run_sandboxed_agent_impl() {
         profile+="${extra_rules}"
     fi
     if [[ ${#binds_ro[@]} -gt 0 ]]; then
-        extra_rules="$(_append_ro_deny_rules "${tag}" "${resolved_home}" "${binds_ro[@]}" -- "${binds_rw[@]+"${binds_rw[@]}"}")" || return 1
+        extra_rules="$(_append_ro_deny_rules "${tag}" "${resolved_home}" "${binds_ro[@]}" -- "${resolved_workdir}" "${binds_rw[@]+"${binds_rw[@]}"}")" || return 1
         profile+="${extra_rules}"
     fi
 
@@ -1151,7 +1159,8 @@ _SBPL_RO_DENY_OPS="file-write* file-link"
 #   HOME        — resolved $HOME (may be empty); ancestor pins stop below it
 #   RO_PATH...  — every --ro-bind path (wrapper, AI_SANDBOX_EXTRA_RO_DIRS,
 #                 _extra_sandbox_setup)
-#   RW_PATH...  — every --bind path, used only to carve exceptions
+#   RW_PATH...  — WORKDIR and every --bind path, used only to carve
+#                 exceptions (an RO parent of WORKDIR keeps WORKDIR writable)
 #
 # Seatbelt has no mounts, so bwrap's "later mount wins" cannot be copied
 # literally, and the parser keeps RW and RO binds in separate arrays. The

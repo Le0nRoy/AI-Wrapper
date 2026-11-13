@@ -201,3 +201,72 @@ assert_no_live_client_reached() {
     fi
     assert_eq "${hits}" "" "no un-stubbed AI client was reached"
 }
+
+# ---------------------------------------------------------------------------
+# Temp dirs and cleanup that cannot reach the checkout or a real home
+# ---------------------------------------------------------------------------
+# Incident (2026-11): inside an agent sandbox `mktemp -d "$HOME/..."` was
+# denied, the empty result went through `cd "" && pwd -P` (the current
+# directory: the repo root) and the EXIT trap's `rm -rf "$FAKE_HOME"`
+# deleted the checkout. Create test dirs with _safe_mktemp_d (fails hard)
+# and remove them with _safe_rm_rf (refuses anything that is not a temp dir).
+
+# Captured when this file is sourced, before isolate_test_env moves HOME.
+_TEST_REAL_HOME="$(cd -- "${HOME:-/}" 2>/dev/null && pwd -P)"
+_TEST_REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+# Last path component of a mktemp result: the templates here end in
+# .XXXXXX / -XXXXXX (mktemp's default name is tmp.XXXXXXXX); dirs derived
+# from one by a suffix such as "-prefix" keep that shape.
+_TEST_TEMP_NAME_PATTERN='[.-][A-Za-z0-9]{6,}$'
+
+# _safe_mktemp_d [MKTEMP_ARGS...]: mktemp -d, printing the new directory's
+# physical path. Prints the reason on stderr and returns 1 (nothing on
+# stdout) when mktemp fails or yields no directory, so callers never get
+# an empty path. Use: DIR="$(_safe_mktemp_d "${TMPDIR:-/tmp}/x.XXXXXX")" || exit 1
+_safe_mktemp_d() {
+    local dir="" resolved=""
+    if ! dir="$(mktemp -d "$@")" || [[ -z "${dir}" || ! -d "${dir}" ]]; then
+        echo "FATAL: mktemp -d $* failed${dir:+ (got '${dir}')}" >&2
+        return 1
+    fi
+    if ! resolved="$(cd -- "${dir}" && pwd -P)" || [[ -z "${resolved}" ]]; then
+        echo "FATAL: cannot resolve the new temp dir ${dir}" >&2
+        return 1
+    fi
+    printf '%s\n' "${resolved}"
+}
+
+# _safe_rm_rf PATH...: rm -rf each PATH that is a test temp dir. Empty
+# arguments (never created) are skipped. Refuses, with a message, and
+# returns 1 for a relative path, "/", the checkout, the real home, any
+# ancestor of those, or a name not shaped like a mktemp result.
+_safe_rm_rf() {
+    local target resolved protected rc=0
+    for target in "$@"; do
+        [[ -z "${target}" ]] && continue
+        if [[ "${target}" != /* ]]; then
+            echo "REFUSING to remove relative path '${target}'" >&2; rc=1; continue
+        fi
+        [[ -e "${target}" || -L "${target}" ]] || continue
+        if [[ -d "${target}" && ! -L "${target}" ]]; then
+            resolved="$(cd -- "${target}" 2>/dev/null && pwd -P)"
+        else
+            resolved="$(cd -- "$(dirname -- "${target}")" 2>/dev/null && pwd -P)/$(basename -- "${target}")"
+        fi
+        if [[ -z "${resolved}" || "${resolved}" == / ]]; then
+            echo "REFUSING to remove '${target}' (resolves to '${resolved:-nothing}')" >&2; rc=1; continue
+        fi
+        for protected in "${_TEST_REPO_ROOT}" "${_TEST_REAL_HOME}"; do
+            [[ -n "${protected}" && "${protected}/" == "${resolved%/}/"* ]] && break
+            protected=""
+        done
+        if [[ -n "${protected}" ]]; then
+            echo "REFUSING to remove '${target}': it is or contains ${protected}" >&2; rc=1; continue
+        fi
+        if [[ ! "$(basename -- "${resolved}")" =~ ${_TEST_TEMP_NAME_PATTERN} ]]; then
+            echo "REFUSING to remove '${target}': not a test temp dir name" >&2; rc=1; continue
+        fi
+        rm -rf -- "${target}"
+    done
+    return "${rc}"
+}

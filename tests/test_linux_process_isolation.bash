@@ -33,13 +33,13 @@ OS="$(uname -s)"
 REAL_BWRAP="$(type -P bwrap || true)"
 HELPER="${REPO_ROOT}/bin/ai_wrapper_data/linux_tty_seccomp.py"
 
-FAKE_HOME="$(mktemp -d "${HOME}/ai-wrapper-test.XXXXXX")"
+FAKE_HOME="$(_safe_mktemp_d "${HOME}/ai-wrapper-test.XXXXXX")" || exit 1
 FAKE_HOME="$(cd "${FAKE_HOME}" && pwd -P)"
-STUB_DIR="$(mktemp -d)"
+STUB_DIR="$(_safe_mktemp_d)" || exit 1
 isolate_test_env "${FAKE_HOME}"
 cleanup() {
     chmod -R u+rwX "${STUB_DIR}" 2>/dev/null
-    rm -rf "${FAKE_HOME}" "${STUB_DIR}"
+    _safe_rm_rf "${FAKE_HOME}" "${STUB_DIR}"
 }
 trap cleanup EXIT
 

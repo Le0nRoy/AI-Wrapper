@@ -22,6 +22,7 @@ import threading
 import time
 import unittest
 import uuid
+from unittest import mock
 from http.server import BaseHTTPRequestHandler
 
 HELPER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "bin", "ai_wrapper_data")
@@ -309,6 +310,81 @@ class ResolutionTests(unittest.TestCase):
             proxy.DestinationFilter().resolve("bad\x00host", 80)
 
 
+PRIVATE_SUFFIX = "gitlab.example.test"
+PRIVATE_NAMES = {
+    PRIVATE_SUFFIX: ["10.20.30.40"],
+    "api." + PRIVATE_SUFFIX: ["172.16.0.5", "fd00::5"],
+    "mapped." + PRIVATE_SUFFIX: ["::ffff:192.168.1.1"],
+    "cgnat." + PRIVATE_SUFFIX: ["100.64.0.7"],
+    "evil-" + PRIVATE_SUFFIX: ["10.0.0.1"],
+    "other.example.test": ["10.0.0.1"],
+    "loop." + PRIVATE_SUFFIX: ["127.0.0.1"],
+    "meta." + PRIVATE_SUFFIX: ["169.254.169.254"],
+    "mixed." + PRIVATE_SUFFIX: ["10.0.0.1", "::ffff:127.0.0.1"],
+}
+
+
+class PrivateHostTests(unittest.TestCase):
+    """--allow-private-host: name-scoped exemption of the private LAN ranges only."""
+
+    def make_filter(self, suffixes=(PRIVATE_SUFFIX,)):
+        return proxy.DestinationFilter(resolver=FakeResolver(PRIVATE_NAMES), private_host_suffixes=suffixes)
+
+    def test_matching_hosts_may_resolve_to_private_ranges(self):
+        destination_filter = self.make_filter(("GitLab.Example.Test.",))
+        for host in (PRIVATE_SUFFIX, "api." + PRIVATE_SUFFIX, "mapped." + PRIVATE_SUFFIX, "cgnat." + PRIVATE_SUFFIX):
+            with self.subTest(host=host):
+                targets = destination_filter.resolve(host, 443)
+                self.assertEqual([sockaddr[0] for _family, sockaddr in targets], PRIVATE_NAMES[host])
+        self.assertTrue(destination_filter.private_allowed("API.GITLAB.EXAMPLE.TEST."))
+
+    def test_non_matching_hosts_stay_blocked(self):
+        destination_filter = self.make_filter()
+        for host in ("other.example.test", "evil-" + PRIVATE_SUFFIX):
+            with self.subTest(host=host):
+                with self.assertRaises(proxy.DestinationBlocked):
+                    destination_filter.resolve(host, 443)
+
+    def test_always_blocked_ranges_apply_to_matching_hosts(self):
+        destination_filter = self.make_filter()
+        for host in ("loop." + PRIVATE_SUFFIX, "meta." + PRIVATE_SUFFIX, "mixed." + PRIVATE_SUFFIX):
+            with self.subTest(host=host):
+                with self.assertRaises(proxy.DestinationBlocked):
+                    destination_filter.resolve(host, 443)
+
+    def test_ip_literals_never_match(self):
+        destination_filter = self.make_filter()
+        # Even a numeric suffix (refused by validation, forced here) never
+        # lets an IP-literal request host through.
+        destination_filter._private_host_suffixes += ("0.0.1", "0.1")
+        for host in ("10.0.0.1", "::ffff:10.0.0.1", "fd00::1"):
+            with self.subTest(host=host):
+                self.assertFalse(destination_filter.private_allowed(host))
+                with self.assertRaises(proxy.DestinationBlocked):
+                    destination_filter.resolve(host, 443)
+
+    def test_default_filter_allows_no_private_host(self):
+        destination_filter = proxy.DestinationFilter(resolver=FakeResolver(PRIVATE_NAMES))
+        with self.assertRaises(proxy.DestinationBlocked):
+            destination_filter.resolve(PRIVATE_SUFFIX, 443)
+
+    def test_network_split(self):
+        self.assertEqual(set(proxy.BLOCKED_NETWORKS),
+                         set(proxy.ALWAYS_BLOCKED_NETWORKS) | set(proxy.PRIVATE_NETWORKS))
+        self.assertEqual(sorted(str(network) for network in proxy.PRIVATE_NETWORKS),
+                         sorted(("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "fc00::/7")))
+
+    def test_suffix_validation(self):
+        self.assertEqual(proxy.normalize_private_host_suffix(" Corp.Example. "), "corp.example")
+        for bad in ("", " ", ".", "*.corp.example", "corp", "10.0.0.1", "::1", "fd00::/8",
+                    "corp..example", "-corp.example", "corp_x.example", "corp.example/x", "0.0.1"):
+            with self.subTest(suffix=bad):
+                with self.assertRaises(ValueError):
+                    proxy.normalize_private_host_suffix(bad)
+        with self.assertRaises(ValueError):
+            proxy.DestinationFilter(private_host_suffixes=("10.0.0.1",))
+
+
 class AuthorityTests(unittest.TestCase):
     def test_valid(self):
         self.assertEqual(proxy.parse_authority("Example.COM:443"), ("example.com", 443))
@@ -538,6 +614,68 @@ class HTTPForwardingTests(ProxyHarness):
                 self.assertEqual(code, expected)
 
 
+class UnixEchoServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+    daemon_threads = True
+
+
+class PrivateHostProxyTests(unittest.TestCase):
+    """End to end over UNIX sockets: CONNECT to an allowed private name
+    passes the filter and connects to the checked address; others get 403."""
+
+    def setUp(self):
+        # Short base: AF_UNIX paths are limited to ~104 bytes on macOS.
+        directory = tempfile.mkdtemp(prefix="anp-", dir="/tmp")
+        self.addCleanup(shutil.rmtree, directory, True)
+        echo_path = os.path.join(directory, "echo.sock")
+        self.echo = UnixEchoServer(echo_path, EchoHandler)
+        self.addCleanup(stop_server, self.echo, start_server(self.echo))
+        self.connected = []
+
+        def connect_to_echo(targets, timeout):
+            # The private address is not routable in tests: record what the
+            # proxy checked and hand back a connection to the echo server.
+            self.connected.append([sockaddr[0] for _family, sockaddr in targets])
+            upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            upstream.settimeout(timeout)
+            upstream.connect(echo_path)
+            return upstream
+
+        patcher = mock.patch.object(proxy, "connect_upstream", connect_to_echo)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        destination_filter = proxy.DestinationFilter(resolver=FakeResolver(PRIVATE_NAMES),
+                                                     private_host_suffixes=(PRIVATE_SUFFIX,))
+        self.proxy_path = os.path.join(directory, "proxy.sock")
+        self.proxy = proxy.ThreadingUnixProxyServer(self.proxy_path, destination_filter, PROXY_IDLE_TIMEOUT_SECONDS)
+        self.addCleanup(stop_server, self.proxy, start_server(self.proxy))
+
+    def connect(self):
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(SOCKET_TIMEOUT_SECONDS)
+        self.addCleanup(client.close)
+        client.connect(self.proxy_path)
+        return client
+
+    def test_allowed_private_host_gets_200(self):
+        client = self.connect()
+        client.sendall(("CONNECT %s:443 HTTP/1.1\r\n\r\n" % PRIVATE_SUFFIX).encode())
+        self.assertTrue(read_head(client).startswith(b"HTTP/1.1 200 "))
+        client.sendall(b"ping")
+        self.assertEqual(client.recv(proxy.RELAY_BUFFER_BYTES), b"ping")
+        self.assertEqual(self.connected, [["10.20.30.40"]])
+
+    def test_other_private_destinations_get_403(self):
+        for target in ("other.example.test:443", "evil-%s:443" % PRIVATE_SUFFIX, "10.0.0.1:443",
+                       "loop.%s:443" % PRIVATE_SUFFIX, "meta.%s:80" % PRIVATE_SUFFIX):
+            with self.subTest(target=target):
+                client = self.connect()
+                client.sendall(("CONNECT %s HTTP/1.1\r\n\r\n" % target).encode())
+                code, _head, body = split_response(read_until_closed(client))
+                self.assertEqual(code, 403)
+                self.assertIn(b"blocked by sandbox network policy", body)
+        self.assertEqual(self.connected, [])
+
+
 class UnixSocketTests(unittest.TestCase):
     def setUp(self):
         # Short base: AF_UNIX paths are limited to ~104 bytes on macOS.
@@ -715,6 +853,22 @@ class CommandLineTests(unittest.TestCase):
         _stdout, stderr = process.communicate(timeout=STARTUP_TIMEOUT_SECONDS)
         self.assertEqual(process.returncode, 2)
         self.assertIn(b"--socket and/or --port", stderr)
+
+    def test_allow_private_host_logged_and_validated(self):
+        process = self.launch("--socket", self.path, "--allow-private-host", "GitLab.Example.Test",
+                              "--allow-private-host", "corp.example")
+        self.assertEqual(self.read_ready_lines(process, 1), ["READY unix %s" % self.path])
+        process.send_signal(signal.SIGTERM)
+        _stdout, stderr = process.communicate(timeout=STARTUP_TIMEOUT_SECONDS)
+        self.assertEqual(process.returncode, 0, stderr)
+        self.assertIn(b"private LAN ranges allowed for hosts under: gitlab.example.test, corp.example", stderr)
+        for bad in ("*.corp.example", "10.0.0.1", "corp", ""):
+            with self.subTest(suffix=bad):
+                process = self.launch("--socket", self.path, "--allow-private-host", bad)
+                _stdout, stderr = process.communicate(timeout=STARTUP_TIMEOUT_SECONDS)
+                self.assertEqual(process.returncode, 2)
+                self.assertIn(b"--allow-private-host", stderr)
+                self.assertFalse(os.path.lexists(self.path))
 
     def test_non_loopback_host_fails(self):
         process = self.launch("--host", "0.0.0.0", "--port", "0")

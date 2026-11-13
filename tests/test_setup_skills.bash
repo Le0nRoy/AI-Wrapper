@@ -7,10 +7,10 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-FAKE_HOME="$(mktemp -d "${TMPDIR:-${HOME}}/ai-wrapper-skills-test.XXXXXX")"
-trap 'rm -rf "${FAKE_HOME}"' EXIT
 # shellcheck source=./lib_test_helpers.bash
 source "${REPO_ROOT}/tests/lib_test_helpers.bash"
+FAKE_HOME="$(_safe_mktemp_d "${TMPDIR:-/tmp}/ai-wrapper-skills-test.XXXXXX")" || exit 1
+trap '_safe_rm_rf "${FAKE_HOME}"' EXIT
 isolate_test_env "${FAKE_HOME}"
 
 mkdir -p \
@@ -45,7 +45,7 @@ if ! HOME="${FAKE_HOME}" bash "${REPO_ROOT}/bin/executable_setup_skills.bash" >/
     exit 1
 fi
 
-skills=(caveman orchestrator-mode ponytail session-retro tortuga)
+skills=(caveman orchestrator-mode ponytail retro-aggregate session-retro skill-sync tortuga)
 destinations=(
     ".claude/skills"
     ".codex/skills"

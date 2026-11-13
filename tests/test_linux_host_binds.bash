@@ -22,14 +22,14 @@ OS="$(uname -s)"
 # Resolve the real bwrap before the stub dir shadows it on PATH.
 REAL_BWRAP="$(type -P bwrap || true)"
 
-FAKE_HOME="$(mktemp -d "${HOME}/ai-wrapper-test.XXXXXX")"
+FAKE_HOME="$(_safe_mktemp_d "${HOME}/ai-wrapper-test.XXXXXX")" || exit 1
 FAKE_HOME="$(cd "${FAKE_HOME}" && pwd -P)"
-STUB_DIR="$(mktemp -d)"
+STUB_DIR="$(_safe_mktemp_d)" || exit 1
 isolate_test_env "${FAKE_HOME}"
 TAILSCALE_PID=""
 cleanup() {
     [[ -n "${TAILSCALE_PID}" ]] && kill "${TAILSCALE_PID}" 2>/dev/null
-    rm -rf "${FAKE_HOME}" "${STUB_DIR}"
+    _safe_rm_rf "${FAKE_HOME}" "${STUB_DIR}"
 }
 trap cleanup EXIT
 
@@ -72,6 +72,10 @@ _has_bind() {
     [[ "${NL}${argv}${NL}" == *"${NL}${flag}${NL}${src}${NL}${dst}${NL}"* ]]
 }
 NL=$'\n'
+# Prints the argv line number of FLAG SRC SRC (0 when absent).
+_bind_idx() {
+    awk -v f="${2}" -v p="${3}" 'prev == f && $0 == p { print NR - 1; found = 1; exit } { prev = $0 } END { if (!found) print 0 }' <<<"${1}"
+}
 _yes() { if "$@"; then echo yes; else echo no; fi; }
 
 echo "== Linux host-path gates (${OS}) =="
@@ -194,6 +198,26 @@ assert_contains "${out}" "AI_SANDBOX_ALLOW_AGENTS_SKILLS_RW=1" "ALLOW_AGENTS_SKI
 out="$( cd "${WORK}" && export PATH="${STUB_DIR}:${PATH}" && _load_linux && _run_sandboxed_agent_linux true -- -- 2>&1 )"
 assert_not_contains "${out}" "WARNING" "protected default launch logs no relaxed-mode warning"
 
+echo "-- bwrap argv: RO extra above WORKDIR / an RW extra mounts first"
+WS="${H}/ws-${RUN_ID}"
+mkdir -p "${WS}/proj/ro-sub" "${WS}/rw-extra"
+argv="$(WORK="${WS}/proj" _argv AI_SANDBOX_EXTRA_RO_DIRS="${WS},${WS}/proj/ro-sub" AI_SANDBOX_EXTRA_RW_DIRS="${WS}/rw-extra")"
+ws_idx="$(_bind_idx "${argv}" --ro-bind "${WS}")"
+wd_idx="$(_bind_idx "${argv}" --bind "${WS}/proj")"
+rw_idx="$(_bind_idx "${argv}" --bind "${WS}/rw-extra")"
+sub_idx="$(_bind_idx "${argv}" --ro-bind "${WS}/proj/ro-sub")"
+assert_eq "$(_yes test "${ws_idx}" -gt 0 -a "${ws_idx}" -lt "${wd_idx}")" yes "RO parent of WORKDIR precedes the WORKDIR bind"
+assert_eq "$(_yes test "${rw_idx}" -gt "${ws_idx}")" yes "RW extra inside the RO parent follows it"
+assert_eq "$(_yes test "${sub_idx}" -gt "${wd_idx}" -a "${sub_idx}" -gt "${rw_idx}")" yes "RO extra inside WORKDIR still follows the WORKDIR bind"
+argv="$(_argv AI_SANDBOX_EXTRA_RO_DIRS="${WS}" AI_SANDBOX_EXTRA_RW_DIRS="${WS}/rw-extra")"
+ws_idx="$(_bind_idx "${argv}" --ro-bind "${WS}")"
+rw_idx="$(_bind_idx "${argv}" --bind "${WS}/rw-extra")"
+wd_idx="$(_bind_idx "${argv}" --bind "${WORK}")"
+assert_eq "$(_yes test "${ws_idx}" -gt "${wd_idx}" -a "${ws_idx}" -lt "${rw_idx}")" yes "RO parent of an RW extra only precedes the RW extras"
+argv="$(_argv AI_SANDBOX_EXTRA_RO_DIRS="${WS}/rw-extra" AI_SANDBOX_EXTRA_RW_DIRS="${WS}/rw-extra")"
+assert_eq "$(_yes test "$(_bind_idx "${argv}" --ro-bind "${WS}/rw-extra")" -gt "$(_bind_idx "${argv}" --bind "${WS}/rw-extra")")" yes \
+    "RO extra equal to an RW extra still mounts last (RO wins)"
+
 # ---------------------------------------------------------------------------
 echo "-- native bubblewrap probes"
 # Native certification of the gates: on Linux a missing bwrap is a
@@ -290,6 +314,22 @@ probe skills-create sh -c 'echo x >${H}/ai-wrapper/.agents/skills/${canary}'
 echo PROBES_DONE" 2>&1 )"
 assert_contains "${out}" "OK:skills-create" "WORKDIR above the skills dir keeps its RW grant"
 rm -f "${H}/ai-wrapper/.agents/skills/${canary}"
+
+# RO extra above WORKDIR and an RW extra: both stay writable, the rest of
+# the RO parent and an RO extra inside WORKDIR stay read-only.
+out="$( cd "${WS}/proj" && export AI_SANDBOX_EXTRA_RO_DIRS="${WS},${WS}/proj/ro-sub" AI_SANDBOX_EXTRA_RW_DIRS="${WS}/rw-extra" \
+    && _load_linux && _run_sandboxed_agent_linux /bin/bash -- -- -c "${PROBE_LIB}
+probe wd-write sh -c 'echo x >${WS}/proj/${canary}'
+probe rw-extra-write sh -c 'echo x >${WS}/rw-extra/${canary}'
+probe ro-sibling sh -c 'echo x >${WS}/${canary}'
+probe ro-sub-write sh -c 'echo x >${WS}/proj/ro-sub/${canary}'
+echo PROBES_DONE" 2>&1 )"
+assert_contains "${out}" "OK:wd-write" "WORKDIR under an RO extra stays writable"
+assert_contains "${out}" "OK:rw-extra-write" "RW extra under an RO extra stays writable"
+assert_contains "${out}" "DENIED:ro-sibling" "rest of the RO extra stays read-only"
+assert_contains "${out}" "DENIED:ro-sub-write" "RO extra inside WORKDIR stays read-only"
+assert_eq "$(_yes test -f "${WS}/proj/${canary}" -a -f "${WS}/rw-extra/${canary}")" yes "RO-parent writes persist on host"
+rm -rf "${WS}"
 
 # Tailscale opt-in: socket reachable through the RO bind, and the RO bind
 # does not stop socket I/O (so it is not a read-only API).

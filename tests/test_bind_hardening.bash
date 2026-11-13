@@ -25,11 +25,11 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=./lib_test_helpers.bash
 source "${REPO_ROOT}/tests/lib_test_helpers.bash"
 
-FAKE_HOME="$(mktemp -d "${HOME}/ai-wrapper-test.XXXXXX")"
+FAKE_HOME="$(_safe_mktemp_d "${HOME}/ai-wrapper-test.XXXXXX")" || exit 1
 FAKE_HOME="$(cd "${FAKE_HOME}" && pwd -P)"
-OUTSIDE="$(mktemp -d)"
+OUTSIDE="$(_safe_mktemp_d)" || exit 1
 isolate_test_env "${FAKE_HOME}"
-cleanup() { rm -rf "${FAKE_HOME}" "${OUTSIDE}"; }
+cleanup() { _safe_rm_rf "${FAKE_HOME}" "${OUTSIDE}"; }
 trap cleanup EXIT
 
 OS="$(uname -s)"
