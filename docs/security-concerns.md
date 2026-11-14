@@ -619,8 +619,6 @@ Three gaps (CC-1..CC-3):
   `$HOME` (so `~/.config` relocated to a data disk is still refused). The
   resolved path is bound at itself and, when the cwd came through a
   symlink, also at the logical path, and `--chdir` uses the logical path.
-  The git metadata overlays already cover both paths
-  (`_wrapper_git_ro_bind` / `_wrapper_git_pin`).
 - *Extra dirs (both backends).* `_sandbox_resolve_extra_dir` resolves
   each entry before it is classified or granted. A missing entry is
   skipped with a WARNING, as before (a preset from another machine stays
@@ -678,7 +676,7 @@ Three gaps (CC-1..CC-3):
 CC-6. `_preset_autoload` exported every saved setting unconditionally,
 so `AI_SANDBOX_PASS_AWS=0 claude_wrapper` in a workdir whose preset held
 `AI_SANDBOX_PASS_AWS=1` launched with AWS credentials anyway. Only
-`AI_SANDBOX_ALLOW_GIT_CONFIG` had a launch-wins check, and only that
+`AI_SANDBOX_ALLOW_GIT_CONFIG` (retired since, B-ρ) had a launch-wins check, and only that
 setting WARNed when a relaxed value was restored; every other red or
 yellow setting (Docker socket, SSH agent, extra RW dirs, ...) came back
 silently, including for scripted launches with no menu.
@@ -698,8 +696,8 @@ silently, including for scripted launches with no menu.
   source time — that would count as caller-set and hide a saved account.
   `_setting_current_value` now substitutes the catalog default for an
   empty str/path, so the settings table still shows `private`.
-- Session-only settings (`AI_SANDBOX_ALLOW_EXTERNAL_WORKTREES`, B-ο) are
-  still rejected before the precedence check: never saved, never loaded.
+- Retired settings (`_AI_RETIRED_SETTINGS`, B-ρ) are skipped before the
+  precedence check, with at most a one-line NOTE.
 
 **Residual.** In an interactive launch, auto-save runs after the menu and
 writes the session's current values, so a one-off launch value (e.g.
@@ -981,357 +979,191 @@ write inside WORKDIR cannot create that back-link). Failure WARNs and
 skips the bind; the launch continues. `AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR`
 does not relax it. **Behaviour change:** worktrees of repos outside
 `$HOME` (or under a `$HOME` dotfile dir) no longer get the shared `.git`
-bound automatically. Outside `$HOME` see B-ο (session opt-in); a raw
-`AI_SANDBOX_EXTRA_RW_DIRS` grant works but has no read-only layers and
-is WARNed.
+bound automatically. Superseded by B-ρ (2026-11): any worktree or
+submodule checkout whose links verify gets its git dir bound read-write,
+on any disk; the basename rule was dropped (worktrees of bare
+repositories named without `.git`, e.g. `.bare`, work) and the location
+rules were dropped (structural and link checks only).
 
-### B-λ — worktree common dir: borrowed entries and host code execution (RESOLVED, 2026-10)
+### B-ρ — Git metadata is writable by the agent (ACCEPTED, 2026-11, owner decision)
 
-Two gaps left by B-ι's first fix:
+Short list of what must stay as it is: `docs/owner-accepted-exceptions.md`.
 
-1. **Borrowed worktree entry.** A checkout's `.git` file could point at
-   an *existing* `<victim>/.git/worktrees/<name>` of any repo; the
-   forward-link check passed. Now `<common>/worktrees/<name>/gitdir`
-   (written by git, not writable from the checkout) must resolve to
-   exactly `<worktree toplevel>/.git` (both sides realpath'd; relative
-   `gitdir` entries are resolved against the entry dir).
-2. **RW on a genuine common dir = host code execution.** The agent could
-   write `hooks/`, `config` (`core.hooksPath`, `core.fsmonitor`, aliases,
-   filter drivers), other worktrees' entries (`commondir`,
-   `config.worktree`) or submodule git dirs, all of which run on the
-   user's next git command outside the sandbox. After the RW bind the
-   wrapper now over-mounts read-only: `config`, `hooks/` (created if
-   missing), all of `worktrees/` except this worktree's own entry, that
-   entry's `commondir` / `gitdir` / `config.worktree` (pre-created when
-   `extensions.worktreeConfig` is on), and the submodule git dirs below
-   `modules/` at any depth (see "Submodule git dirs" under B-ν): their
-   `config`, `hooks/`, `config.worktree`, `commondir` and `worktrees/`
-   are RO in both modes and every directory on the chain to them is
-   pinned. A symlink among the root-level targets aborts the bind
-   (WARN); a symlink, wrong type or exceeded limit in the submodule tree
-   refuses the launch (#12). This worktree's own submodule git dirs
-   (`<common>/worktrees/<name>/modules`, where git keeps them for a
-   linked worktree) are protected after the menu and follow
-   `AI_SANDBOX_ALLOW_GIT_CONFIG` like WORKDIR's own submodules; the
-   shared ones never do. Missing submodule `hooks/` are no longer
-   created on the host (WARNed instead). Commit, branch, checkout, fetch
-   keep working; `git config`, `remote add`, `push -u`,
-   `branch --set-upstream-to`, `worktree add/prune` and submodule
-   updates fail inside the sandbox. Applies to the Claude wrapper too.
+**Decision.** Git must work inside the wrapper by default, with no
+switch to turn it off, in plain repositories, linked worktrees (inside or
+outside the repository root, on any disk, worktrees of bare repositories
+included) and submodule checkouts (nested and slash-named included). The
+agent gets full read-write access to the repository's git dir, including
+`config`, `hooks/`, `config.worktree`, `commondir`, `info/`, `modules/`
+and `worktrees/`:
 
-**TOCTOU.** Validation and binds use the same realpath-resolved paths;
-the over-mount targets are checked for symlinks immediately before the
-flags are built. A residual window remains between this check and
-bwrap's mount for a *concurrent* host process that can write the
-victim repo; sandboxed sessions can no longer rename the RO mount
-points. The owner accepted this window without a code change (#14,
-below).
+- plain repository (`WORKDIR/.git` is a directory): through the WORKDIR
+  bind, with no read-only overlays, pins or placeholders;
+- linked worktree: the whole common dir (`<repo>/.git` or a bare
+  repository), bound read-write by `_wrapper_bind_git_common_dir`;
+- submodule checkout: exactly its module git dir
+  `<super>/.git/modules/<name>` (nested submodules below its `modules/`
+  included), never `<super>/.git` or sibling submodules.
 
-**Check-to-mount window (#14, ACCEPTED RESIDUAL, 2026-10).** Not fixed;
-the current behaviour is kept and documented. All Git-metadata
-validation (common-dir eligibility, back-links, root and submodule
-symlink/type checks) runs in the wrapper's shell before the kernel
-mounts (bwrap) or enforces rules (Seatbelt). Nothing re-checks the
-paths at launch, and the check, the mount and the exec are not atomic.
+So `git config`, `remote add`, `push -u`, hook installers,
+`git worktree add/prune`, branch deletion, `git gc` and submodule
+updates all work in the sandbox.
 
-- *Who.* A process other than the sandboxed agent that can replace a
-  selected source or one of its ancestors after validation: another host
-  process of the user, a concurrent session whose grants cover the
-  repository (an older wrapper, `AI_SANDBOX_ALLOW_GIT_CONFIG=1`, or a raw
-  `AI_SANDBOX_EXTRA_RW_DIRS` grant on it), or another local user who
-  can write a shared repository. A default-protected session cannot
-  rename the RO mount points it sees. Write access to one repository is
-  not, by itself, the right to run code as the user or read the user's
-  other files, so these actors are not assumed to own everything the
-  launching session can reach.
-- *Source selection.* bwrap and the Seatbelt rule generator select
-  sources by pathname. A source or ancestor swapped for a symlink or a
-  different directory after validation is resolved at mount / rule
-  time, so the bind or grant can name something other than what was
-  validated (on macOS `_resolve_bind_target` realpaths each path when
-  the SBPL rules are rendered). Which grant changes depends on the
-  swapped entry: the common dir and this worktree's entry are RW, the
-  over-mounts RO.
-- *Vanished protection entries (Linux).* The generic bind loop in
-  `_run_sandboxed_agent_linux` only tests that a source exists and, with
-  the default `BWRAP_STRICT=0`, skips a missing one with a WARN. An RO
-  over-mount present at discovery but removed before that loop is
-  therefore skipped, leaving that path under the RW common-dir bind.
-  This is a validation/protection gap; no end-to-end host execution has
-  been demonstrated natively. Entries absent at discovery are a
-  separate, already accepted residual (B-ν).
-- *Evidence.* A native synthetic bwrap probe (bwrap 0.13.1, synthetic
-  directories only — no real credentials, user repositories or
-  host-sensitive paths): a `--ro-bind` of the original path read the
-  original content; after a rename + symlink swap the same path bind
-  read a synthetic sibling outside the selected scope; a `--ro-bind-fd`
-  of a descriptor opened before the swap still read the original. This
-  shows pathname source selection and descriptor identity for that one
-  directory, not descendant/destination safety or a full wrapper exploit.
-  On macOS only source inspection and simulated SBPL generation exist —
-  no native race probe and no evidence about kernel enforcement or
-  broader rule interactions. Existing native CI (`smoke-linux`,
-  `smoke-macos`) covers the current access rules, not this race.
-- *Not adopted.* Descriptor binding (`--bind-fd` / `--ro-bind-fd`,
-  supported by bwrap 0.13.1) could pin selected source identity on Linux
-  only; Seatbelt has no equivalent, and it would not remove every
-  pathname race. A pre-exec re-check would narrow the window but cannot
-  close it atomically. Neither is implemented.
-- *Operational boundary.* While a wrapper launches, coordinate with (or
-  trust) every writer of the selected Git metadata: the common dir, its
-  `config`, `hooks/`, `worktrees/`, this worktree's entry and submodule
-  git dirs, and their ancestors. Protection after launch, B-ο's opt-in
-  and exact-scope checks and the #12 limits do not make the pre-launch
-  window atomic. Deliberate raw grants (`AI_SANDBOX_EXTRA_RW_DIRS`) are a
-  separate, user-chosen exposure. All existing checks, WARNs and
-  overrides (#10/#12 `AI_SANDBOX_ALLOW_GIT_CONFIG` handling, #13
-  external worktrees default off and session-only, #15 classifier and
-  `/Volumes` behaviour) are unchanged.
+**Accepted risk.** Host git runs hooks and commands named in config
+(`core.fsmonitor`, `core.hooksPath`, `core.sshCommand`, aliases,
+filter and diff drivers, credential helpers) outside the sandbox. The
+agent can plant any of them, and they run on the host the next time the
+user runs git in that repository — a shell prompt that calls
+`git status` is enough to trigger `core.fsmonitor`. For a worktree the
+same applies to the main checkout and every other worktree of the
+repository; for a submodule, to that submodule's checkout. The owner
+accepts this for usability; review `.git/config` and `.git/hooks/`
+after sessions in repositories whose content you do not trust. The
+same holds for repositories the agent creates (`git init`, clones) and
+for any git dir reachable through `AI_SANDBOX_EXTRA_RW_DIRS`.
 
-**macOS (#11).** Seatbelt has no mounts, so the backend renders every
-`--ro-bind` as a read allow plus a `(deny file-write* file-link …)`
-rule appended after all allows (`_append_ro_deny_rules`). Precedence is
-"most specific bind wins", independent of flag order: an RO path is
-denied except below an RW `--bind` nested strictly inside it (so
-`worktrees/` stays RO except this worktree's own entry, whose
-`commondir`/`gitdir` are RO again). An equal or broader RW grant —
-WORKDIR, `AI_SANDBOX_EXTRA_RW_DIRS`, a duplicate `--bind` — never
-reopens an RO path. Because Seatbelt matches paths rather than inodes,
-every ancestor directory of an RO path below `$HOME` (and the root of
-each nested RW exception) is also write-denied as a literal: renaming a
-writable parent away, editing the file under its new name and renaming
-it back fails. `$HOME` and its ancestors have no write grant, so they
-are not pinned; they get stat-only (`file-read-metadata`) grants instead
-so git/realpath can walk a `$HOME` that is not directly under `/Users`.
-`file-link` blocks hard-linking a protected file into a writable
-directory. The same rules apply to `AI_SANDBOX_EXTRA_RO_DIRS`, the
-glab config bind and `_extra_sandbox_setup` entries. Native coverage:
-`tests/test_bind_hardening.bash` (worktree e2e through the codex
-wrapper) and `tests/test_macos_ro_overlays.bash`, both in CI
-`smoke-macos`.
+**Pointer sanity (kept).** A git dir outside WORKDIR is found through
+the checkout's `.git` file (and the `commondir` it points at), which a
+crafted repository controls. Without checks it could get any directory
+bound read-write: `~/.ssh`, `$HOME`, `/etc`, another repository's
+`.git`. `_wrapper_git_common_dir_ok` therefore still requires, on
+realpath-resolved paths:
 
-Linux used to differ in one case: bwrap applies binds in order, and
-`AI_SANDBOX_EXTRA_RW_DIRS` entries were appended after the wrapper's RO
-over-mounts, so an entry covering the common dir hid them. Since #10 the
-backend mounts user RW extra dirs before the wrapper's own binds (user
-RO extra dirs stay after them, so the wrapper's RW binds cannot reopen
-them), so the RO layers win on both OSes (`_extra_sandbox_setup` binds
-still come last).
+1. a real directory (not a symlink), not `$HOME` itself;
+2. shaped like a git dir (regular `HEAD` and `config`, `objects/`,
+   `refs/`); below `<super>/.git/modules/` it must follow git's module
+   layout (`_wrapper_git_module_dir_ok`: `<super>/.git` a real git dir,
+   no symlinks on the chain, never inside a module's `objects/`,
+   `refs/` or `worktrees/`);
+3. forward and reverse links naming this checkout: for a worktree,
+   WORKDIR's git dir is `<common>/worktrees/<name>` and its `gitdir`
+   file (written by git in the repository, not writable from the
+   checkout) points back at `<checkout>/.git`; for a submodule
+   checkout, the checkout's `.git` gitfile names the module git dir and
+   the module's `core.worktree` names the checkout.
 
-The WORKDIR's own `.git` is covered by B-ν.
+(3) is what stops a crafted pointer. The reverse link is a file
+**inside the target** that names this checkout. The agent controls the
+checkout's own `.git` file, but not the target: unless the user's git
+wrote that file (the user made this worktree or submodule), passing (3)
+needs someone who can already write the target. So a pointer can only
+reach a directory the agent could already write, and binding that adds
+nothing. `~/.ssh`, `/etc` or an unrelated repository have no such file
+and fail (3) however they are shaped. One gap: a stale worktree entry
+(worktree deleted without `git worktree remove` or `prune`) still names
+its old path; if an agent can write that path, it can recreate the
+checkout there, and a later launch started from that path binds the
+repository's git dir. Prune stale worktrees of sensitive repositories. (1) and (2) keep the forms git
+itself would not accept (symlinked git dirs, `$HOME`, fake module
+layouts). Only the validated dir itself is bound. Nothing inside it
+picks a bind target: launched from the main checkout the wrapper binds
+nothing extra (its `.git` comes with WORKDIR), and `worktrees/*/gitdir`
+of other worktrees, `commondir`, `objects/info/alternates` or symlinks
+in `objects/` and `refs/` are never followed to a path to bind. A
+planted `<repo>/.git/commondir` fails (3) at the next launch. So what
+the agent writes in a git dir cannot make a later launch bind a host
+path it could not already write. A failed check binds nothing and prints `git won't work in
+this checkout because its git dir ... failed a pointer check: <reason>`;
+the launch continues. `AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR` does not
+relax the checks.
 
-### B-ο — worktrees of repositories outside `$HOME` (MITIGATED, 2026-10, #13)
+**No location blocklist (owner decision, 2026-11).** The earlier
+location rules are gone: system and temp trees outside `$HOME`
+(`_wrapper_git_external_location_ok`), the dotfile dir directly under
+`$HOME`, and credential or host-executed locations under it
+(`_wrapper_git_home_location_ok`, which used `_wrapper_home_location_denied`;
+that list now serves only the config-symlink guard). Given (3) they
+only refused real repositories the user had made (a worktree of
+`~/.password-store`, a repository on a disk under `/tmp` or `/opt`).
+A git dir that holds credentials or client settings is the user's own
+repository; B-ρ applies to it like to any other, AI agent profiles
+included (next paragraph).
 
-B-ι bound a worktree's shared `.git` only strictly under `$HOME`, so git
-failed in worktrees of repos elsewhere (e.g. `/Data/projects`). The only
-workaround, `AI_SANDBOX_EXTRA_RW_DIRS=<repo>/.git`, grants plain RW with
-none of B-λ's read-only layers — exactly the host-code-execution path
-B-λ closes — and the wrapper's rejection WARN recommended it.
+**Agent profile and state directories (not refused, owner-accepted
+exception, 2026-11).** A git dir that is, contains or is inside an AI
+agent profile or state directory gets no special treatment: it is bound
+read-write when it passes the link checks. The cross-client scenario
+(one agent plants a git dir in its own writable profile, a later session
+of another agent gets that profile read-write) and what still limits it
+are in [`docs/owner-accepted-exceptions.md`](owner-accepted-exceptions.md)
+→ "Git dirs inside AI agent profile/state directories are not refused".
+Do not reintroduce a refusal without owner approval.
 
-**Mitigation.** `AI_SANDBOX_ALLOW_EXTERNAL_WORKTREES` (bool, default 0,
-category *sensitive*). Off keeps HOME-only eligibility; `$HOME`
-worktrees (and the verified `~/.local/share/<repo>/.git/modules/<name>`
-layout) never need it. On, `_wrapper_git_common_dir_ok` accepts a
-common dir outside `$HOME` only if:
+**Bind order (read-only overlays stay on top).** The git dir is passed
+as `--under-bind` (`_wrapper_add_under_bind`), not `--bind`. Before, it
+was appended after the client persistent-control overlays (#48), so
+on bwrap, where the later mount wins, a git dir that contained a
+profile (e.g. a profile relocated into a repository's `.git`) or sat
+inside a control (a repository under `~/.codex/skills/`) reopened those
+controls read-write. Seatbelt reopened the second case too: a `--bind`
+nested in an `--ro-bind` dir is carved out of its write deny. Now:
 
-- `_wrapper_git_external_location_ok` accepts its realpath: not equal to
-  or below `/bin /boot /dev /etc /lib* /nix /opt /proc /root /run /sbin
-  /snap /sys /tmp /usr /var /Applications /Library /System /Users/Shared
-  /cores /private` (matched per path component, so `/etcx` is not
-  `/etc`; macOS `/tmp`, `/var`, `/etc` resolve under `/private`), not
-  containing `$HOME`, and with no dot-prefixed directory above the git
-  dir (another user's `~/.config/...`, `<repo>/.git/modules/<name>`).
-  Mount points (`/mnt`, `/media`, `/srv`, `/Volumes`) and other users'
-  `/home` / `/Users` dirs stay eligible.
-- every existing check passes unchanged: real directory, sensitive
-  classifier, `.git` / `<name>.git` basename and git shape, forward link
-  (WORKDIR's gitdir is exactly `<common>/worktrees/<name>`) and reverse
-  link (that entry's `gitdir`, not a symlink, resolves to exactly this
-  checkout's `.git`). The submodule exception stays HOME-only.
+- bwrap (`_run_sandboxed_agent_linux`): under-binds are mounted right
+  after the virtual filesystems, before `~/bin`, the skill source,
+  `~/AGENTS.md`/`~/CLAUDE.md`, the profile binds, pins and control
+  overlays, credential overlays and `AI_SANDBOX_EXTRA_RO_DIRS`. Every
+  read-only overlay and pin wins wherever it sits relative to the git
+  dir. A git dir inside a read-only overlay is then read-only too (git
+  reads work, writes do not).
+- Seatbelt (`macos_sandbox_exec.bash`): `--under-bind` renders the same
+  `(allow file* (subpath ...))` as `--bind`, but is never an exception
+  in `_append_ro_deny_rules`. The write denies and pins are rendered
+  after every allow and Seatbelt applies the last matching rule, so
+  they win when equal to, inside or containing the git dir. Seatbelt
+  has no other read-only overlays: credential paths are simply not
+  granted, as on bwrap where they are not mounted.
 
-The bind is the same as under `$HOME`: exactly the validated common dir
-RW, its `config`, `hooks/`, `worktrees/` (except this worktree's entry),
-the entry's `commondir` / `gitdir` / `config.worktree` and all submodule
-metadata read-only in both `AI_SANDBOX_ALLOW_GIT_CONFIG` modes, the #12
-scan limits (16 levels / 256 module dirs). No parent or sibling of the
-common dir is granted. On macOS the external ancestors of the common dir
-and (when it is outside `$HOME`) of WORKDIR get `file-read-metadata` on
-the literal path only — stat, no listing or reads. Accepting an
-external dir is logged (WARN).
+Coverage: `tests/test_git_dirs.bash` (bwrap argv order through a stub
+bwrap, e2e on both OSes with a read-only extra dir inside a git dir and
+a git dir inside one; a planted git dir in a client profile accepted),
+`tests/test_macos_ro_overlays.bash` (rendering and native Seatbelt
+checks).
 
-*Session-only.* The value comes from the host launch environment or
-this session's `s) Settings`. `_preset_autosave` never writes it and
-`_preset_autoload` ignores it with a WARN (also in the legacy shared
-file), so a saved, injected or historical preset — which a sandboxed
-agent may be able to write — cannot authorize access; an explicit launch
-value, including `=0`, is kept. The common-dir bind therefore moved from
-before the menu into `_apply_post_menu_binds` (common dir, then WORKDIR
-metadata, then this worktree's submodules, then credential binds) in the
-claude, codex, agy and copilot wrappers. The host shell configuration
-that may set the variable is not proven tamper-proof; separating
-persistent controls from agent-writable state is #48.
+**Removed** (dead code deleted, not disabled): read-only overlays and
+pins on WORKDIR's `.git` entries and on submodule git dirs
+(`_wrapper_protect_workdir_git` and its module scan with its depth and
+count limits), placeholder `hooks/` / `config.worktree` creation, the
+absent-entry WARN, the Linux exit quarantine and its session-cleanup
+trap wiring (the egress-proxy EXIT trap is back to its earlier form),
+the macOS `--deny-write` flag with its case-insensitive regex rendering,
+the read-only plan for a linked worktree's shared `.git`, the
+repository-root admission rule, the indirection WARNs, the
+`AI_SANDBOX_EXTRA_RW_DIRS` git WARN, and the settings
+`AI_SANDBOX_ALLOW_GIT_CONFIG`, `AI_SANDBOX_ALLOW_EXTERNAL_WORKTREES`
+(with the session-only preset mechanism that existed only for it) and
+`AI_SANDBOX_BLOCK_LINKED_GIT_DIRS`. A saved preset still naming one of
+them is read without the unknown-setting WARN (`_AI_RETIRED_SETTINGS`);
+a saved value other than `0` prints one NOTE, and the next auto-save
+drops the key. This supersedes the earlier hardening entries for
+WORKDIR git metadata (#10, #12), worktree eligibility (#13), the shared
+`.git` read-only plan and absent `commondir` / `config.worktree`
+handling.
 
-*Raw RW grants.* `AI_SANDBOX_EXTRA_RW_DIRS` stays available. Both
-backends WARN when an accepted entry is a git dir or a work tree with a
-`.git` dir, unless that git dir is WORKDIR's own `.git` or the common dir
-the wrapper bound with read-only layers (those layers still win, see
-B-λ). The WARN points to the opt-in; the grant is not refused.
+**Check-to-mount race (#14).** The checks run on paths before the
+launch. A concurrent session that can write next to the git dir (one
+started in the main checkout `<repo>`, with `<repo>/.git` under its
+WORKDIR) could swap `<repo>/.git` for a symlink to `~/.ssh` between
+another session's check and its mount; bwrap resolves a path bind when
+it mounts, so that session would get `~/.ssh` read-write. Fixed on
+bwrap 0.8 and newer: the backend opens each under-bind just before the
+launch, keeps the descriptor only when `/proc/self/fd` names exactly
+the checked path (a symlink or another path swapped in fails it: WARN,
+nothing bound, the launch continues) and passes it as `--bind-fd`;
+bwrap mounts the descriptor, verifies the mount matches it and closes
+it before the client starts. Remaining: a swap for another real
+directory at the same path before the open (the swapped-in directory
+must already be writable by the session doing it, and renames cannot
+cross bind mounts), and older bwrap without `--bind-fd`, where the path
+is bound as before with an INFO line naming the gap (the default
+nested-namespace protection already needs 0.8). macOS has no such
+race: Seatbelt checks every access against the profile's resolved
+paths, so a symlink swapped in later leads to a path the profile does
+not grant.
 
-**Residual risks.**
-
-- *Links are not ownership.* Worktree links are ordinary files. They
-  prove the checkout and the repository name each other, not that the
-  user meant to expose the repository. Anyone who can already write the
-  external repository on the host (another local user with write access
-  to a shared repo, an earlier unprotected session) can create a
-  matching entry. The opt-in is the user's decision for the session.
-- *Git ownership.* Eligibility uses `git rev-parse` without overriding
-  `safe.directory`: a repository git considers owned by someone else is
-  not discovered and not bound. No separate UID rule was added, so
-  shared repositories git accepts (via `safe.directory`) are eligible.
-  Tests only cover repos owned by the test user.
-- *Unchanged B-λ / B-ν residuals:* metadata absent at launch, config
-  indirection, content written by earlier sessions, the existing creation
-  of a missing top-level `hooks/` and `config.worktree` in the validated
-  common dir, and the check-to-mount window (#14, accepted residual,
-  see B-λ). The location guard is
-  separate from `_sandbox_sensitive_dir_kind` (B-ξ).
-
-Coverage: `tests/test_external_worktree.bash` (CI `smoke-linux` and
-`smoke-macos`): location guard, opt-in off/on, HOME regression, prefix
-and alias paths, borrowed / forged / foreign backlinks, crafted
-commondir, refused real-Git locations, preset save/load exclusion and
-injection, raw-RW WARN, a pty-driven `s) Settings` toggle, and native
-enforcement (commit, branch, objects / refs / index; shared config,
-hooks, worktrees, pointers and submodule metadata denied; sibling repo
-and canary unreadable and unchanged). The macOS `--meta-bind` flag
-shape is also checked on Linux with a simulated `_wrapper_os`; that is
-not enforcement evidence.
-
-### B-ν — WORKDIR's own git metadata (MITIGATED, 2026-10, #10)
-
-WORKDIR is RW, and with it the repository's `.git/hooks/*` and
-`.git/config` (`core.hooksPath`, `core.fsmonitor`, `core.sshCommand`,
-aliases, filter/diff drivers, credential helpers), a linked worktree's
-`.git` file (repointable), `.git/commondir` (git takes config and hooks
-from the dir it names, even in a normal repo) and other checkouts'
-`worktrees/*` pointers. All of them run commands on the host,
-unsandboxed, on the user's next git command there.
-
-**Mitigation.** `_wrapper_protect_workdir_git` (`ai_wrapper_lib.bash`),
-called from `_apply_post_menu_binds` after the preset and menu in the
-claude, codex, agy and copilot wrappers. A refusal exits the wrapper
-before the client starts. It protects only entries that exist at launch:
-
-| WORKDIR | Always | Protected mode only |
-|---|---|---|
-| normal repo (`.git` dir) | `.git` and the chain to every submodule git dir pinned; `commondir`, `worktrees/` RO (also in submodule git dirs) | `config`, `hooks/`, `config.worktree` RO, also in submodule git dirs at any depth |
-| linked worktree / submodule checkout (`.git` file) | `.git` file RO | — (shared `.git`: B-λ) |
-| bare repo, or WORKDIR is a git dir | `commondir`, `worktrees/` RO | same entries directly under WORKDIR |
-| repository subdirectory | nothing to do: the git dir is outside WORKDIR and not writable | |
-| not a repository | WARN: metadata created in the session (`git init`, clone, nested repos) needs host review | |
-
-- **Pin (root integrity).** On Linux a self-bind makes `.git` a mount
-  point, so `rename(2)`/`rmdir(2)` fail with `EBUSY`. On macOS the new
-  backend flag `--pin` renders a literal write deny on `.git` and its
-  ancestors below `$HOME` (`_append_pin_rules`); RO entries alone pin it
-  only when one exists, which is not the case in relaxed mode or when
-  every protected entry is absent. Children stay writable, so the index,
-  objects, refs, logs, `HEAD` and lock files work as before.
-- **Setting.** `AI_SANDBOX_ALLOW_GIT_CONFIG=1` (menu: Sensitive, "Allow
-  editing git config and hooks"; default 0) drops the RO layers on
-  `config`, `hooks/`, `config.worktree` and submodule config/hooks only
-  (WORKDIR's submodules and a linked worktree's own submodules). The
-  pins, pointer files, `commondir`, `worktrees/` and all validation and
-  limits stay. A value given explicitly at launch (even `=0`) wins over
-  the per-workdir preset, as for every setting (S-μ); restoring `1` from
-  a preset WARNs. It does not
-  relax the worktree common dir or its shared submodules (B-λ).
-- **Submodule git dirs (#12).** `_wrapper_git_scan_modules` walks
-  `modules/` (WORKDIR's git dir, a worktree's shared common dir and its
-  own `worktrees/<name>/modules`; one shared helper). A directory whose
-  `HEAD` or `config` is a regular file is a module git dir (a missing
-  `config` alone does not demote it); any other directory is a namespace
-  parent of a slash-containing name (`modules/libs/foo`) and is searched
-  further; git refuses to nest module git dirs inside another one's
-  namespace. Below a module git dir only its own `modules/` is searched
-  (`modules/a/modules/b`), never `objects/` or `refs/`. Every module git
-  dir gets the root's entry set (above) and every directory from
-  `modules/` down to it (namespace parents, nested `modules/`) is pinned,
-  in both modes: read-only children alone do not stop `rename(2)` of a
-  parent on Linux, and a moved parent would let the agent plant a fresh
-  tree in its place. On Linux all pins are mounted before the read-only
-  layers below them.
-  Limits: at most 16 directory levels below a `modules/` root (every
-  component counts: `modules/a/modules/b` is 3, `modules/x/y/z` is 3) and
-  at most 256 module git dirs per scan (a linked worktree's shared and
-  own trees count together). Exceeding either refuses the launch with an
-  ERROR naming the path; nothing is skipped or truncated.
-- **Validation (both modes).** A symlinked `.git`, `config`, `hooks`,
-  `config.worktree`, `commondir`, `worktrees`, `modules`, any symlink in
-  the searched submodule tree (namespace parents, module git dirs, their
-  `HEAD`, `config`, `hooks`, `commondir`, `worktrees`, `modules`), or one
-  of those with the wrong file type, refuses the launch. The common-dir
-  binder propagates such a refusal too (all wrappers exit 1). So does a WORKDIR strictly inside a git
-  dir. Failure to resolve WORKDIR or its git dir fails closed. Host-side
-  detection runs `git rev-parse` / `git config --file` only (no hooks or
-  configured commands), with inherited `GIT_DIR` / `GIT_WORK_TREE` /
-  `GIT_COMMON_DIR` dropped.
-- **No host mutation.** Nothing is created or truncated, unlike the
-  common-dir helper (B-λ), and there is no post-session step.
-
-**Usability impact (protected mode).** Commit, new local branches,
-checkout of local branches, merge/rebase, fetch and plain push keep
-working and persist. Anything that writes config fails with "could not
-lock/rename config" or EROFS: `git config`, `git remote add`, `git
-branch --set-upstream-to`, hook installers (`pre-commit install`,
-husky), `git submodule init/update`. Some commands fail half-way:
-
-- `git push -u` can update the remote and then fail to record the local
-  tracking config: the push lands, the upstream is not set
-  (`tests/test_workdir_git_protection.bash` checks both);
-- creating a branch that tracks a remote (`git checkout <remote-only
-  branch>`, `checkout -b x origin/x`, `switch`, `branch x origin/y`)
-  creates the ref, fails to write the tracking config and exits non-zero
-  (checkout leaves HEAD where it was);
-- `git branch -m` renames the ref, then fails to update config.
-
-When linked worktrees exist, `worktrees/` is read-only from the main
-checkout too, so `git worktree add/prune`, `git gc`'s worktree pruning
-and renaming a branch checked out in another worktree fail.
-
-**Residual (accepted by the owner).**
-
-- *Absent entries.* bwrap needs an existing mount point and Seatbelt
-  rules are only rendered for existing sources; creating them would
-  mutate the host. A missing `config`, `hooks/`, `commondir` (absent in
-  almost every repo, so this WARN appears on most normal-repo launches)
-  or `config.worktree` (with `extensions.worktreeConfig`), in the root or
-  in any submodule git dir, stays creatable and is listed in a WARN.
-  Created ones are not protected until the next launch. The same holds
-  for submodule git dirs created in the session (`modules/` stays
-  writable so `git submodule update --init` works).
-- *Indirection.* WARNs (detection only) for `core.hooksPath`,
-  `core.fsmonitor` and `include.path` / `includeIf.*.path` resolving into
-  WORKDIR, hook symlinks into WORKDIR, a `.git` file pointing at a git dir
-  inside WORKDIR, and submodule checkouts (their `.git` pointer files
-  below WORKDIR stay writable). Other commands in config (filter drivers,
-  `sshCommand`, aliases) that run scripts from WORKDIR, and existing hooks
-  that read WORKDIR content (pre-commit's `.pre-commit-config.yaml`,
-  husky scripts, Makefiles), are not audited.
-- *Operation state.* `.git/rebase-merge/` and `.git/rebase-apply/` must
-  stay writable. The agent can leave a rebase in progress whose todo list
-  contains `exec <cmd>`; `git rebase --continue` on the host then runs it.
-  Check `git status` and the todo before continuing a rebase you did not
-  start.
-- *Not sanitized.* RO protection freezes what is there; it does not
-  clean commands or hook symlinks already present, or metadata written by
-  an earlier unprotected session.
-- *Nested metadata.* Repos and `.git` dirs created anywhere below
-  WORKDIR (outside `modules/`) are writable. Submodule git dirs below
-  `modules/` are covered at any depth (#12).
-- *Plugins.* `_extra_sandbox_setup` binds are applied last and can
-  re-grant RW (trusted code, S-β).
+**Residual (nested launch).** In a nested launch (the wrapper started inside
+another sandbox that exposes only a submodule's module git dir), the
+superproject's `.git` is not a full git dir there, so the module layout
+check fails and git does not work in that submodule.
 
 ### B-ξ — macOS backend duplicated the sensitive-path lists (RESOLVED, 2026-10, #15)
 
@@ -1364,7 +1196,8 @@ enforcement:
 Platform lists differ by design (Linux `/home`, `/root`, `/mnt`, `/media`,
 `/srv`, `/opt`, `/proc`, …; macOS `/Users`, `/System`, `/Applications`,
 `/Library`, the `/private/...` canonical forms of `/tmp`, `/var`, `/etc`).
-The #13 external-worktree location guard stays separate and stricter.
+Git dirs bound from outside WORKDIR have no location guard (B-ρ): only
+structural and link checks.
 
 Coverage: `tests/test_sensitive_path_parity.bash` (CI `smoke-linux` and
 `smoke-macos`): classifier tables for both OS rule sets (shadowed

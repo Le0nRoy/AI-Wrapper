@@ -51,6 +51,35 @@ for help in "${linux_help}" "${darwin_help}"; do
     assert_contains "${help}" 'AI_SANDBOX_ALLOW_UNRESTRICTED_NET=1' "unrestricted-network opt-out documented on both OSes"
 done
 
+# s) Settings use cases are mirrored from the catalog: every setting shown
+# on an OS has its "Use when" line in that OS's help, OS-only ones only there.
+_catalog_names() {
+    (
+        if [[ "${1}" == "darwin" ]]; then
+            uname() { if [[ "${1:-}" == "-s" ]]; then echo Darwin; else command uname "$@"; fi; }
+        else
+            uname() { if [[ "${1:-}" == "-s" ]]; then echo Linux; else command uname "$@"; fi; }
+        fi
+        # shellcheck source=../bin/ai_wrapper_data/ai_wrapper_lib.bash
+        source "${REPO_ROOT}/bin/ai_wrapper_data/ai_wrapper_lib.bash"
+        for e in "${_AI_SETTINGS_LIST[@]}"; do printf '%s\n' "${e%%|*}"; done
+    )
+}
+for os in linux darwin; do
+    if [[ "${os}" == linux ]]; then help="${linux_help}"; other="${darwin_help}"; else help="${darwin_help}"; other="${linux_help}"; fi
+    while IFS= read -r name; do
+        assert_contains "${help}" "(\`${name}\`): " "${os} help: use cases for ${name}"
+    done < <(_catalog_names "${os}")
+done
+assert_contains "${linux_help}" '(`AI_SANDBOX_ALLOW_TIOCSTI`): ' "TIOCSTI use cases in the Linux help"
+assert_not_contains "${darwin_help}" '(`AI_SANDBOX_ALLOW_TIOCSTI`): ' "TIOCSTI use cases not in the macOS help"
+assert_contains "${darwin_help}" '(`AI_SANDBOX_ALLOW_KEYCHAIN`): ' "Keychain use cases in the macOS help"
+assert_not_contains "${linux_help}" '(`AI_SANDBOX_ALLOW_KEYCHAIN`): ' "Keychain use cases not in the Linux help"
+for help in "${linux_help}" "${darwin_help}"; do
+    assert_contains "${help}" '(`CLAUDE_ACCOUNT`, `CODEX_ACCOUNT`, `AGY_ACCOUNT`): ' "account profile use cases on both OSes"
+    assert_contains "${help}" 'type `?N`' "s) Settings help documents ?N"
+done
+
 # Marker syntax itself must never leak into either rendering.
 assert_not_contains "${linux_help}" '<!-- os:' "no leaked marker syntax in the Linux render"
 assert_not_contains "${darwin_help}" '<!-- os:' "no leaked marker syntax in the macOS render"

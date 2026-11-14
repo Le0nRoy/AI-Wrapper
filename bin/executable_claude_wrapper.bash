@@ -132,6 +132,10 @@ if [[ $# -eq 0 && -t 0 && -t 1 ]]; then
         _extra_post_menu_setup
     fi
 
+    # Claude Code UI env vars (CLAUDE_CODE_NO_FLICKER, ...) set by the
+    # caller reach the client through the scrubbed Linux sandbox env.
+    _claude_pass_ui_env
+
     case "${WRAPPER_MENU_CHOICE}" in
         orchestrate)
             run_orchestrated_session
@@ -159,4 +163,5 @@ _apply_post_menu_binds || exit 1
 if declare -f _extra_post_menu_setup >/dev/null 2>&1; then
     _extra_post_menu_setup
 fi
+_claude_pass_ui_env
 run_sandboxed_agent "${AI_AGENT_COMMAND}" -- "${WRAPPER_FLAGS[@]+"${WRAPPER_FLAGS[@]}"}" -- "${AGENT_FLAGS[@]+"${AGENT_FLAGS[@]}"}" "$@"

@@ -75,15 +75,13 @@ account profiles work on Linux only (same as the Claude wrapper).
 
 ## Also shared with the Claude wrapper
 
-- Git worktrees: when the working directory is a `git worktree`, the main
-  repository's shared `.git` is bound read-write so git works — only if it
-  passes validation (under `$HOME`, not in a dotfile dir, a real `.git` /
-  `<name>.git` dir whose worktree entry links back to this checkout).
-  Its `config`, `hooks/` and other worktrees' entries stay read-only, so
-  `git config`, `git remote add`, `push -u`, `git worktree add` and
-  submodule updates fail inside the sandbox. Otherwise a WARN is printed
-  and git won't work in the worktree; bind the `.git` via
-  `AI_SANDBOX_EXTRA_RW_DIRS` if you trust it.
+- Git: in a plain repo, a linked worktree (anywhere, bare repos included)
+  or a submodule checkout, the git dir is bound read-write, including
+  `config`, `hooks/` and `commondir`, so all git operations work. A git dir
+  outside the working directory is bound only if it is a real git dir whose
+  links point back to this checkout (wherever it lies, AI agent profiles
+  included); otherwise a WARN is printed and git won't work.
+  See `docs/owner-accepted-exceptions.md`.
 - `AI_SANDBOX_PASS_GITLAB=1` also binds the glab config read-only.
 - `AI_WRAPPER_EXTRA_PROFILE` plugins (see the Claude wrapper help,
   "Extensions via AI_WRAPPER_EXTRA_PROFILE") are loaded, including the

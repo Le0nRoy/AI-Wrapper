@@ -35,7 +35,7 @@ source "${WRAPPER_DATA_DIR}/ai_wrapper_lib.bash"
 # account (today's unsuffixed ~/.claude) — CLAUDE_ACCOUNT=private and
 # CLAUDE_ACCOUNT=<unset> are treated identically.
 _AI_SETTINGS_LIST+=(
-    "CLAUDE_ACCOUNT|str|private|info|Account profile|Which ~/.claude-<name>/ credential profile to use. 'private' = default ~/.claude. Type a profile name, or 'private' to reset. Named profiles are Linux-only; macOS refuses them at launch.|account"
+    "CLAUDE_ACCOUNT|str|private|info|Account profile|Which ~/.claude-<name>/ credential profile to use. 'private' = default ~/.claude. Type a profile name, or 'private' to reset. Named profiles are Linux-only; macOS refuses them at launch. Use when: this session should run under another login, e.g. a work account kept in ~/.claude-work.|account"
 )
 
 # No source-time `export CLAUDE_ACCOUNT=private`: _preset_autoload treats a set
@@ -171,4 +171,33 @@ _bind_claude_account() {
     _wrapper_add_bind "${claude_json_bind_src}" "${HOME}/.claude.json"
     _wrapper_protect_client_controls "claude" "${claude_dir_src}" "${HOME}/.claude" \
         "${_CLAUDE_CLIENT_CONTROLS[@]}" || exit 1
+}
+
+# ===== CLAUDE CODE UI ENV PASSTHROUGH =====
+# Claude Code reads its display settings from env vars (fullscreen
+# renderer, mouse capture, alternate screen, wheel scroll speed). The Linux
+# bwrap backend starts the client with --clearenv, so they never arrive
+# unless named on the AI_SANDBOX_PASS_ENV allowlist. UI preferences only,
+# never credentials. macOS needs nothing here: macos_sandbox_exec.bash
+# already passes every CLAUDE_* name through.
+_CLAUDE_UI_ENV_VARS=(
+    CLAUDE_CODE_NO_FLICKER
+    CLAUDE_CODE_DISABLE_MOUSE
+    CLAUDE_CODE_DISABLE_MOUSE_CLICKS
+    CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN
+    CLAUDE_CODE_SCROLL_SPEED
+)
+
+# Add each _CLAUDE_UI_ENV_VARS name that is set (non-empty) in the caller's
+# environment to AI_SANDBOX_PASS_ENV; unset names are left out. Call after
+# _preset_autoload and _preset_autosave: AI_SANDBOX_PASS_ENV is a saved
+# setting, so adding to it earlier would hide a saved list from autoload
+# and persist these names into the workdir preset.
+_claude_pass_ui_env() {
+    [[ "${_wrapper_os:-}" == "Darwin" ]] && return 0
+    local name
+    for name in "${_CLAUDE_UI_ENV_VARS[@]}"; do
+        [[ -n "${!name:-}" ]] && _sandbox_pass_env_add "${name}"
+    done
+    return 0
 }

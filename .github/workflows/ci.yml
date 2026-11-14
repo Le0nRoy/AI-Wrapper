@@ -107,12 +107,12 @@ jobs:
       - run: bash tests/test_codex_wrapper.bash
       - run: bash tests/test_bind_hardening.bash
       - run: bash tests/test_sensitive_path_parity.bash
-      - run: bash tests/test_external_worktree.bash
-      - run: bash tests/test_workdir_git_protection.bash
+      - run: bash tests/test_git_dirs.bash
       - run: bash tests/test_macos_ro_overlays.bash
       - run: bash tests/test_macos_credential_policy.bash
       - run: bash tests/test_agy_wrapper.bash
       - run: bash tests/test_copilot_wrapper.bash
+      - run: bash tests/test_claude_wrapper.bash
       - run: bash tests/test_client_persistent_controls.bash
       - run: bash tests/test_linux_host_binds.bash
       - run: bash tests/test_linux_runtime_dir.bash
@@ -124,10 +124,10 @@ jobs:
   # cross-platform smoke tests as Linux (run_sandboxed_agent dispatches on
   # `uname -s` internally), the macOS-only DRYRUN/PROFILE tests, and the
   # preset suite (BSD stat; run-preset-tests.sh exits 2 off Darwin, so
-  # this job is its only CI path). Bind-hardening, WORKDIR git metadata
-  # and RO-overlay tests certify native Seatbelt write denial on the
-  # worktree common dir and WORKDIR's own .git; they
-  # fail, not skip, when sandbox-exec is unavailable. The codex/agy/copilot
+  # this job is its only CI path). Bind-hardening and RO-overlay tests
+  # certify native Seatbelt write denial, and the git-dir suite native git
+  # writes to a worktree's or submodule's git dir; they fail, not skip,
+  # when sandbox-exec is unavailable. The codex/agy/copilot
   # wrapper suites run their argv, settings and native named-account
   # refusal (#46) checks here; their bwrap e2e blocks print skip lines
   # (see docs/testing.md).
@@ -140,8 +140,7 @@ jobs:
       - run: bash tests/test_extra_bind_dirs.bash
       - run: bash tests/test_bind_hardening.bash
       - run: bash tests/test_sensitive_path_parity.bash
-      - run: bash tests/test_external_worktree.bash
-      - run: bash tests/test_workdir_git_protection.bash
+      - run: bash tests/test_git_dirs.bash
       - run: bash tests/test_macos_ro_overlays.bash
       - run: bash tests/test_macos_credential_policy.bash
       - run: bash tests/test_client_persistent_controls.bash
@@ -149,4 +148,5 @@ jobs:
       - run: bash tests/test_codex_wrapper.bash
       - run: bash tests/test_agy_wrapper.bash
       - run: bash tests/test_copilot_wrapper.bash
+      - run: bash tests/test_claude_wrapper.bash
       - run: bash tests/run-preset-tests.sh

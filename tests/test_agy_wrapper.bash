@@ -551,13 +551,13 @@ STUB
         git_q() { git -c init.defaultBranch=main -c user.name=t -c user.email=t@t "$@" >/dev/null 2>&1; }
         git_q init "${FAKE_HOME}/repos/main"
         git_q -C "${FAKE_HOME}/repos/main" commit --allow-empty -m init
-        git_q -C "${FAKE_HOME}/repos/main" worktree add "${FAKE_HOME}/wt" -b wt
+        git_q -C "${FAKE_HOME}/repos/main" worktree add "${FAKE_HOME}/repos/main/wt" -b wt
         cat >"${FAKE_HOME}/.local/bin/agy" <<'STUB'
 #!/bin/bash
 git log --format='LOG:%s' -1 2>&1
 STUB
         _sync_agy_stub
-        out="$(cd "${FAKE_HOME}/wt" && PATH="${agy_path}" \
+        out="$(cd "${FAKE_HOME}/repos/main/wt" && PATH="${agy_path}" \
             bash "${REPO_ROOT}/bin/executable_agy_wrapper.bash" x </dev/null 2>&1)"
         assert_contains "${out}" "LOG:init" "agy wrapper: git works in a worktree inside the sandbox"
     fi
