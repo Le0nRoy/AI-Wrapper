@@ -1275,7 +1275,7 @@ followed if pre-created as a symlink).
 
 **Mitigation.** One embedded helper (`_agy_host_py`, run as `python3 -I -`)
 does the conversation operations. `settings.json` is not touched at all
-since #85 (see "Settings are session-only" below). It opens the resolved profile component by component with
+since #85 (see "Settings are never written" below). It opens the resolved profile component by component with
 `O_NOFOLLOW` and `*at` calls, refuses symlinked directories, database,
 SQLite sidecars and title files before changing anything, unlinks symlinked
 artifact leaves without traversal, opens SQLite with `mode=rw|ro` (never
@@ -1294,21 +1294,19 @@ are gone.
   refuses the operation if either fails. Tests swap each sidecar for a
   symlink at open and at write time, and swap `antigravity-cli/` for a
   directory holding same-named sidecars; the external bytes stay unchanged.
-- **Settings are session-only (#85).** The sandbox permissions
-  (`toolPermission`/`artifactReviewPolicy` `always-proceed`,
-  `allowNonWorkspaceAccess` true, `enableTerminalSandbox` false,
-  `trustedWorkspaces` = the resolved WORKDIR) are passed as
-  `agy --settings '<JSON>'`, which agy applies to that invocation only and
-  never saves. The wrapper never reads, creates, rewrites, chmods or
-  replaces `settings.json` (or a symlink target) and never creates
+- **Settings are never written (#85).** Sandbox autonomy comes from the
+  `--dangerously-skip-permissions` command-line flag only. Earlier agy
+  releases also took session-only `--settings '<JSON>'`; current agy
+  removed that flag (it exits 2 on it), so the wrapper no longer passes
+  it. The wrapper never creates, rewrites, chmods or replaces
+  `settings.json` (or a symlink target) and never creates
   `antigravity-cli/`, so unwrapped `agy` sessions keep the user's own
   policy, parallel wrappers in different workdirs cannot race, and a
-  killed wrapper leaves nothing to restore. The JSON is built in pure bash
-  (no host interpreter); the WORKDIR path is JSON-escaped, so it cannot
-  add or override keys. Tests run the real wrapper through a stub `bwrap`
-  (normal, missing, symlinked `settings.json`, four parallel workdirs, a
-  SIGKILL at launch) and check that file and its directory keep their
-  content, inode, mode and mtime.
+  killed wrapper leaves nothing to restore. Tests run the real wrapper
+  through a stub `bwrap` (normal, missing, symlinked `settings.json`, four
+  parallel workdirs, a SIGKILL at launch) and check that file and its
+  directory keep their content, inode, mode and mtime, and that no
+  `--settings` reaches the agent argv.
 - **Title writes (rename).** `.wrapper_title` is replaced by an `O_EXCL`
   temp file + `renameat` in the held directory, after re-checking the file
   (inode, size, mtime) and re-walking the parent; a changed file fails the

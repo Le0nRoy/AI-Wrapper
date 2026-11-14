@@ -3,8 +3,8 @@
 #   - agy orchestrate / resume / start argv construction
 #   - AGY_ACCOUNT validation and binding (invalid name, missing profile,
 #     default ~/.gemini symlink guards, credential-dir symlink refusal)
-#   - invocation-local `--settings '<JSON>'` permissions (host
-#     antigravity-cli/settings.json is never read, created or edited) and
+#   - command-line-only permissions (no `--settings`, which agy removed;
+#     host antigravity-cli/settings.json is never created or edited) and
 #     managed skill sync (config/skills/orchestrator-mode/SKILL.md)
 #   - per-agent per-workdir presets (<hash>-agy.env isolation from claude/codex)
 #   - agy-help.md OS-conditional rendering
@@ -68,31 +68,6 @@ assert_eq "${rc}" "0" "agy orchestrate succeeds"
 assert_eq "${out}" \
     "agy${NL}${SEP}${NL}--bind${NL}/w${NL}/w${NL}${SEP}${NL}--dangerously-skip-permissions${NL}--prompt-interactive${NL}Orchestrate \"now\"${NL}line two" \
     "agy orchestrate: --prompt-interactive <orchestrator prompt>"
-
-# ---------------------------------------------------------------------------
-echo "-- invocation-local --settings JSON (_agy_build_settings_json)"
-# Parse the JSON with python3 and print it in a canonical form.
-_json_canon() { python3 -I -c 'import json,sys;d=json.load(sys.stdin);print(json.dumps(d,sort_keys=True))'; }
-_expected_settings() {
-    python3 -I -c 'import json,sys;print(json.dumps({"toolPermission":"always-proceed","artifactReviewPolicy":"always-proceed","allowNonWorkspaceAccess":True,"enableTerminalSandbox":False,"trustedWorkspaces":[sys.argv[1]]},sort_keys=True))' "${1}"
-}
-out="$( cd "${FAKE_HOME}/work" && _load agy && _agy_build_settings_json )"
-assert_eq "$(_json_canon <<<"${out}")" "$(_expected_settings "${FAKE_HOME}/work")" \
-    "default: the five sandbox keys, trusting the resolved current directory"
-assert_not_contains "${out}" "${NL}" "... as one compact argv token"
-ln -s "${FAKE_HOME}/work" "${FAKE_HOME}/work-link"
-out="$( cd "${FAKE_HOME}/work-link" && _load agy && _agy_build_settings_json )"
-assert_eq "$(_json_canon <<<"${out}")" "$(_expected_settings "${FAKE_HOME}/work")" \
-    "a symlinked workdir is trusted by its canonical path"
-rm -f "${FAKE_HOME}/work-link"
-for special in '/p/with space' '/p/"quoted"' '/p/back\slash' "/p/single'quote" $'/p/tab\tnl\nend' $'/p/ctl\x01\x1f' '/p/utf8-é-日本'; do
-    out="$( _load agy && _agy_build_settings_json "${special}" )"
-    assert_eq "$(_json_canon <<<"${out}" 2>&1)" "$(_expected_settings "${special}")" \
-        "path $(printf '%q' "${special}") round-trips through JSON"
-done
-out="$( _load agy && _agy_build_settings_json '/p/"],"toolPermission":"request-review' )"
-assert_eq "$(_json_canon <<<"${out}" 2>&1)" "$(_expected_settings '/p/"],"toolPermission":"request-review')" \
-    "a path cannot inject or override settings keys"
 
 # ---------------------------------------------------------------------------
 echo "-- interactive resume conversation picker (_agy_list_conversations / _agent_resume_args)"
@@ -532,9 +507,9 @@ STUB
         bash "${REPO_ROOT}/bin/executable_agy_wrapper.bash" chat hello </dev/null 2>&1)"
     rc=$?
     assert_eq "${rc}" "0" "wrapper launches stub agy from ~/.local/bin inside sandbox"
-    expected_settings="$( cd "${FAKE_HOME}/work" && _load agy && _agy_build_settings_json )"
-    assert_contains "${out}" "ARGV:--dangerously-skip-permissions --settings ${expected_settings} chat hello" \
-        "non-interactive argv is AGENT_FLAGS (with session-only --settings) + user args"
+    assert_contains "${out}" "ARGV:--dangerously-skip-permissions chat hello" \
+        "non-interactive argv is AGENT_FLAGS + user args"
+    assert_not_contains "${out}" "--settings" "... with no --settings (removed from agy)"
     assert_eq "$(_snap "${alt_file}")" "${alt_before}" "host settings.json is untouched by a wrapper run"
     assert_contains "${out}" "alt-gemini-profile" "\$HOME/.gemini-alt is visible at \$HOME/.gemini inside the sandbox"
     assert_contains "${out}" "SETTINGS_OK" "antigravity-cli/settings.json is visible inside the sandbox"
