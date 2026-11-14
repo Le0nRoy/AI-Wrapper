@@ -61,7 +61,7 @@ wt_entry="${mg}/worktrees/wt"
 # Darwin-shaped (single-arg) git flags from the real wrapper helper.
 _git_flags() {
     ( cd "${FAKE_HOME}/repos/main/wt" && _load_backend && _wrapper_os=Darwin && WRAPPER_FLAGS=() \
-        && _wrapper_bind_git_common_dir && printf '%s\n' "${WRAPPER_FLAGS[@]}" )
+        && _wrapper_bind_git_common_dir && printf '%s\n' "${WRAPPER_FLAGS[@]+"${WRAPPER_FLAGS[@]}"}" )
 }
 # Nested RO/RW bind list over the worktree fixture: the common dir RO, its
 # data dirs and one worktree entry RW, the entry's link files RO again.
@@ -80,7 +80,8 @@ _render_from_flags() {
               --ro-bind) ro+=("${path}") ;;
           esac
       done
-      _append_ro_deny_rules test "${FAKE_HOME}" "${ro[@]}" -- "${rw[@]+"${rw[@]}"}" )
+      [[ ${#ro[@]} -gt 0 ]] && _append_ro_deny_rules test "${FAKE_HOME}" "${ro[@]}" -- "${rw[@]+"${rw[@]}"}"
+      true )
 }
 _render() { ( _load_backend; _append_ro_deny_rules test "${FAKE_HOME}" "$@" ) 2>&1; }
 
