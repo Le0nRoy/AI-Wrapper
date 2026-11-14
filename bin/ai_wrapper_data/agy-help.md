@@ -69,19 +69,14 @@ Because the OS sandbox (bubblewrap on Linux, Seatbelt on macOS) already
 confines filesystem writes to `WORKDIR`, `~/.gemini`, and `/tmp`, the wrapper
 grants `agy` full autonomy inside the sandbox boundary:
 
-- Passes `--dangerously-skip-permissions` on the command line.
-- Passes session-only settings with `--settings '<JSON>'`:
-  `toolPermission: "always-proceed"`, `artifactReviewPolicy: "always-proceed"`,
-  `allowNonWorkspaceAccess: true`, `enableTerminalSandbox: false` (avoiding
-  nested-sandbox conflicts inside the outer `ai-wrapper` sandbox), and the
-  resolved working directory in `trustedWorkspaces`.
+- Passes `--dangerously-skip-permissions` on the command line. Current
+  `agy` has no `--settings` flag, so the wrapper passes no session
+  settings.
 
-`agy` applies these for that run only and never saves them. The wrapper
-never reads, creates or edits `<profile>/antigravity-cli/settings.json`:
-your own settings there still apply to keys the wrapper does not pass,
+The wrapper never creates or edits `<profile>/antigravity-cli/settings.json`
+(it is read-only inside the sandbox): your own settings there still apply,
 and `agy` launched outside the wrapper keeps your normal permission
-prompts. Sessions in different working directories can run in parallel;
-each trusts only its own directory.
+prompts. Sessions in different working directories can run in parallel.
 
 The profile's persistent controls (that `settings.json`, hooks, MCP
 config, rules, workflows, plugins, skills and prompt files; see

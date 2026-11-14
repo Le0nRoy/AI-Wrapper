@@ -7,10 +7,11 @@
 #     symlinked antigravity-cli/brain/conversations ancestors, database and
 #     title file are refused; symlinked artifact leaves are unlinked only;
 #     missing databases are never created
-#   - sandbox permissions are invocation-local (`agy --settings '<JSON>'`):
-#     real wrapper runs through a stub bwrap (Linux) never read, create,
-#     rewrite or chmod <profile>/antigravity-cli/settings.json, including
-#     parallel runs from different workdirs and a run killed mid-launch
+#   - sandbox permissions are command-line only (no `--settings`, which
+#     agy removed): real wrapper runs through a stub bwrap (Linux) never
+#     create, rewrite or chmod <profile>/antigravity-cli/settings.json,
+#     including parallel runs from different workdirs and a run killed
+#     mid-launch
 #   - rename stays available: it changes the displayed title and reports
 #     lock/permission/conflict failures before touching the index
 #   - deterministic race injection (path swaps, concurrent writers) by
@@ -314,7 +315,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-echo "-- invocation-local --settings: host settings.json is never touched"
+echo "-- command-line-only permissions: host settings.json is never touched"
 # Content + metadata (inode, mode, mtime) of each PATH: any create, rewrite,
 # chmod or replace changes it (a directory's mtime changes on new entries).
 _snap() { local f; for f in "$@"; do printf '%s|%s|%s\n' "${f}" "$(_fp "${f}")" "$( [[ -e "${f}" ]] && _meta "${f}")"; done; }
@@ -328,7 +329,7 @@ else
     cat >"${STUB_DIR}/bwrap" <<'STUB'
 #!/bin/bash
 printf 'BWRAP_ARG:%s\n' "$@"
-if [[ "${AGY_TEST_KILL_WRAPPER:-0}" == "1" && " $* " == *" --settings "* ]]; then
+if [[ "${AGY_TEST_KILL_WRAPPER:-0}" == "1" && " $* " == *" --dangerously-skip-permissions "* ]]; then
     kill -KILL "${PPID}"
 fi
 exit 0
@@ -340,18 +341,16 @@ STUB
         ( cd "${wd}" && env PATH="${STUB_DIR}:${PATH}" "$@" \
             bash "${REPO_ROOT}/bin/executable_agy_wrapper.bash" chat hi </dev/null 2>&1 )
     }
-    # trustedWorkspaces of the --settings argument in wrapper output, as JSON.
-    _trusted() {
+    # Agent flags + user args in wrapper output (from AGENT_FLAGS' first
+    # flag to the end of the bwrap argv), space-joined.
+    _agent_argv() {
         python3 -I -c '
-import json, sys
+import sys
 args = [l[len("BWRAP_ARG:"):] for l in sys.stdin.read().splitlines() if l.startswith("BWRAP_ARG:")]
-i = args.index("--settings")
-d = json.loads(args[i + 1])
-assert d["toolPermission"] == "always-proceed" and d["artifactReviewPolicy"] == "always-proceed"
-assert d["allowNonWorkspaceAccess"] is True and d["enableTerminalSandbox"] is False
-print(json.dumps(d["trustedWorkspaces"]))' 2>&1
+i = args.index("--dangerously-skip-permissions")
+print(" ".join(args[i:]))' 2>&1
     }
-    _ws() { python3 -I -c 'import json,sys;print(json.dumps(sys.argv[1:]))' "$@"; }
+    AGENT_ARGV_EXPECTED="--dangerously-skip-permissions chat hi"
 
     cli="${FAKE_HOME}/.gemini/antigravity-cli"
     mkdir -p "${cli}"
@@ -360,7 +359,9 @@ print(json.dumps(d["trustedWorkspaces"]))' 2>&1
     before="$(_snap "${cli}/settings.json" "${cli}")"
     out="$(_run_wrapper "${WORK}")"; rc=$?
     assert_eq "${rc}" "0" "wrapper launches with the user's own (stricter) settings.json"
-    assert_eq "$(_trusted <<<"${out}")" "$(_ws "${WORK}")" "... passing the sandbox permissions via --settings for WORKDIR"
+    assert_eq "$(_agent_argv <<<"${out}")" "${AGENT_ARGV_EXPECTED}" \
+        "... passing the sandbox permissions on the command line"
+    assert_not_contains "${out}" "BWRAP_ARG:--settings" "... and no --settings (removed from agy)"
     assert_eq "$(_snap "${cli}/settings.json" "${cli}")" "${before}" \
         "... and settings.json and its directory are unchanged (content, inode, mode, mtime)"
     assert_contains "${out}" "BWRAP_ARG:--ro-bind"$'\n'"BWRAP_ARG:${cli}/settings.json"$'\n'"BWRAP_ARG:${cli}/settings.json" \
@@ -385,7 +386,7 @@ print(json.dumps(d["trustedWorkspaces"]))' 2>&1
     out="$(_run_wrapper "${WORK}")"; rc=$?
     assert_eq "${rc}" "1" "symlinked (dotfiles) settings.json refuses the launch by default"
     assert_contains "${out}" "is a symlink" "... with an ERROR naming the cause"
-    assert_not_contains "${out}" "BWRAP_ARG:--settings" "... before any agent argv is built"
+    assert_not_contains "${out}" "BWRAP_ARG:--dangerously-skip-permissions" "... before any agent argv is built"
     assert_eq "$(_snap "${cli}/settings.json" "${dot}/settings.json" "${dot}" "${cli}")" "${before}" \
         "... leaving the symlink, its target and both directories unchanged"
     out="$(_run_wrapper "${WORK}" AI_SANDBOX_ALLOW_SETTINGS=1)"; rc=$?
@@ -396,11 +397,11 @@ print(json.dumps(d["trustedWorkspaces"]))' 2>&1
     # Negative control: a refused launch never reaches the agent or the file.
     out="$(_run_wrapper "${WORK}" AGY_ACCOUNT='x;y')"; rc=$?
     assert_eq "${rc}" "1" "invalid AGY_ACCOUNT still refuses the launch"
-    assert_not_contains "${out}" "BWRAP_ARG:--settings" "... before any agent argv is built"
+    assert_not_contains "${out}" "BWRAP_ARG:--dangerously-skip-permissions" "... before any agent argv is built"
     assert_eq "$(_snap "${cli}/settings.json" "${dot}/settings.json" "${dot}" "${cli}")" "${before}" "... and nothing changes"
 
     # Concurrency: parallel runs from different workdirs each get their own
-    # trustedWorkspaces; none can see (or clobber) another's settings.
+    # agent argv; none can see (or clobber) another's settings.
     rm -f "${cli}/settings.json"
     printf '{"toolPermission":"request-review"}\n' >"${cli}/settings.json"
     before="$(_snap "${cli}/settings.json" "${cli}")"
@@ -414,8 +415,8 @@ print(json.dumps(d["trustedWorkspaces"]))' 2>&1
     for k in 0 1 2 3; do
         wait "${pids[${k}]}"; rc=$?
         assert_eq "${rc}" "0" "parallel run ${k}: launches"
-        assert_eq "$(_trusted <"${FAKE_HOME}/par-${k}.out")" "$(_ws "${par_dirs[${k}]}")" \
-            "parallel run ${k}: trusts only its own workdir $(printf '%q' "${par_dirs[${k}]}")"
+        assert_eq "$(_agent_argv <"${FAKE_HOME}/par-${k}.out")" "${AGENT_ARGV_EXPECTED}" \
+            "parallel run ${k}: command-line permissions only in $(printf '%q' "${par_dirs[${k}]}")"
     done
     assert_eq "$(_snap "${cli}/settings.json" "${cli}")" "${before}" "parallel runs: settings.json and its directory unchanged"
 
@@ -424,7 +425,7 @@ print(json.dumps(d["trustedWorkspaces"]))' 2>&1
     # stderr: the shell's "Killed" job notice.
     out="$(_run_wrapper "${WORK}" AGY_TEST_KILL_WRAPPER=1 2>/dev/null)"; rc=$?
     assert_eq "${rc}" "137" "crash: wrapper killed (SIGKILL) at the agent launch"
-    assert_contains "${out}" "BWRAP_ARG:--settings" "crash: ... after the --settings argv was built"
+    assert_contains "${out}" "BWRAP_ARG:--dangerously-skip-permissions" "crash: ... after the agent argv was built"
     assert_eq "$(_snap "${cli}/settings.json" "${cli}")" "${before}" "crash: ... settings.json and antigravity-cli/ unchanged"
     assert_eq "$(ls -A "${cli}")" "settings.json" "crash: ... with no leftover temp or backup files"
     out="$(_run_wrapper "${WORK}")"; rc=$?

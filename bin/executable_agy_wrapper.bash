@@ -16,9 +16,9 @@
 #   ~/.gemini-<name>/ (bound at ~/.gemini) instead of the default ~/.gemini,
 #   or pick "Account profile" from the s) Settings menu
 # - Full autonomy inside the OS sandbox: passes `--dangerously-skip-permissions`
-#   plus session-only `--settings '<JSON>'` (`always-proceed` tool and artifact
-#   policies, non-workspace access, no nested terminal sandbox, WORKDIR
-#   trusted); the host `antigravity-cli/settings.json` is never read or written
+#   (agy dropped `--settings`, so no session settings are passed and no
+#   settings file is written); the host `antigravity-cli/settings.json` is
+#   never written and stays read-only inside the sandbox
 # - Git worktree support (shared .git bound RW), glab config bind when
 #   AI_SANDBOX_PASS_GITLAB=1, AI_WRAPPER_EXTRA_PROFILE plugin hooks
 
@@ -50,11 +50,11 @@ if [[ -d "${HOME}/.local/bin" ]]; then
 fi
 
 # Antigravity CLI flags — full autonomy within the OS sandbox boundary.
-# Permissions are invocation-local (`--settings`, never saved by agy), so
-# the host settings.json stays untouched and parallel sessions cannot race.
+# Command-line only: agy no longer accepts `--settings` (it exits 2 on it),
+# and the wrapper never writes settings.json, so the host file stays
+# untouched and parallel sessions cannot race.
 AGENT_FLAGS=(
     --dangerously-skip-permissions
-    --settings "$(_agy_build_settings_json)"
 )
 
 # Evaluate the WORKDIR-breadth heuristic before showing the menu so the

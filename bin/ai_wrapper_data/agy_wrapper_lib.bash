@@ -1221,50 +1221,6 @@ _agent_resume_args() {
     done
 }
 
-# Print STRING as a JSON string literal (quotes included). Pure bash, so
-# no host interpreter runs against a possibly hostile checkout. Bytes are
-# walked in the C locale: `"`, `\` and control characters are escaped,
-# everything else (including UTF-8 sequences) passes through unchanged.
-_agy_json_string() {
-    local LC_ALL=C
-    local input="${1}" out="" ch code i
-    for (( i = 0; i < ${#input}; i++ )); do
-        ch="${input:i:1}"
-        case "${ch}" in
-            '"') out+='\"' ;;
-            '\') out+='\\' ;;
-            [[:cntrl:]])
-                printf -v code '%d' "'${ch}"
-                printf -v ch '\\u%04x' "${code}"
-                out+="${ch}"
-                ;;
-            *) out+="${ch}" ;;
-        esac
-    done
-    printf '"%s"' "${out}"
-}
-
-# Session-only agy settings, passed as `--settings '<JSON>'` (agy applies
-# them for this invocation and never saves them), so the host
-# <profile>/antigravity-cli/settings.json is never read, created or
-# rewritten, and concurrent wrappers in different workdirs cannot race:
-#   - toolPermission / artifactReviewPolicy "always-proceed": tool calls and
-#     artifact edits do not block on approval prompts
-#   - allowNonWorkspaceAccess=true: sandbox-bound paths outside WORKDIR
-#     (/tmp, ~/bin, AI_SANDBOX_EXTRA_*_DIRS, worktree common dirs) are usable
-#   - enableTerminalSandbox=false: agy is already confined by the outer
-#     bubblewrap / Seatbelt sandbox; a nested one fails or conflicts
-#   - trustedWorkspaces=[WORKDIR]: no workspace-trust prompt on launch
-# Args: [WORKDIR] (default: the resolved current directory).
-_agy_build_settings_json() {
-    local wd="${1:-}"
-    if [[ -z "${wd}" ]]; then
-        wd="$(_realpath "$(pwd -P)" 2>/dev/null)" || wd="$(pwd -P)"
-    fi
-    printf '{"toolPermission":"always-proceed","artifactReviewPolicy":"always-proceed","allowNonWorkspaceAccess":true,"enableTerminalSandbox":false,"trustedWorkspaces":[%s]}' \
-        "$(_agy_json_string "${wd}")"
-}
-
 # Sync managed ai-wrapper skills into <profile_dir>/config/skills/ so
 # Antigravity CLI discovers `orchestrator-mode` and companion skills in
 # every profile (default ~/.gemini and named ~/.gemini-<account>) without
