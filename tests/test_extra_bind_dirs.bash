@@ -9,20 +9,25 @@
 # which made the guard refuse to launch at all any time both a trusted
 # wrapper bind AND the extra-dirs env var were present — i.e. every real
 # launch. See tests/test_sandbox_common.bash for the FAKE_HOME rationale.
+#
+# Also checks (#65) that entries and WORKDIR are resolved before the
+# guard classifies them: symlinks and ".." into a sensitive location are
+# refused, benign symlinked entries are granted at their resolved path,
+# missing entries are skipped and dangling ones refuse the launch.
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=./lib_test_helpers.bash
 source "${REPO_ROOT}/tests/lib_test_helpers.bash"
+
+FAKE_HOME="$(_safe_mktemp_d "${HOME}/ai-wrapper-test.XXXXXX")" || exit 1
+isolate_test_env "${FAKE_HOME}"
 # shellcheck source=../bin/ai_agent_universal_wrapper.bash
 source "${REPO_ROOT}/bin/ai_agent_universal_wrapper.bash"
-
-FAKE_HOME="$(mktemp -d "${HOME}/ai-wrapper-test.XXXXXX")"
-export HOME="${FAKE_HOME}"
 mkdir -p "${FAKE_HOME}/project" "${FAKE_HOME}/.claude" "${FAKE_HOME}/extra_data" "${FAKE_HOME}/.ssh"
 echo "extra-dir-ok" >"${FAKE_HOME}/extra_data/marker.txt"
 
-cleanup() { rm -rf "${FAKE_HOME}"; }
+cleanup() { _safe_rm_rf "${FAKE_HOME}"; }
 trap cleanup EXIT
 
 echo "== AI_SANDBOX_EXTRA_{RW,RO}_DIRS smoke tests ($(uname -s)) =="
@@ -65,5 +70,49 @@ out="$(cd "${FAKE_HOME}/project" && AI_SANDBOX_EXTRA_RW_DIRS="${FAKE_HOME}/.ssh"
     AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 run_sandboxed_agent /bin/echo -- -- hi 2>&1)"
 rc=$?
 assert_eq "${rc}" "0" "AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 overrides the extra-dirs refusal too"
+
+# --- #65: entries are resolved before classification ---
+ln -s "${FAKE_HOME}/.ssh" "${FAKE_HOME}/ssh-link"
+ln -s "${FAKE_HOME}/extra_data" "${FAKE_HOME}/data-link"
+ln -s "${FAKE_HOME}/gone" "${FAKE_HOME}/dangling-link"
+for entry in "${FAKE_HOME}/ssh-link" "${FAKE_HOME}/project/../.ssh" "${FAKE_HOME}/project/.."; do
+    out="$(cd "${FAKE_HOME}/project" && AI_SANDBOX_EXTRA_RW_DIRS="${entry}" \
+        run_sandboxed_agent /bin/echo -- -- hi 2>&1)"
+    rc=$?
+    assert_eq "${rc}" "1" "AI_SANDBOX_EXTRA_RW_DIRS=${entry#"${FAKE_HOME}"/} is refused after resolution"
+    assert_contains "${out}" "Refusing extra bind" "... by the extra-bind guard (${entry#"${FAKE_HOME}"/})"
+done
+
+out="$(cd "${FAKE_HOME}/project" && AI_SANDBOX_EXTRA_RO_DIRS="${FAKE_HOME}/data-link" \
+    run_sandboxed_agent /bin/cat -- -- "${FAKE_HOME}/extra_data/marker.txt" 2>&1)"
+rc=$?
+assert_eq "${rc}" "0" "benign symlinked extra dir launches"
+assert_contains "${out}" "extra-dir-ok" "... and its resolved target is readable"
+
+out="$(cd "${FAKE_HOME}/project" && AI_SANDBOX_EXTRA_RW_DIRS="${FAKE_HOME}/not-here,${FAKE_HOME}/extra_data" \
+    run_sandboxed_agent /bin/echo -- -- missing-skipped 2>&1)"
+rc=$?
+assert_eq "${rc}" "0" "missing extra dir is skipped"
+assert_contains "${out}" "missing-skipped" "... and the command still runs"
+
+out="$(cd "${FAKE_HOME}/project" && AI_SANDBOX_EXTRA_RW_DIRS="${FAKE_HOME}/dangling-link" \
+    AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1 run_sandboxed_agent /bin/echo -- -- DANGLING_RAN 2>&1)"
+rc=$?
+assert_eq "${rc}" "1" "dangling extra-dir symlink fails closed, even with the sensitivity override"
+assert_not_contains "${out}" "DANGLING_RAN" "... before the command runs"
+
+# --- #65: WORKDIR reached through a symlink ---
+out="$(cd "${FAKE_HOME}/ssh-link" && run_sandboxed_agent /bin/echo -- -- hi 2>&1)"
+rc=$?
+assert_eq "${rc}" "1" "WORKDIR via a symlink into ~/.ssh is refused"
+assert_contains "${out}" "Refusing to sandbox with WORKDIR" "... by the sensitive-WORKDIR guard"
+
+ln -s "${FAKE_HOME}/project" "${FAKE_HOME}/project-link"
+out="$(cd "${FAKE_HOME}/project-link" && run_sandboxed_agent /bin/sh -- -- -c 'pwd' 2>&1)"
+rc=$?
+assert_eq "${rc}" "0" "WORKDIR via a symlink to a project dir launches"
+if [[ "$(uname -s)" == "Linux" ]]; then
+    assert_contains "${out}" "${FAKE_HOME}/project-link" "... in the logical cwd (Linux)"
+fi
 
 tests_summary_and_exit

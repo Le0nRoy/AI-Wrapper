@@ -62,8 +62,9 @@ smoke_tty_substitution() {
 
     # Functional check: source the rewritten lib with the minimum shims and
     # exercise _preset_autosave (with a bad dir) so it emits a WARN to
-    # the captured tty output. We make the config dir unwritable to force
-    # the mkdir failure path.
+    # the captured tty output. A regular file used as an ancestor of the
+    # config dir forces the mkdir failure path for any effective UID
+    # (chmod-based failure injection is bypassed by root).
     (
         set +u
         export AI_WRAPPER_AGENT_NAME="smoke"
@@ -75,18 +76,19 @@ smoke_tty_substitution() {
         exec 9<"${tmp}/tty.in"
         # shellcheck disable=SC1090
         . "${lib_copy}"
-        # Point XDG_CONFIG_HOME at an unwritable path to trigger the WARN.
         export HOME="${tmp}"
         mkdir -p "${tmp}/work"
-        cd "${tmp}/work"
-        export XDG_CONFIG_HOME="${tmp}/nodir/noparent"
+        cd "${tmp}/work" || exit 1
+        # XDG_CONFIG_HOME below a regular file: mkdir -p cannot succeed.
+        : > "${tmp}/not-a-dir"
+        export XDG_CONFIG_HOME="${tmp}/not-a-dir/config"
         # _preset_autosave_path just computes, _preset_autosave tries to mkdir.
         _preset_autosave 2>/dev/null || true
     )
 
-    if ! grep -q 'WARN\|workdir\|ai-wrapper' "${out_file}" 2>/dev/null; then
+    if ! grep -q 'WARN: _preset_autosave: could not create' "${out_file}" 2>/dev/null; then
         echo "FATAL: smoke test could not capture /dev/tty output." >&2
-        echo "       Expected WARN or workdir in ${out_file}; got:" >&2
+        echo "       Expected the _preset_autosave mkdir WARN in ${out_file}; got:" >&2
         sed 's/^/    /' "${out_file}" >&2 2>/dev/null || true
         rm -rf "${tmp}"
         return 1

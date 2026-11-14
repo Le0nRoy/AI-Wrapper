@@ -39,6 +39,9 @@ if [[ $# -eq 0 && -t 0 && -t 1 ]]; then
     _preset_autoload
     show_main_menu
     _preset_autosave
+    # WORKDIR git metadata protection (ai_wrapper_lib.bash), after the
+    # menu so the AI_SANDBOX_ALLOW_GIT_CONFIG toggle applies.
+    _wrapper_protect_workdir_git || exit 1
 
     case "${WRAPPER_MENU_CHOICE}" in
         orchestrate)
@@ -60,4 +63,5 @@ fi
 # workdir, instead of silently reverting to catalog defaults.
 # AI rules (AGENTS.md and CLAUDE.md) are bound by default in universal wrapper
 _preset_autoload
+_wrapper_protect_workdir_git || exit 1
 run_sandboxed_agent "${AI_AGENT_COMMAND}" -- "${WRAPPER_FLAGS[@]}" -- "${AGENT_FLAGS[@]}" "$@"

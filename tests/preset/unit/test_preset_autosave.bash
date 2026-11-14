@@ -16,7 +16,8 @@ clear_catalog_env
 source_lib
 export XDG_CONFIG_HOME="${TEST_SCRATCH}/config"
 workdir="$(pwd -P)"
-hash="$(printf '%s' "${workdir}" | shasum -a 256 | cut -c1-12)"
+# Independent oracle, not the production hash pipeline.
+hash="$(python3 -I -c 'import hashlib,sys;print(hashlib.sha256(sys.argv[1].encode()).hexdigest()[:12])' "${workdir}")"
 expected="${TEST_SCRATCH}/config/ai-wrapper/last-preset/${hash}-${TEST_AGENT_ID}.env"
 actual="$(_preset_autosave_path)"
 if assert_eq "UNIT-AUTOSAVE-01" "${expected}" "${actual}"; then
@@ -32,7 +33,8 @@ unset XDG_CONFIG_HOME
 clear_catalog_env
 source_lib
 workdir="$(pwd -P)"
-hash="$(printf '%s' "${workdir}" | shasum -a 256 | cut -c1-12)"
+# Independent oracle, not the production hash pipeline.
+hash="$(python3 -I -c 'import hashlib,sys;print(hashlib.sha256(sys.argv[1].encode()).hexdigest()[:12])' "${workdir}")"
 expected="${HOME}/.config/ai-wrapper/last-preset/${hash}-${TEST_AGENT_ID}.env"
 actual="$(_preset_autosave_path)"
 if assert_eq "UNIT-AUTOSAVE-02" "${expected}" "${actual}"; then

@@ -20,6 +20,8 @@ The sandbox bounds *writes* — it does not bound *reads* or *network*. Be aware
 - **Read + network = exfiltration.** The agent can read any user-readable file
   (`~/.ssh`, `~/.aws`, browser data, etc.) and POST it out. Use only with
   trusted agent versions.
+  The egress proxy (below) keeps the agent off this machine's services,
+  your LAN and cloud metadata endpoints; public hosts stay reachable.
 - **Write + exec inside WORKDIR.** The agent can drop a binary anywhere under
   the working directory and execute it; the child inherits the sandbox, so this
   is not an escape, but "sandboxed" is not the same as "cannot run code".
@@ -29,20 +31,41 @@ The sandbox bounds *writes* — it does not bound *reads* or *network*. Be aware
   It also refuses anything under `~/Library`.
 <!-- os:end -->
   cd somewhere narrow before starting if you care about the blast radius.
+- **Git metadata is writable.** The repository's git dir (`config`, `hooks/`,
+  `commondir`; for a worktree the shared `.git`, for a submodule its git dir)
+  is read-write in the sandbox, so the agent can plant hooks or config such
+  as `core.fsmonitor` that run on the host the next time you run git there
+  (a shell prompt's `git status` is enough). Details: the git entries
+  under Environment variables.
 - **`--dangerously-skip-permissions` is on by design** because the sandbox is
   the fence. If you loosen the sandbox profile, reconsider that flag.
 
 ## Environment variables
 
 - `AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR=1` — override the refusal to launch
-  from HOME dotfile dirs. Use only when you're deliberately editing one of
-  those locations and accept the wider write fence.
+  from `$HOME` or a HOME dotfile dir, and to accept such dirs or top-level
+  system dirs in `AI_SANDBOX_EXTRA_RW_DIRS` / `AI_SANDBOX_EXTRA_RO_DIRS`.
+  Use only when you're deliberately editing one of those locations and
+  accept the wider write fence. The cwd and each extra-dir entry are
+  judged after resolving symlinks and `..`, so a symlink into one of these
+  locations is refused the same way; extra dirs are granted at their
+  resolved path. A missing extra-dir entry is skipped with a warning; one
+  that exists but does not resolve to a directory (dangling symlink,
+  loop, file) refuses the launch, and this override does not change that.
+<!-- os:linux -->
+  Also overrides the refusal to launch from a top-level system directory
+  (`/`, `/etc`, `/tmp`, `/home`, ...).
+
 <!-- os:darwin -->
-  Also covers `~/Library`.
+  Also covers `~/Library`. Launching from a top-level system directory
+  (`/`, `/etc` = `/private/etc`, `/tmp`, `/Users`, `/Library`, ...) stays
+  refused on macOS; the setting does not override it.
 
 - `AI_SANDBOX_ALLOW_RO_HOMEDIR=1` — widen the read allowlist to `$HOME`
   except the credential exclusions in the SBPL profile (the 9 credential
-  dotfiles, `~/Library/Keychains`, `~/Library/{Messages, Mail, Cookies}`,
+  dotfiles, `~/.git-credentials`, `~/.config/git/credentials`, the glab
+  config dirs (readable only with `AI_SANDBOX_PASS_GITLAB=1`),
+  `~/Library/Keychains`, `~/Library/{Messages, Mail, Cookies}`,
   Chrome/Chromium/Brave/Arc/Edge/Firefox/Vivaldi profiles,
   `~/Library/Containers/com.apple.Safari`, Slack/Discord state,
   1Password/Bitwarden/KeePassXC sync caches). **The flag still exposes
@@ -57,28 +80,282 @@ The sandbox bounds *writes* — it does not bound *reads* or *network*. Be aware
   per-service cred dirs (~/.ssh, ~/.aws, ~/.kube, ~/.docker) are
   enabled by their matching `AI_SANDBOX_PASS_*` flag instead. Red banner.
 <!-- os:darwin -->
+- git credential-store files (`~/.git-credentials`,
+  `~/.config/git/credentials`) are always unreadable, whatever
+  `AI_SANDBOX_ALLOW_RO_HOMEDIR` / `AI_SANDBOX_ALLOW_RO_CREDENTIALS` say;
+  the rest of `~/.config/git` stays readable. Only an explicit grant of
+  the file or a parent (WORKDIR, extra dirs, `--bind`) exposes them.
+- `AI_SANDBOX_ALLOW_KEYCHAIN=1` — grant RW on `~/Library/Keychains` and
+  lookups of the `com.apple.SecurityServer` / `com.apple.securityd`
+  keychain daemons and of secd (`com.apple.securityd.xpc`, the Data
+  Protection keychain some CLIs such as incident.io's use).
+  **Off by default:** the agent cannot read keychain
+  files or ask securityd for items. Claude Code keeps its macOS login in
+  the Keychain, so with the default either pass `CLAUDE_CODE_OAUTH_TOKEN`
+  (from `claude setup-token`) or set this to `1`. When on, the agent can
+  read, add or change any keychain item whose access list lets the
+  calling program in without a prompt. Red banner. macOS only.
+<!-- os:end -->
+- `AI_SANDBOX_ALLOW_SETTINGS=1` — leave the client profile's persistent
+  controls (settings, skills, plugins, hooks, prompts) writable. By
+  default (0) the ones present at launch are read-only and the profile
+  directory and the directories leading to them are pinned (cannot be
+  renamed away and replaced), so the agent cannot change how later
+  sessions, also unsandboxed ones, behave. Session, history and login
+  state stay writable. Controls absent at launch stay creatable; nothing
+  is created on the host. A control that is a symlink (or behind one
+  inside the profile) refuses the launch. Controls inside WORKDIR stay
+  editable, so maintaining them from their own repository works. A value
+  set at launch wins over the saved per-workdir preset. Red banner.
+  Protected per client: Claude `~/.claude` settings(.local).json,
+  CLAUDE.md, AGENTS.md, RTK.md, agents, commands, hooks, output-styles,
+  plugins, skills; Codex `~/.codex` config.toml, config.json, hooks.json,
+  AGENTS(.override).md, agents, hooks, plugins, prompts, rules, skills;
+  Copilot `~/.copilot` config.json, settings.json, mcp-config.json,
+  copilot-instructions.md, AGENTS.md, agents, hooks, installed-plugins,
+  plugins, skills (and `~/.config/github-copilot/config.json`); AGY
+  `~/.gemini` antigravity-cli/settings.json and hooks.json, the config/
+  settings, MCP, hooks, rules, prompts, workflows, sidecars, agents,
+  plugins and skills, GEMINI.md, AGENTS.md, settings.json, commands,
+  extensions. A client command that saves one of these (e.g. Copilot
+  `/login` into config.json, Claude `/model`) fails in the sandbox.
+- Git works without any setting in plain repositories, linked worktrees
+  (inside or outside their repository's root, on any disk, worktrees of
+  bare repositories included) and submodule checkouts (nested and
+  slash-named submodules included). The agent has full read-write access
+  to the git dir: a plain repository's `.git` through WORKDIR; for a
+  worktree the repository's shared `.git`, for a submodule checkout
+  exactly its `<superproject>/.git/modules/<name>` (not the
+  superproject's `.git` or sibling submodules), bound read-write as a
+  whole. `config`, `hooks/`, `commondir`, `config.worktree`, `info/`,
+  `worktrees/` and `modules/` are all writable, so `git config`,
+  `remote add`, `push -u`, hook installers, `git worktree add/prune`,
+  `git gc` and submodule updates work. **The agent can therefore plant
+  hooks or config (`core.fsmonitor`, `core.hooksPath`, aliases, filter
+  drivers) that run on the host the next time you run git there,
+  including a shell prompt's `git status`.** Review `.git/config` and
+  `.git/hooks/` after sessions in untrusted repositories.
+- The `.git` file of a worktree or submodule checkout is part of the
+  checkout, so a crafted repository could point it anywhere. Before
+  binding a git dir outside WORKDIR the wrapper checks, on resolved
+  paths, that it is a real directory (not a symlink) shaped like a git
+  dir (`HEAD`, `config`, `objects/`, `refs/`), that its links name this
+  checkout (worktree: `<common>/worktrees/<name>/gitdir` points back at
+  the checkout; submodule: the checkout's `.git` file names the git dir
+  and its `core.worktree` names the checkout), and that it is not
+  `$HOME`. The link back to the checkout is a file inside the git dir,
+  so a crafted pointer can only reach a directory a session could
+  already write. A failed check binds nothing and prints one WARN
+  ("git won't work in this checkout because ..."); the launch continues.
+- There is no location refusal, AI agent profile and state directories
+  (`~/.claude`, `~/.codex`, `~/.copilot`, named account profiles, ...)
+  included: a git dir there that passes the checks is bound read-write.
+  Each client can write its own profile, so a git dir planted there can
+  hand that client's tokens to a later session of another client
+  launched from a matching checkout. Owner-accepted; see
+  `docs/owner-accepted-exceptions.md`.
+- Read-only overlays stay on top of the git dir: client settings,
+  skills and hooks (and `~/bin`, credential overlays, read-only extra
+  dirs) keep their protection when the git dir contains them or sits
+  inside one; a git dir inside a protected dir is then read-only too.
+- No setting turns git off or makes the git dir read-only:
+  `AI_SANDBOX_ALLOW_GIT_CONFIG`, `AI_SANDBOX_ALLOW_EXTERNAL_WORKTREES`
+  and `AI_SANDBOX_BLOCK_LINKED_GIT_DIRS` are retired (see "Retired
+  settings" under the per-workdir preset below).
+<!-- os:linux -->
+- `AI_SANDBOX_ALLOW_BIN_RW=1` — bind `~/bin` read-write. Off by default:
+  `~/bin` is read-only, so its programs still run (it is first on the
+  sandbox PATH) but cannot be added, replaced or deleted. On, the agent
+  can plant programs you later run outside the sandbox. Red banner.
+- `AI_SANDBOX_ALLOW_AGENTS_SKILLS_RW=1` — bind the shared skill source
+  `~/ai-wrapper/.agents` read-write. Off by default (read-only):
+  `setup_skills.bash` copies it into every client's skill directory, so a
+  writable copy lets the agent rewrite skills other sessions load. Red
+  banner.
+- `AI_SANDBOX_ALLOW_ANDROID=1` — bind `~/Android` (SDK, emulator images,
+  debug keystores) read-write. Off by default: not visible in the sandbox.
+- `AI_SANDBOX_PASS_TAILSCALE=1` — bind `/run/tailscale/tailscaled.sock`
+  read-only. Off by default: no socket in the sandbox. The read-only bind
+  only stops the socket file being replaced or removed; it does **not**
+  make the Tailscale API read-only. `tailscaled` authorises each LocalAPI
+  request by the caller's user ID, and the sandbox runs as your user, so
+  the agent can do whatever `tailscaled` allows your user (with
+  `tailscale set --operator=$USER`, that includes changing settings).
+  Red banner.
+- User runtime dir: the host `$XDG_RUNTIME_DIR` (`/run/user/UID`) is
+  **not** shared. The sandbox gets its own empty runtime dir (mode
+  `0700`), exported as `XDG_RUNTIME_DIR` — the host path when it lies
+  under `/run` or `/tmp` and nothing else is mounted there, otherwise
+  `/run/user/UID`; also when the host value is unset or invalid. Files
+  and sockets created there vanish with the sandbox. Only named sockets
+  are shared: the SSH agent socket at its own path
+  (`AI_SANDBOX_PASS_SSH_AGENT=1`) and the rootless Docker
+  (`$XDG_RUNTIME_DIR/docker.sock`) and Podman
+  (`$XDG_RUNTIME_DIR/podman/podman.sock`) sockets
+  (`AI_SANDBOX_ALLOW_DOCKER=1`; a `DOCKER_HOST` passed by
+  `AI_SANDBOX_PASS_DOCKER=1` that names the rootless socket is pointed at
+  where it is mounted). The D-Bus session bus, `systemd --user`,
+  keyring, display and audio servers are not reachable.
+- `AI_SANDBOX_ALLOW_XDG_RUNTIME_RW=1` — bind the host `$XDG_RUNTIME_DIR`
+  read-write (the behaviour before this setting existed). It must exist,
+  be yours, and not be a system directory, `$HOME`, a dotfile directory,
+  a parent of `$HOME`, or writable by others; otherwise the launch stops
+  with the reason. Every socket in it becomes reachable with your user ID,
+  whatever the SSH-agent and Docker settings say. What the agent can then
+  do depends on each service (through the session bus or
+  `systemd --user` this may include starting programs outside the
+  sandbox). Red banner and a launch `WARNING`.
+
+- Nested user namespaces: the sandbox runs with `--unshare-user
+  --disable-userns --assert-userns-disabled`, so the agent cannot create
+  user namespaces of its own. Ordinary tools, git and Docker/Podman
+  clients using a shared host socket are unaffected; nested bubblewrap
+  or Flatpak, Chromium/Playwright without `--no-sandbox` and container
+  engines run inside the sandbox fail. If bubblewrap cannot enforce this
+  (no `--disable-userns` support), the launch stops with the reason.
+  Needs the opt-in: `npx playwright test` or headless Chrome with its own
+  sandbox, rootless `podman run` / `buildah bud` inside the sandbox,
+  `bwrap ...`, `flatpak run`, `unshare -Ur`. Works without it: `docker` /
+  `podman` through the host's socket, Chromium with `--no-sandbox`.
+- `AI_SANDBOX_ALLOW_NESTED_USERNS=1` — launch without that restriction.
+  Each nested namespace gives the agent namespace-root capabilities and
+  more kernel attack surface. Red banner and a launch `WARNING`.
+- Terminal injection: a seccomp filter makes `ioctl(TIOCSTI)` and
+  `ioctl(TIOCLINUX)` fail with `EPERM`, so the agent cannot type
+  commands into your terminal that run after the session. Nothing else
+  changes: `/dev/tty`, raw input, window resize and Ctrl+C work as
+  usual. The filter is built on the host with `python3 -I` and the
+  libseccomp runtime library (`libseccomp2`); if either is missing or
+  the filter fails its self-test, the launch stops with the reason.
+- `AI_SANDBOX_ALLOW_TIOCSTI=1` — launch without the terminal filter. On
+  kernels that still allow `TIOCSTI` the agent can then inject input.
+  Yellow banner and a launch `WARNING`.
+- Preflight: reads `/proc/sys/kernel/unprivileged_userns_clone` and
+  `/proc/sys/user/max_user_namespaces` directly (no `sysctl` binary). A
+  knob your kernel does not have is fine; one set to `0` stops the
+  launch. Before the client starts, a minimal bubblewrap sandbox with the
+  same isolation options runs `true`; if it fails, the launch stops and
+  says whether user namespaces are denied (kernel, AppArmor, container),
+  bubblewrap lacks an option, the filter could not load, or it is a
+  setup problem.
+- Network: the sandbox has its own network namespace (`--unshare-net`):
+  services on this machine (`127.0.0.1`, `::1`), abstract UNIX sockets
+  such as X11 or D-Bus, and your LAN are not reachable, and nothing can
+  connect out directly. HTTP and HTTPS go through an egress proxy the
+  wrapper starts on the host for the session: `http_proxy`,
+  `https_proxy`, `HTTP_PROXY`, `HTTPS_PROXY`, `all_proxy` and `ALL_PROXY`
+  are `http://127.0.0.1:3128` (the sandbox's own loopback, relayed to the
+  proxy's private UNIX socket), and `no_proxy` / `NO_PROXY` keep
+  `localhost` direct, so dev servers inside the sandbox still work. The
+  proxy refuses (403) any destination that resolves to loopback, private
+  LAN (RFC 1918, `100.64.0.0/10` incl. Tailscale, IPv6 ULA), link-local /
+  cloud metadata (`169.254.169.254`), multicast or reserved addresses
+  (private LAN only for names allowed by `AI_SANDBOX_PRIVATE_HOSTS`, see
+  below); at exit the wrapper reports how many requests it refused
+  (`AI_SANDBOX_DEBUG=1` lists them). Clients that ignore the proxy
+  variables, SSH (`git@github.com:` remotes; use `https://`), raw TCP/UDP
+  and LAN or cluster endpoints (`kubectl` to a LAN cluster) do not work.
+  Unix-socket grants (Docker, SSH agent, Tailscale) are unaffected.
+  `AI_SANDBOX_PASS_TAILSCALE=1` also lets the proxy reach `*.ts.net`
+  (MagicDNS) names on Tailscale addresses. The
+  wrapper needs a `python3` in `/usr/bin`, `/bin` or `/usr/local/bin`
+  for the in-sandbox relay; if the proxy cannot start the launch stops
+  with the reason.
+- `AI_SANDBOX_ALLOW_UNRESTRICTED_NET=1` — share the host network
+  (`--share-net`, the behaviour before this setting existed) and start no
+  proxy. The agent can then reach everything on this machine and your
+  network, including cloud metadata endpoints. Red banner and a launch
+  `WARNING`. Also available on macOS (Seatbelt).
+
+These controls are Linux-only (except
+`AI_SANDBOX_ALLOW_UNRESTRICTED_NET`) and ordinary settings: saved to and
+restored from the per-workdir preset like the other toggles. A path
+missing on the host is skipped, never created. An explicit wider grant
+still applies: launching from (or `AI_SANDBOX_EXTRA_RW_DIRS` on) a
+directory at or above `~/bin` or `~/ai-wrapper/.agents` makes that tree
+writable whatever these toggles say; likewise a WORKDIR or
+`AI_SANDBOX_EXTRA_RW_DIRS` entry that contains the host runtime dir
+exposes it and its sockets whatever the runtime settings say. Kind
+support was removed: `~/.kind` and `~/kind_dot_kube` are never mounted
+and `KIND_EXPERIMENTAL_PROVIDER` is not passed; Kubernetes access is `AI_SANDBOX_PASS_KUBE` (`~/.kube`,
+`KUBECONFIG`).
+<!-- os:end -->
+<!-- os:darwin -->
 - `AI_SANDBOX_PROFILE=<path>` — point at an alternative SBPL profile (absolute
   path, or relative to the universal wrapper's directory). Replaces the base
   profile entirely; per-call `--bind` rules are still appended. The wrapper
-  refuses to load a profile that lacks `(version 1)` and `(deny default)` in
-  its first 80 non-comment lines (post-WS3 sanity check; closes U-C). Set
+  refuses to load a profile that lacks `(version 1)` or `(deny default)`, or
+  has an `allow` rule naming `default` (e.g. `(allow default)`), anywhere
+  outside comments and strings; forms split across lines still match.
+  Block comments (`#|`), datum comments (`#;`) and character literals
+  (`#\`) are refused too, since they can hide a rule from the check. Set
   `AI_SANDBOX_PROFILE_TRUST_ME=1` to bypass the check — required only for
   legitimately permissive profiles, red banner. macOS only — bwrap has no
   equivalent profile-file mechanism.
 - `AI_SANDBOX_DRYRUN=1` — print the resolved sandbox-exec argv, the post-scrub
   child environment, and the rendered SBPL profile, then exit. Nothing
   launches. macOS only — not yet implemented on the bwrap backend.
-- `AI_SANDBOX_BLOCK_LOCALHOST=1` — emit SBPL `(deny network-outbound (remote
+- Network: Seatbelt denies IP networking. The only IP connection the
+  sandbox can make is outbound TCP to the egress proxy the wrapper starts
+  on the host for the session (`127.0.0.1`, a free port picked at
+  launch): `http_proxy`, `https_proxy`, `HTTP_PROXY`, `HTTPS_PROXY`,
+  `all_proxy` and `ALL_PROXY` are `http://127.0.0.1:<port>`, set after
+  `AI_SANDBOX_PASS_ENV` so a passthrough cannot replace them. Direct
+  connections (public hosts, your LAN, `169.254.169.254`, other
+  `localhost` ports such as dev databases) and listening on IP ports fail
+  with `Operation not permitted`. The proxy refuses (403) any destination
+  that resolves to loopback, private LAN (RFC 1918, `100.64.0.0/10` incl.
+  Tailscale, IPv6 ULA), link-local / cloud metadata, multicast or
+  reserved addresses (private LAN only for names allowed by
+  `AI_SANDBOX_PRIVATE_HOSTS`, see below); at exit the wrapper reports how many requests it
+  refused (`AI_SANDBOX_DEBUG=1` lists them). Clients that ignore the proxy
+  variables, SSH (`git@github.com:` remotes; use `https://`), raw TCP/UDP,
+  LAN or cluster endpoints and dev servers inside the sandbox do not
+  work. UNIX-domain sockets are unaffected (name resolution through
+  mDNSResponder, the SSH agent and Docker sockets still follow their own
+  settings). The proxy needs a `python3` on `PATH`; if it cannot start
+  the launch stops with the reason.
+- `AI_SANDBOX_ALLOW_UNRESTRICTED_NET=1` — open networking
+  (`(allow network*)`, the behaviour before this setting existed) and no
+  proxy. The agent can then reach everything on this machine and your
+  network, including cloud metadata endpoints. Red banner and a launch
+  `WARNING`. Saved in presets like other settings.
+- `AI_SANDBOX_BLOCK_LOCALHOST=1` — with
+  `AI_SANDBOX_ALLOW_UNRESTRICTED_NET=1`, emit SBPL `(deny network-outbound (remote
   ip "localhost:*"))` and the symmetric inbound rule. Blocks IPv4 + IPv6
-  loopback (sandbox-exec resolves "localhost" to both). Off by default so
-  dev workflows on `127.0.0.1` keep working; set this when you want the
-  agent unable to reach dev DBs / kubectl proxy on loopback. **Scope
-  caveat:** the flag is IP-only. Unix-domain sockets
+  loopback (sandbox-exec resolves "localhost" to both). The restricted
+  default already blocks loopback; set this with the unrestricted network
+  when you want the agent unable to reach dev DBs / kubectl proxy on
+  loopback. **Scope caveat:** the flag is IP-only. Unix-domain sockets
   (`/var/run/docker.sock`, `~/.colima/*.sock`) and link-local addresses
   (AWS IMDS at `169.254.169.254`) are **not** covered — fence those at
   the network or firewall layer if they matter. macOS only — no Linux
   backend.
 <!-- os:end -->
+- `AI_SANDBOX_PRIVATE_HOSTS="corp.example gitlab.corp.example"` — space-
+  or comma-separated host suffixes the egress proxy may connect to when
+  they resolve to private LAN addresses (`10/8`, `172.16/12`,
+  `192.168/16`, `100.64/10`, `fc00::/7`); a suffix also covers its
+  subdomains (`corp.example` allows `git.corp.example`, not
+  `evilcorp.example`). Loopback, link-local / cloud metadata, multicast
+  and reserved addresses stay blocked for these names, and IP addresses
+  typed into a request are never matched. Entries need two or more labels;
+  IP addresses, wildcards (`*.x`) and single labels are ignored with a
+  `WARNING`. Service settings add their own hosts: `AI_SANDBOX_PASS_GITLAB`
+  adds `GITLAB_HOST` / `GL_HOST` and the `hosts:` keys and `api_host:`
+  values of glab's `config.yml` (gitlab.com excluded);
+  `AI_SANDBOX_PASS_KUBE` adds the host names of the kubeconfig `server:`
+  URLs (a server given as an IP address cannot be allowed by name; use
+  its DNS name). `AI_SANDBOX_DEBUG=1` logs every host added. Risk: whoever
+  controls DNS for an allowed name can point it at any other internal
+  address; list only names you trust. Saved in presets like other text
+  settings.
+- `AI_SANDBOX_EXTRA_RW_DIRS` entries that are a git dir or a repository
+  work tree get a WARN: the raw grant has none of the read-only `config` /
+  `hooks/` layers, so the agent can make host git run commands. For a
+  linked worktree, launch from the worktree instead (with
+  `AI_SANDBOX_ALLOW_EXTERNAL_WORKTREES=1` when the repository is outside
+  `$HOME`). The grant itself still applies.
 - `AI_SANDBOX_ALLOW_DOCKER=1` — emit RW rules for
   `/var/run/docker.sock`, `~/.colima`, `~/.docker`. **Off by default.**
   **WARNING:** when on and the Docker / Colima daemon is running, the
@@ -87,10 +364,12 @@ The sandbox bounds *writes* — it does not bound *reads* or *network*. Be aware
   session legitimately needs `docker` from inside the sandbox.
 <!-- os:darwin -->
 - `--ro-bind SRC` adds a read-allowlist rule for SRC (single positional
-  argument post-WS1; no DST — sandbox-exec cannot remap paths). The source
-  path must exist at launch — a missing source is a hard error (exit 1),
-  not a silent skip. This matches `--bind` strictness and prevents
-  typo-induced silent failures.
+  argument post-WS1; no DST — sandbox-exec cannot remap paths) and denies
+  writes to it, even under a broader `--bind`, WORKDIR or
+  `AI_SANDBOX_EXTRA_RW_DIRS` grant. Only a `--bind` nested strictly inside
+  SRC stays writable. The source path must exist at launch — a missing
+  source is a hard error (exit 1), not a silent skip. This matches
+  `--bind` strictness and prevents typo-induced silent failures.
 <!-- os:end -->
 <!-- os:linux -->
 - `--bind SRC DST` / `--ro-bind SRC DST` (two positional arguments) adds a
@@ -98,6 +377,8 @@ The sandbox bounds *writes* — it does not bound *reads* or *network*. Be aware
   paths, unlike sandbox-exec. The source path must exist at launch — a
   missing source is a hard error (exit 1), not a silent skip.
 <!-- os:end -->
+- An `AI_SANDBOX_EXTRA_RO_DIRS` entry that contains WORKDIR or an
+  `AI_SANDBOX_EXTRA_RW_DIRS` entry does not mask them; they stay writable.
 
 ### Env scrubbing (Phase 1, 2026-05-24)
 
@@ -140,6 +421,17 @@ Red-banner opt-ins (raw credential material):
   vars (e.g. `PASS_ENV=ANTHROPIC_API_KEY` to forward an Anthropic key
   when Claude is not authenticated via `~/.claude.json`). Names must
   match `[A-Za-z_][A-Za-z0-9_]*`; whitespace ignored.
+- Claude Code UI settings — `CLAUDE_CODE_NO_FLICKER`,
+  `CLAUDE_CODE_DISABLE_MOUSE`, `CLAUDE_CODE_DISABLE_MOUSE_CLICKS`,
+  `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN`, `CLAUDE_CODE_SCROLL_SPEED` —
+  reach the Claude client whenever they are set (non-empty) in the launch
+  environment, e.g. `CLAUDE_CODE_NO_FLICKER=1 claude_wrapper.bash` for the
+  fullscreen renderer with mouse-wheel scrolling. Claude wrapper only;
+  other agents never receive them. Unset names are not passed.
+<!-- os:linux -->
+  The Claude wrapper adds the set ones to `AI_SANDBOX_PASS_ENV` for this
+  launch only (not saved in the workdir preset).
+<!-- os:end -->
 
 Additional passthrough / bind rules can be registered by a downstream
 plugin's `_extra_sandbox_setup` — see "Extensions via
@@ -200,6 +492,51 @@ across menu invocations, set the variable in `~/.zshrc` (or wherever
 you invoke `claude_wrapper` from) instead. `b` / Enter returns to the
 main menu.
 
+Each entry shows what it does, what Off means and a `Use when:` line.
+The list is taller than most terminals, so type `?N` (or `?N,M`) to see
+the full help of entry N on its own screen: the variable name, type,
+default and current value, and the complete text. Enter returns to the
+list. The start menu lists only settings that differ from their default.
+
+When to turn each setting on (the `Use when:` text of the menu; the
+account row exists in the Claude, Codex and AGY wrappers):
+
+- **Show verbose internal logging** (`AI_SANDBOX_DEBUG`): a bind, preset or launch refusal behaves unexpectedly, or to list the requests the egress proxy refused.
+- **Pass extra env vars by name** (`AI_SANDBOX_PASS_ENV`): a build or tool inside the sandbox needs one variable from your shell, e.g. JAVA_HOME, GOFLAGS or a project config path; not for secrets you would not hand the agent.
+- **Extra read-write bind directories** (`AI_SANDBOX_EXTRA_RW_DIRS`): the task must write outside WORKDIR, e.g. a sibling repo changed together with this one or a shared build output dir.
+- **Extra read-only bind directories** (`AI_SANDBOX_EXTRA_RO_DIRS`): the agent must read material outside WORKDIR without changing it, e.g. another checkout, an SDK, docs or datasets.
+- **Allow launch from sensitive dirs** (`AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR`): you deliberately let the agent edit your dotfiles or $HOME itself (e.g. maintaining ~/.config) and accept that write fence.
+- **Allow editing client settings and skills** (`AI_SANDBOX_ALLOW_SETTINGS`): you edit the client's own settings, skills, plugins or hooks from a session (e.g. developing a skill in place) and review the result.
+- **Let agent read residual credential files** (`AI_SANDBOX_ALLOW_RO_CREDENTIALS`): a tool in the session needs one of them, e.g. the gcloud CLI, gpg signing or verification, npm or pip with private registries or publishing, .netrc-authenticated downloads.
+- **Share SSH agent + ~/.ssh** (`AI_SANDBOX_PASS_SSH_AGENT`): the agent must use your SSH keys, e.g. git over SSH (also needs unrestricted network), ssh or scp to your hosts, SSH commit signing.
+- **Share Kubernetes context + ~/.kube** (`AI_SANDBOX_PASS_KUBE`): the agent runs kubectl, helm or k9s against your clusters.
+- **Share AWS credentials + ~/.aws** (`AI_SANDBOX_PASS_AWS`): the agent runs the aws CLI, terraform or SDK code against your AWS account.
+- **Share GitHub token** (`AI_SANDBOX_PASS_GH`): the agent uses gh (PRs, issues, releases) or pushes to GitHub over HTTPS.
+- **Share GitLab token + glab config** (`AI_SANDBOX_PASS_GITLAB`): the agent uses glab or pushes to GitLab over HTTPS.
+- **Share OpenAI credentials** (`AI_SANDBOX_PASS_OPENAI`): code the agent runs (tests, scripts, evals) calls the OpenAI API with your key.
+- **Allow unrestricted network access** (`AI_SANDBOX_ALLOW_UNRESTRICTED_NET`): SSH git remotes (git@github.com:...), ssh, scp or rsync; tools that ignore http_proxy; reaching localhost dev servers or databases on the host; LAN or Tailscale hosts; raw TCP/UDP.
+- **Reach internal hosts by name through the proxy** (`AI_SANDBOX_PRIVATE_HOSTS`): the agent must reach internal HTTP(S) APIs, package mirrors, artifact registries or docs on private LAN addresses without opening unrestricted network access.
+- **Mount Docker / Colima socket** (`AI_SANDBOX_ALLOW_DOCKER`): the session must build or run containers (docker build, docker compose up, testcontainers) and you accept the host-root risk.
+- **Share Docker client env vars + ~/.docker** (`AI_SANDBOX_PASS_DOCKER`): the docker client needs your DOCKER_HOST, contexts or registry logins, e.g. pulling private images or docker push.
+- **Account profile** (`CLAUDE_ACCOUNT`, `CODEX_ACCOUNT`, `AGY_ACCOUNT`): this session should run under another login, e.g. a work account kept in `~/.claude-work` (`~/.codex-work`, `~/.gemini-work`).
+<!-- os:linux -->
+- **Share ~/Android (read-write)** (`AI_SANDBOX_ALLOW_ANDROID`): building or testing Android apps (gradle, adb, the emulator) from the sandbox.
+- **Allow writing ~/bin** (`AI_SANDBOX_ALLOW_BIN_RW`): the task is to add or update your own scripts in ~/bin and you review them before running them.
+- **Allow editing the shared agent-skill source** (`AI_SANDBOX_ALLOW_AGENTS_SKILLS_RW`): developing or editing the shared skills themselves from a session.
+- **Share the whole user runtime dir (read-write)** (`AI_SANDBOX_ALLOW_XDG_RUNTIME_RW`): the agent must reach a session service the named sockets do not cover, e.g. systemctl --user or other D-Bus clients, a GPG agent, the keyring, Wayland or X11 apps, PipeWire audio; prefer the SSH-agent and Docker settings when they suffice.
+- **Allow nested user namespaces** (`AI_SANDBOX_ALLOW_NESTED_USERNS`): the agent runs tools that build their own sandbox or containers inside this one. Needs it: npx playwright test, headless Chrome with its own sandbox, podman run / buildah bud inside the sandbox, bwrap, flatpak run, unshare -Ur. Not needed: docker/podman via the host socket, Chromium --no-sandbox. Each namespace gives the agent namespace-root capabilities and more kernel attack surface. Off: creating a user namespace fails; the launch is refused if bubblewrap cannot enforce that.
+- **Allow terminal input injection (TIOCSTI)** (`AI_SANDBOX_ALLOW_TIOCSTI`): that refusal blocks you: the host lacks python3 or the libseccomp runtime, an unsupported CPU architecture, a bubblewrap too old for --add-seccomp-fd, or the kernel rejects the filter. Usually harmless where sysctl dev.tty.legacy_tiocsti=0 (Linux 6.2+ then refuses TIOCSTI to unprivileged processes).
+- **Share Tailscale daemon socket** (`AI_SANDBOX_PASS_TAILSCALE`): the agent runs the tailscale CLI (status, ping, serve) through your daemon.
+<!-- os:end -->
+<!-- os:darwin -->
+- **Dry run — print plan, don't launch** (`AI_SANDBOX_DRYRUN`): checking which argv, environment and SBPL rules a settings change produces before a real launch, or attaching that plan to a bug report.
+- **Custom sandbox profile override** (`AI_SANDBOX_PROFILE`): you maintain your own SBPL restrictions, e.g. a stricter profile for untrusted repos.
+- **Skip safety check on custom profile** (`AI_SANDBOX_PROFILE_TRUST_ME`): your reviewed custom profile is deliberately permissive and fails that check.
+- **Share home directory (read-only)** (`AI_SANDBOX_ALLOW_RO_HOMEDIR`): the task reads files spread across your home (other projects, notes, tool configs) and you accept that most of $HOME is readable.
+- **Allow macOS Keychain access** (`AI_SANDBOX_ALLOW_KEYCHAIN`): a client must use its Keychain login and you cannot pass a token, or a tool needs Keychain items (e.g. git credential-osxkeychain).
+- **Block localhost network access** (`AI_SANDBOX_BLOCK_LOCALHOST`): you need unrestricted networking (e.g. SSH remotes) but the agent must not reach dev databases, kubectl proxy or other services on loopback.
+<!-- os:end -->
+
 ### Account switching
 
 Claude and Codex wrappers (the Codex wrapper uses `CODEX_ACCOUNT` and
@@ -221,8 +558,8 @@ switch between them without re-authenticating each time.
   file) via the same auto-save/auto-load mechanism as every other setting (see `c) Clear` below) — pick an
   account once per project and it's remembered on the next launch from
   that directory.
-- Non-interactive launches respect `CLAUDE_ACCOUNT=<name>` set in the
-  environment, or fall back to the workdir's saved preset.
+- `CLAUDE_ACCOUNT=<name>` set in the launch environment wins over the
+  workdir's saved preset; when unset, the saved account is used.
 
 Account switching relies on bind-mount remapping — the wrapper makes
 `~/.claude-<name>` appear as `~/.claude` inside the sandbox so the Claude
@@ -233,11 +570,12 @@ CLI sees its expected config path. On Linux (bubblewrap) this works via
 **macOS limitation:** sandbox-exec / Seatbelt has no bind-mount remapping;
 the path grant is a single-argument ACL, so a named account directory is
 accessible at its real path (`~/.claude-<name>`) but cannot be remapped to
-appear as `~/.claude`. As a result, setting `CLAUDE_ACCOUNT=work` will
-grant read/write access to `~/.claude-work` in the sandbox but Claude
-reads `~/.claude` — the session will silently use the default account
-directory instead of the named one. Account switching is fully
-functional on Linux only.
+appear as `~/.claude`. Rather than silently running on the default account,
+the wrapper refuses a named profile on macOS: `CLAUDE_ACCOUNT=work`
+(from the environment, a saved preset or the Settings menu) exits with
+an error before any directory is created or Claude starts. Use
+`CLAUDE_ACCOUNT=private` (or leave it unset) on macOS; named account
+profiles work on Linux only.
 <!-- os:end -->
 
 ### c) Clear saved settings for this workdir
@@ -254,15 +592,32 @@ per-agent operation — no naming, no confirmation, no sub-menu required.
   `bool=0` values) to
   `${XDG_CONFIG_HOME:-$HOME/.config}/ai-wrapper/last-preset/<hash>-<agent>.env`
   where `<hash>` is the first 12 hex chars of the SHA-256 of the
-  resolved working directory path and `<agent>` is `claude`, `codex` or
-  `cursor`. One file per workdir and agent, so running the Claude and
+  resolved (physical) working directory path, computed with
+  `sha256sum` (GNU coreutils, Linux) or `shasum -a 256` (macOS) — one
+  of them must be on `PATH` — and `<agent>` is `claude`, `codex`,
+  `agy` or `copilot`. One file per workdir and agent, so running the Claude and
   Codex wrappers in the same directory never clobbers the other's
   settings.
-- **Auto-load** — fires when the menu opens. Restores all settings
-  silently on a match; if the file does not exist (first run or after
-  a clear) the menu starts with catalog defaults. A dim
-  `(restored from <path>)` line appears in the header when settings
-  are in effect.
+- **Auto-load** — fires when the menu opens, and before a
+  non-interactive launch. Restores the saved settings; if the file does
+  not exist (first run or after a clear) the menu starts with catalog
+  defaults. A dim `(restored from <path>)` line appears in the header
+  when settings are in effect.
+- **Launch environment wins** — a setting already set in the environment
+  you launch with (even `=0` or empty) is never overwritten by the
+  preset, e.g. `AI_SANDBOX_PASS_AWS=0 claude_wrapper` keeps AWS off
+  even if the preset saved `1`. In an interactive launch the next
+  auto-save then stores that value for the workdir.
+- **Restore warnings** — restoring a red or yellow setting (credentials,
+  Docker socket, extra dirs, ...) at a non-default value
+  prints `WARN: ... Restored KEY=VALUE from the saved preset` on
+  stderr, so scripted launches see what was relaxed.
+- **Retired settings** — a key the wrapper no longer has (today
+  `AI_SANDBOX_ALLOW_GIT_CONFIG`, `AI_SANDBOX_ALLOW_EXTERNAL_WORKTREES`,
+  `AI_SANDBOX_BLOCK_LINKED_GIT_DIRS`) is skipped without the
+  unknown-setting WARN; a saved value other than `0` prints one
+  `NOTE: ... Ignoring retired setting` line on stderr. The next
+  auto-save drops it.
 - **Upgrade from the shared file** — older releases wrote one shared
   `<hash>.env` per workdir for all agents. Until this agent has saved
   its own `<hash>-<agent>.env`, auto-load reads that legacy file
@@ -275,6 +630,14 @@ per-agent operation — no naming, no confirmation, no sub-menu required.
   marker so the header line disappears on the next render. Other
   agents' `<hash>-<agent>.env` files are left alone. No confirmation.
   Use this as the escape hatch to start fresh from catalog defaults.
+- **Fails closed** — if the workdir hash cannot be computed (neither
+  `sha256sum` nor `shasum` on `PATH`, the command fails or prints
+  something other than a SHA-256 digest, or `pwd -P` fails), the wrapper
+  prints an `ERROR:` line, the header shows `Saved settings disabled`,
+  and nothing is restored, saved or cleared for that session. The
+  session itself still launches with the current settings; other
+  workdirs' presets are never read or touched as a fallback. Install
+  coreutils or perl's `shasum` to restore presets.
 
 The preset file is plain `KEY=VALUE` per line with a comment header
 (`# workdir: <path>` and `# agent: <id>`); you can
@@ -310,7 +673,11 @@ particular callback is a zero-behavior-change no-op:
 - `_extra_sandbox_setup` — fires in both backends right before binds bake
   into the SBPL profile (Darwin) / bwrap exec (Linux). Append to
   `binds_rw` / `binds_ro` / `binds_meta` / `env_allowlist` on macOS or to
-  `bwrap_args` on Linux.
+  `bwrap_args` on Linux. It runs before the egress proxy starts, so it can
+  also append host suffixes to `AI_SANDBOX_PRIVATE_HOSTS` (e.g.
+  `AI_SANDBOX_PRIVATE_HOSTS+=" mcp.corp.example"`) to open internal
+  services the plugin needs; the addition applies to that launch only and
+  is never saved to the preset.
 - `_extra_post_menu_setup` — fires after the interactive menu (and on the
   non-interactive path) before dispatch. Mutate `AGENT_FLAGS` /
   `AI_SANDBOX_PROFILE` / any env-var toggle.
@@ -339,7 +706,9 @@ of symlinks because sandbox-exec on macOS resolves file rules against the
 canonical real path. Each managed copy carries a
 `.setup_skills_managed` marker file recording its source path, so reruns
 refresh the copy in place; non-managed entries in destination skill
-directories are left untouched.
+directories are left untouched. Each copy is staged and marked before it
+replaces the previous entry, so a failed copy keeps the old one; setup then
+exits nonzero and a rerun completes the sync. `--dry` writes nothing.
 
 Run setup with:
 ```sh
@@ -348,7 +717,9 @@ Run setup with:
 
 Key skills:
 - `orchestrator-mode` — Delegated investigation, planning, and implementation
-- `session-retro` — Session analysis and reusable lessons
+- `retro-aggregate` — Merge saved retros across sessions into one decidable backlog and apply approved changes
+- `session-retro` — Session analysis and saved retros
+- `skill-sync` — Keep installed skills in sync with their source repos
 - `caveman` — Concise responses without losing technical substance
 - `ponytail` — Smallest complete solution and evidence-based scope pushback
 - `tortuga` — On-demand use of the existing GitHub runner

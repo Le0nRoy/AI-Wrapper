@@ -3,7 +3,7 @@
 # AI_WRAPPER_EXTRA_PROFILE extension system.
 #
 # Covers:
-#   _extra_settings_register  (fires at lib source time)
+#   _extra_settings_register  (fires from _load_extra_profile)
 #   _extra_category_label     (_category_label fallback)
 #   _extra_header_extras      (show_header)
 #   _extra_menu_options       (show_main_menu render)
@@ -36,19 +36,30 @@ fi
 if (( ok == 1 )); then PASS=$((PASS+1)); echo "PASS HOOK-SETTINGS-REGISTER-01"; else FAIL=$((FAIL+1)); fi
 clean_scratch
 
-# HOOK-SETTINGS-REGISTER-02: hook fires when defined before source_lib.
+# HOOK-SETTINGS-REGISTER-02: hook fires from _load_extra_profile once the
+# AI_WRAPPER_EXTRA_PROFILE plugin defining it is sourced — not at lib source
+# time (firing there would run before the wrapper loads the plugin).
 mk_scratch; guard_home
 export XDG_CONFIG_HOME="${TEST_SCRATCH}/config"
 clear_catalog_env
+unset -f _extra_settings_register 2>/dev/null || true
 _SENTINEL_FILE="${TEST_SCRATCH}/settings_register_fired"
-# Must be defined before source_lib — the call is at module-init level.
+_PLUGIN_FILE="${TEST_SCRATCH}/settings_register_plugin.bash"
+cat > "${_PLUGIN_FILE}" <<PLUGIN
 _extra_settings_register() { touch "${_SENTINEL_FILE}"; }
+PLUGIN
 source_lib
 ok=1
+if [[ -f "${_SENTINEL_FILE}" ]]; then
+    _fail "HOOK-SETTINGS-REGISTER-02" "_extra_settings_register fired at source time" "" ""; ok=0
+fi
+export AI_WRAPPER_EXTRA_PROFILE="${_PLUGIN_FILE}"
+_load_extra_profile
 if [[ ! -f "${_SENTINEL_FILE}" ]]; then
-    _fail "HOOK-SETTINGS-REGISTER-02" "_extra_settings_register was not called" "" ""; ok=0
+    _fail "HOOK-SETTINGS-REGISTER-02" "_extra_settings_register was not called by _load_extra_profile" "" ""; ok=0
 fi
 if (( ok == 1 )); then PASS=$((PASS+1)); echo "PASS HOOK-SETTINGS-REGISTER-02"; else FAIL=$((FAIL+1)); fi
+unset AI_WRAPPER_EXTRA_PROFILE
 unset -f _extra_settings_register
 clean_scratch
 

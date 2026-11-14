@@ -2,7 +2,8 @@
 # Shared test harness for preset tests.
 #
 # Provides:
-#   mk_scratch      — create per-test scratch dir, set HOME and PWD inside it.
+#   mk_scratch      — create per-test scratch dir, set HOME, XDG_*_HOME and
+#                     PWD inside it.
 #   source_lib      — source a sed-rewritten copy of ai_wrapper_lib.bash
 #                     that redirects all /dev/tty writes to TEST_TTY_OUT
 #                     and all /dev/tty reads from TEST_TTY_IN.
@@ -70,7 +71,7 @@ _require_darwin() {
 
 # Create a unique scratch dir. Sets:
 #   TEST_SCRATCH      - absolute path to scratch
-#   HOME              - scratch/home
+#   HOME              - scratch/home (XDG_{CONFIG,DATA,STATE,CACHE}_HOME under it)
 #   TEST_TTY_OUT      - scratch/tty.out
 #   TEST_TTY_IN       - scratch/tty.in
 #   AI_WRAPPER_TEST_LIB - scratch/lib.bash
@@ -82,6 +83,11 @@ mk_scratch() {
     mkdir "${TEST_SCRATCH}/work" || return 1
     HOME="${TEST_SCRATCH}/home"
     export HOME
+    # Never inherit the developer's XDG roots or plugin profile: preset
+    # files must land in scratch even when a test forgets to override them.
+    export XDG_CONFIG_HOME="${HOME}/.config" XDG_DATA_HOME="${HOME}/.local/share"
+    export XDG_STATE_HOME="${HOME}/.local/state" XDG_CACHE_HOME="${HOME}/.cache"
+    unset AI_WRAPPER_EXTRA_PROFILE BASH_ENV
     TEST_TTY_OUT="${TEST_SCRATCH}/tty.out"
     TEST_TTY_IN="${TEST_SCRATCH}/tty.in"
     : > "${TEST_TTY_OUT}"
@@ -236,6 +242,7 @@ clear_catalog_env() {
     unset AI_SANDBOX_PROFILE
     unset AI_SANDBOX_PROFILE_TRUST_ME
     unset AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR
+    unset AI_SANDBOX_ALLOW_SETTINGS
     unset AI_SANDBOX_ALLOW_RO_HOMEDIR
     unset AI_SANDBOX_ALLOW_RO_CREDENTIALS
     unset AI_SANDBOX_PASS_SSH_AGENT
@@ -248,6 +255,13 @@ clear_catalog_env() {
     unset AI_SANDBOX_ALLOW_DOCKER
     unset AI_SANDBOX_PASS_DOCKER
     unset AI_SANDBOX_WORKDIR_WARNING
+    # Catch catalog rows added since this list was written: a leftover
+    # value now counts as caller-set and blocks the preset (CC-6).
+    local name
+    for name in $(compgen -v AI_SANDBOX_); do
+        unset "${name}"
+    done
+    unset CLAUDE_ACCOUNT CODEX_ACCOUNT AGY_ACCOUNT
 }
 
 # --- macOS stat mode bits -------------------------------------------------
