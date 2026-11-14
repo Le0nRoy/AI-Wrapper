@@ -515,6 +515,7 @@ account row exists in the Claude, Codex and AGY wrappers):
 - **Share GitLab token + glab config** (`AI_SANDBOX_PASS_GITLAB`): the agent uses glab or pushes to GitLab over HTTPS.
 - **Share OpenAI credentials** (`AI_SANDBOX_PASS_OPENAI`): code the agent runs (tests, scripts, evals) calls the OpenAI API with your key.
 - **Allow unrestricted network access** (`AI_SANDBOX_ALLOW_UNRESTRICTED_NET`): SSH git remotes (git@github.com:...), ssh, scp or rsync; tools that ignore http_proxy; reaching localhost dev servers or databases on the host; LAN or Tailscale hosts; raw TCP/UDP.
+- **Reach internal hosts by name through the proxy** (`AI_SANDBOX_PRIVATE_HOSTS`): the agent must reach internal HTTP(S) APIs, package mirrors, artifact registries or docs on private LAN addresses without opening unrestricted network access.
 - **Mount Docker / Colima socket** (`AI_SANDBOX_ALLOW_DOCKER`): the session must build or run containers (docker build, docker compose up, testcontainers) and you accept the host-root risk.
 - **Share Docker client env vars + ~/.docker** (`AI_SANDBOX_PASS_DOCKER`): the docker client needs your DOCKER_HOST, contexts or registry logins, e.g. pulling private images or docker push.
 - **Account profile** (`CLAUDE_ACCOUNT`, `CODEX_ACCOUNT`, `AGY_ACCOUNT`): this session should run under another login, e.g. a work account kept in `~/.claude-work` (`~/.codex-work`, `~/.gemini-work`).
