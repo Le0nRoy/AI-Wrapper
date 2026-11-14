@@ -7,10 +7,10 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-FAKE_HOME="$(mktemp -d "${TMPDIR:-${HOME}}/ai-wrapper-skills-test.XXXXXX")"
-trap 'rm -rf "${FAKE_HOME}"' EXIT
 # shellcheck source=./lib_test_helpers.bash
 source "${REPO_ROOT}/tests/lib_test_helpers.bash"
+FAKE_HOME="$(_safe_mktemp_d "${TMPDIR:-/tmp}/ai-wrapper-skills-test.XXXXXX")" || exit 1
+trap '_safe_rm_rf "${FAKE_HOME}"' EXIT
 isolate_test_env "${FAKE_HOME}"
 
 mkdir -p \
@@ -45,7 +45,7 @@ if ! HOME="${FAKE_HOME}" bash "${REPO_ROOT}/bin/executable_setup_skills.bash" >/
     exit 1
 fi
 
-skills=(caveman orchestrator-mode ponytail session-retro tortuga)
+skills=(caveman orchestrator-mode ponytail retro-aggregate session-retro skill-sync tortuga)
 destinations=(
     ".claude/skills"
     ".codex/skills"
@@ -218,7 +218,7 @@ for mode in rsync norsync; do
     echo mine > "${home}/.copilot/skills"
     run_setup "${home}" "${tools}" && fail "[${mode}] setup succeeded despite blocked mkdir"
     [[ "$(cat "${home}/.copilot/skills")" == mine ]] || fail "[${mode}] blocking file touched"
-    [[ "${setup_out}" == *"Copied: 15,"* ]] || fail "[${mode}] blocked root counted: ${setup_out}"
+    [[ "${setup_out}" == *"Copied: $(( 3 * ${#skills[@]} )),"* ]] || fail "[${mode}] blocked root counted: ${setup_out}"
     [[ -f "${home}/.claude/skills/caveman/.setup_skills_managed" ]] || fail "[${mode}] healthy root not deployed"
     rm -f "${home}/.copilot/skills"
     run_setup "${home}" "${tools}" || fail "[${mode}] retry after mkdir failure: ${setup_out}"
@@ -275,7 +275,7 @@ for mode in rsync norsync; do
     mkdir -p "${home}/ai-wrapper/.agents/skills/caveman/.setup_skills_managed" "${home}/.claude/skills"
     run_setup "${home}" "${tools}" && fail "[${mode}] setup succeeded despite marker failure"
     [[ -e "${home}/.claude/skills/caveman" ]] && fail "[${mode}] unmarked copy left in place"
-    [[ "${setup_out}" == *"Copied: 16,"* ]] || fail "[${mode}] failed marker counted: ${setup_out}"
+    [[ "${setup_out}" == *"Copied: $(( 4 * (${#skills[@]} - 1) )),"* ]] || fail "[${mode}] failed marker counted: ${setup_out}"
     no_leftovers "${home}/.claude/skills"
     rmdir "${home}/ai-wrapper/.agents/skills/caveman/.setup_skills_managed"
     run_setup "${home}" "${tools}" || fail "[${mode}] retry after marker failure: ${setup_out}"

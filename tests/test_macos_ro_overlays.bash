@@ -25,10 +25,10 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${REPO_ROOT}/tests/lib_test_helpers.bash"
 
 # Under the real $HOME for the reason given in tests/test_sandbox_common.bash.
-FAKE_HOME="$(mktemp -d "${HOME}/ai-wrapper-test.XXXXXX")"
+FAKE_HOME="$(_safe_mktemp_d "${HOME}/ai-wrapper-test.XXXXXX")" || exit 1
 FAKE_HOME="$(cd "${FAKE_HOME}" && pwd -P)"
 isolate_test_env "${FAKE_HOME}"
-cleanup() { rm -rf "${FAKE_HOME}"; }
+cleanup() { _safe_rm_rf "${FAKE_HOME}"; }
 trap cleanup EXIT
 
 OS="$(uname -s)"
@@ -298,6 +298,20 @@ assert_eq "${rc}" "1" "missing --under-bind source fails"
 assert_contains "${out}" "--under-bind source missing" "... with the source-missing message"
 rm -rf "${FAKE_HOME}/project/ctl"
 
+# AI_SANDBOX_EXTRA_RO_DIRS above WORKDIR: WORKDIR and an RW extra nested in
+# the RO parent are carved out; an RO extra inside WORKDIR stays denied.
+WS="${FAKE_HOME}/ws"
+mkdir -p "${WS}/proj/ro-sub" "${WS}/rw-extra"
+out="$( cd "${WS}/proj" && PATH="${dry_path}" && _load_backend \
+    && AI_SANDBOX_EXTRA_RO_DIRS="${WS},${WS}/proj/ro-sub" AI_SANDBOX_EXTRA_RW_DIRS="${WS}/rw-extra" \
+       AI_SANDBOX_DRYRUN=1 _run_sandboxed_agent_impl /bin/echo -- -- hi 2>&1 )"
+profile="${out#*=== Rendered SBPL profile ===}"
+ws_re="$( _load_backend; _regex_escape "${WS}" )"
+assert_contains "${profile}" "(deny ${DENY_OPS} (require-all (subpath \"${WS}\")" "RO parent of WORKDIR: write-denied with exceptions"
+assert_contains "${profile}" "(require-not (regex #\"^${ws_re}/proj/\"))" "RO parent of WORKDIR: WORKDIR carved out"
+assert_contains "${profile}" "(require-not (regex #\"^${ws_re}/rw-extra/\"))" "RO parent of WORKDIR: nested RW extra carved out"
+assert_contains "${profile}" "(deny ${DENY_OPS} (subpath \"${WS}/proj/ro-sub\"))" "RO extra inside WORKDIR under an RO parent: still write-denied"
+
 # Flag parsing and validation are unchanged.
 out="$(_dryrun -- --ro-bind "${FAKE_HOME}/nope" -- hi)"; rc=$?
 assert_eq "${rc}" "1" "missing --ro-bind source still fails"
@@ -445,6 +459,18 @@ else
     echo "  (native extension-hook output: ${out})"
     assert_contains "${out}" "DENIED:${FAKE_HOME}/repos/main/wt/ro-sub/y" "native extension hook: binds_ro is read-only"
     assert_contains "${out}" "WROTE:${FAKE_HOME}/ext-rw/z" "native extension hook: binds_rw is writable"
+
+    # AI_SANDBOX_EXTRA_RO_DIRS above WORKDIR does not mask WORKDIR or a
+    # nested RW extra; siblings under the RO parent stay read-only.
+    out="$( cd "${WS}/proj" && _load_backend \
+        && AI_SANDBOX_EXTRA_RO_DIRS="${WS},${WS}/proj/ro-sub" AI_SANDBOX_EXTRA_RW_DIRS="${WS}/rw-extra" \
+           _run_sandboxed_agent_impl /bin/sh -- -- -c "$(_write_probe)" _ \
+           "${WS}/proj/x" "${WS}/rw-extra/y" "${WS}/sibling" "${WS}/proj/ro-sub/z" 2>&1 )"
+    echo "  (native RO-parent output: ${out})"
+    assert_contains "${out}" "WROTE:${WS}/proj/x" "native: WORKDIR under an RO extra stays writable"
+    assert_contains "${out}" "WROTE:${WS}/rw-extra/y" "native: RW extra under an RO extra stays writable"
+    assert_contains "${out}" "DENIED:${WS}/sibling" "native: sibling under the RO extra is read-only"
+    assert_contains "${out}" "DENIED:${WS}/proj/ro-sub/z" "native: RO extra inside WORKDIR stays read-only"
 fi
 
 assert_no_live_client_reached

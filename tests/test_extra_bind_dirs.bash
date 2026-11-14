@@ -20,14 +20,14 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=./lib_test_helpers.bash
 source "${REPO_ROOT}/tests/lib_test_helpers.bash"
 
-FAKE_HOME="$(mktemp -d "${HOME}/ai-wrapper-test.XXXXXX")"
+FAKE_HOME="$(_safe_mktemp_d "${HOME}/ai-wrapper-test.XXXXXX")" || exit 1
 isolate_test_env "${FAKE_HOME}"
 # shellcheck source=../bin/ai_agent_universal_wrapper.bash
 source "${REPO_ROOT}/bin/ai_agent_universal_wrapper.bash"
 mkdir -p "${FAKE_HOME}/project" "${FAKE_HOME}/.claude" "${FAKE_HOME}/extra_data" "${FAKE_HOME}/.ssh"
 echo "extra-dir-ok" >"${FAKE_HOME}/extra_data/marker.txt"
 
-cleanup() { rm -rf "${FAKE_HOME}"; }
+cleanup() { _safe_rm_rf "${FAKE_HOME}"; }
 trap cleanup EXIT
 
 echo "== AI_SANDBOX_EXTRA_{RW,RO}_DIRS smoke tests ($(uname -s)) =="

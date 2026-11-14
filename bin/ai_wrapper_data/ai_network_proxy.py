@@ -10,6 +10,13 @@ in IPv6 (IPv4-mapped, NAT64 well-known prefix, 6to4) is unwrapped and
 checked as IPv4. The upstream socket connects to the verified address
 itself, so no second lookup can rebind the name.
 
+``--allow-private-host SUFFIX`` (repeatable) exempts ONLY the private LAN
+ranges (RFC 1918, RFC 6598, ULA) for request hosts equal to SUFFIX or
+ending in ``.SUFFIX`` (case-insensitive, trailing dot ignored), so a
+corporate service on an internal address stays reachable by name.
+Loopback, link-local / metadata, "this network", multicast and reserved
+stay blocked for every host; IP-literal request hosts never match.
+
 Listens on a UNIX domain socket (``--socket PATH``, mode 0600) and/or a
 loopback TCP port (``--host 127.0.0.1 --port N``; 0 picks a free port).
 Prints one ``READY tcp HOST:PORT`` / ``READY unix PATH`` line per listener
@@ -31,6 +38,7 @@ import http.client
 import ipaddress
 import logging
 import os
+import re
 import select
 import signal
 import socket
@@ -43,19 +51,26 @@ from urllib.parse import urlsplit
 
 LOG = logging.getLogger("ai_network_proxy")
 
-BLOCKED_NETWORKS = tuple(ipaddress.ip_network(cidr) for cidr in (
+# Blocked for every destination, --allow-private-host or not.
+ALWAYS_BLOCKED_NETWORKS = tuple(ipaddress.ip_network(cidr) for cidr in (
     # Loopback
     "127.0.0.0/8", "::1/128",
     # Link-local, incl. cloud metadata (169.254.169.254)
     "169.254.0.0/16", "fe80::/10",
-    # Private LAN: RFC 1918, RFC 6598 shared address space, IPv6 ULA
-    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "fc00::/7",
     # "This network" (0.0.0.0 reaches the host on Linux), multicast, reserved
     "0.0.0.0/8", "224.0.0.0/4", "240.0.0.0/4", "ff00::/8",
     # Unspecified and deprecated IPv4-compatible IPv6 (::a.b.c.d)
     "::/96",
 ))
+# Private LAN: RFC 1918, RFC 6598 shared address space (CGNAT, Tailscale),
+# IPv6 ULA. Blocked unless the request host matches --allow-private-host.
+PRIVATE_NETWORKS = tuple(ipaddress.ip_network(cidr) for cidr in (
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "fc00::/7",
+))
+BLOCKED_NETWORKS = ALWAYS_BLOCKED_NETWORKS + PRIVATE_NETWORKS
 NAT64_WELL_KNOWN_PREFIX = ipaddress.ip_network("64:ff9b::/96")
+HOST_LABEL_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+MIN_PRIVATE_HOST_SUFFIX_LABELS = 2
 IPV4_LOW_BITS_MASK = 0xFFFFFFFF
 
 DEFAULT_HOST = "127.0.0.1"
@@ -108,19 +123,68 @@ def parse_ip(text):
     return ipaddress.ip_address(text.split("%", 1)[0])
 
 
+def _is_ip_literal(text):
+    try:
+        parse_ip(text)
+    except ValueError:
+        return False
+    return True
+
+
+def normalize_private_host_suffix(text):
+    """Return the canonical form of an --allow-private-host SUFFIX.
+
+    ValueError for an empty, wildcard, IP-literal, all-numeric,
+    single-label or otherwise non-hostname suffix (a single label such as
+    ``com`` would open private ranges to every name under that TLD).
+    """
+    suffix = text.strip().lower().rstrip(".")
+    if not suffix:
+        raise ValueError("empty host suffix")
+    if "*" in suffix:
+        raise ValueError("wildcards are not supported in %r; give the bare suffix" % text)
+    if _is_ip_literal(suffix):
+        raise ValueError("%r is an IP address, not a host name" % text)
+    labels = suffix.split(".")
+    if len(labels) < MIN_PRIVATE_HOST_SUFFIX_LABELS:
+        raise ValueError("%r needs at least %d labels" % (text, MIN_PRIVATE_HOST_SUFFIX_LABELS))
+    for label in labels:
+        if not HOST_LABEL_PATTERN.match(label):
+            raise ValueError("%r is not a valid host name" % text)
+    if all(label.isdigit() for label in labels):
+        raise ValueError("%r looks like part of an IP address, not a host name" % text)
+    return suffix
+
+
 class DestinationFilter:
     """Resolve destinations and refuse any that touch a blocked network."""
 
-    def __init__(self, blocked_networks=BLOCKED_NETWORKS, resolver=socket.getaddrinfo):
+    def __init__(self, blocked_networks=BLOCKED_NETWORKS, resolver=socket.getaddrinfo,
+                 private_host_suffixes=(), private_networks=PRIVATE_NETWORKS):
         self._blocked_networks = tuple(blocked_networks)
         self._resolver = resolver
+        self._private_host_suffixes = tuple(normalize_private_host_suffix(suffix) for suffix in private_host_suffixes)
+        self._private_networks = tuple(private_networks)
 
-    def blocked_reason(self, address):
-        """Return why ``address`` is blocked, or None when it is allowed."""
+    def private_allowed(self, host):
+        """True when ``host`` (a name, never an IP literal) matches --allow-private-host."""
+        name = host.lower().rstrip(".")
+        if not name or _is_ip_literal(name):
+            return False
+        return any(name == suffix or name.endswith("." + suffix) for suffix in self._private_host_suffixes)
+
+    def blocked_reason(self, address, exempt_networks=()):
+        """Return why ``address`` is blocked, or None when it is allowed.
+
+        Networks in ``exempt_networks`` are skipped (also for an embedded
+        IPv4 address).
+        """
         for candidate in (address, embedded_ipv4(address)):
             if candidate is None:
                 continue
             for network in self._blocked_networks:
+                if network in exempt_networks:
+                    continue
                 if candidate.version == network.version and candidate in network:
                     return "%s is in blocked range %s" % (address, network)
         return None
@@ -133,7 +197,10 @@ class DestinationFilter:
 
         Fails closed: raises DestinationBlocked if any resolved address is
         blocked or unparseable, DestinationUnresolvable if none resolve.
+        A host matching --allow-private-host may resolve to the private
+        LAN ranges; every other blocked range still applies to it.
         """
+        exempt_networks = self._private_networks if self.private_allowed(host) else ()
         try:
             infos = self._resolver(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
         except (OSError, UnicodeError, ValueError) as error:
@@ -148,7 +215,7 @@ class DestinationFilter:
                 address = parse_ip(sockaddr[0])
             except ValueError:
                 raise DestinationBlocked("%s resolved to unparseable address %r" % (host, sockaddr[0]))
-            reason = self.blocked_reason(address)
+            reason = self.blocked_reason(address, exempt_networks)
             if reason is not None:
                 raise DestinationBlocked("%s resolved to a blocked address: %s" % (host, reason))
             targets.append((family, sockaddr))
@@ -467,6 +534,13 @@ class ThreadingUnixProxyServer(_ProxyServerMixin, socketserver.UnixStreamServer)
         return "unix %s" % self.server_address
 
 
+def _private_host_suffix_arg(text):
+    try:
+        return normalize_private_host_suffix(text)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error))
+
+
 def parse_args(argv):
     parser = argparse.ArgumentParser(description="Sandbox egress proxy (CONNECT + HTTP) with destination filtering.")
     parser.add_argument("--socket", help="listen on this UNIX domain socket path")
@@ -477,6 +551,10 @@ def parse_args(argv):
     parser.add_argument("--log-level", default="INFO", choices=("DEBUG", "INFO", "WARNING", "ERROR"))
     parser.add_argument("--parent-pid", type=int,
                         help="start a new session and stop once this PID is no longer the parent")
+    parser.add_argument("--allow-private-host", action="append", default=[], metavar="SUFFIX",
+                        type=_private_host_suffix_arg,
+                        help="let hosts equal to or under SUFFIX resolve to private LAN ranges "
+                             "(RFC 1918, RFC 6598, ULA); repeatable")
     args = parser.parse_args(argv)
     if args.socket is None and args.port is None:
         parser.error("give --socket and/or --port")
@@ -522,8 +600,10 @@ def main(argv=None):
         except OSError as error:
             print("ai_network_proxy: cannot start a new session: %s" % error, file=sys.stderr)
             return 1
+    if args.allow_private_host:
+        LOG.info("private LAN ranges allowed for hosts under: %s", ", ".join(args.allow_private_host))
     try:
-        servers = build_servers(args, DestinationFilter())
+        servers = build_servers(args, DestinationFilter(private_host_suffixes=args.allow_private_host))
     except (OSError, ValueError) as error:
         print("ai_network_proxy: cannot listen: %s" % error, file=sys.stderr)
         return 1

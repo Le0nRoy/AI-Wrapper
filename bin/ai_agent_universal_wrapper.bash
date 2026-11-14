@@ -304,6 +304,158 @@ _AI_SANDBOX_NET_PROXY_PID=""
 _AI_SANDBOX_NET_PROXY_DIR=""
 _AI_SANDBOX_NET_PROXY_ERROR=""
 
+# Host suffixes the egress proxy lets resolve to private LAN ranges
+# (RFC 1918, RFC 6598 / CGNAT, IPv6 ULA; --allow-private-host): entries of
+# AI_SANDBOX_PRIVATE_HOSTS (space- or comma-separated, also appended to by
+# plugins in _extra_sandbox_setup) plus the hosts the opted-in services
+# need. Loopback, link-local / metadata and the other always-blocked ranges
+# stay blocked for these names too. gitlab.com is public and never added.
+_AI_SANDBOX_PUBLIC_GITLAB_HOST=gitlab.com
+_AI_SANDBOX_TAILSCALE_MAGICDNS_SUFFIX=ts.net
+# Two or more DNS labels, lower case; IP literals are refused separately.
+_AI_SANDBOX_HOST_NAME_PATTERN='^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'
+_AI_SANDBOX_IPV4_LITERAL_PATTERN='^[0-9.]+$'
+# Set by _sandbox_private_host_args.
+_AI_SANDBOX_PRIVATE_HOST_ARGS=()
+_AI_SANDBOX_PRIVATE_HOSTS_SEEN=""
+
+# Prints the host in VALUE (a URL, host:port or bare host name): quotes and
+# whitespace, scheme, userinfo, path, port and a trailing dot dropped, lower
+# case. Returns 1 (prints nothing) unless the result is a host name the
+# proxy accepts as --allow-private-host: IP literals (they cannot be
+# allowed by name), single labels and wildcards are refused.
+_sandbox_host_from_value() {
+    local host
+    host="$(printf '%s' "${1}" | tr -d "\"'[:space:]" | tr '[:upper:]' '[:lower:]')"
+    host="${host#*://}"
+    host="${host%%/*}"
+    host="${host##*@}"
+    host="${host%%:*}"
+    host="${host%.}"
+    [[ "${host}" =~ ${_AI_SANDBOX_HOST_NAME_PATTERN} ]] || return 1
+    [[ "${host}" =~ ${_AI_SANDBOX_IPV4_LITERAL_PATTERN} ]] && return 1
+    printf '%s\n' "${host}"
+}
+
+# Adds the host in VALUE to _AI_SANDBOX_PRIVATE_HOST_ARGS once. ORIGIN
+# names where it came from (for logs); an invalid entry the user typed into
+# AI_SANDBOX_PRIVATE_HOSTS is WARNed, auto-detected ones are skipped quietly.
+_sandbox_private_host_add() {
+    local value="${1}" origin="${2}" host
+    if ! host="$(_sandbox_host_from_value "${value}")"; then
+        if [[ "${origin}" == AI_SANDBOX_PRIVATE_HOSTS ]]; then
+            echo_log "WARNING" "AI_SANDBOX_PRIVATE_HOSTS: ignoring '${value}' (needs a host name with two or more labels, e.g. corp.example; no IP addresses or wildcards)"
+        elif [[ "${AI_SANDBOX_DEBUG:-0}" == "1" ]]; then
+            echo_log "DEBUG" "private hosts: skipping '${value}' from ${origin} (not a host name the proxy can allow)"
+        fi
+        return 0
+    fi
+    case " ${_AI_SANDBOX_PRIVATE_HOSTS_SEEN} " in
+        *" ${host} "*) return 0 ;;
+    esac
+    _AI_SANDBOX_PRIVATE_HOSTS_SEEN+=" ${host}"
+    _AI_SANDBOX_PRIVATE_HOST_ARGS+=(--allow-private-host "${host}")
+    if [[ "${AI_SANDBOX_DEBUG:-0}" == "1" ]]; then
+        echo_log "DEBUG" "private hosts: ${host} (from ${origin})"
+    fi
+    return 0
+}
+
+# Prints the glab-cli config.yml files that exist: GLAB_CONFIG_DIR, the XDG
+# config dir, macOS ~/Library/Application Support/glab-cli and
+# ~/.config/glab-cli (the dirs the PASS_GITLAB bind covers, plus glab's
+# own overrides).
+_sandbox_glab_config_files() {
+    local dir
+    local -a dirs=("${HOME}/Library/Application Support/glab-cli" "${HOME}/.config/glab-cli")
+    [[ -n "${XDG_CONFIG_HOME:-}" ]] && dirs=("${XDG_CONFIG_HOME}/glab-cli" "${dirs[@]}")
+    [[ -n "${GLAB_CONFIG_DIR:-}" ]] && dirs=("${GLAB_CONFIG_DIR}" "${dirs[@]}")
+    for dir in "${dirs[@]}"; do
+        [[ -f "${dir}/config.yml" && -r "${dir}/config.yml" ]] && printf '%s\n' "${dir}/config.yml"
+    done
+    return 0
+}
+
+# Prints the GitLab hosts in a glab config.yml: the keys of the top-level
+# `hosts:` map (any consistent indent) and each host's `api_host:` value.
+# Best effort, plain awk: anchors, flow maps and multi-line keys are not
+# understood (and so not added).
+_sandbox_glab_config_hosts() {
+    awk '
+        /^[^[:space:]#]/ { in_hosts = ($0 ~ /^hosts:[[:space:]]*(#.*)?$/); child = -1; next }
+        !in_hosts || /^[[:space:]]*(#.*)?$/ { next }
+        {
+            match($0, /^ */); indent = RLENGTH; line = substr($0, indent + 1)
+            if (child < 0) child = indent
+            if (indent == child) { sub(/:.*/, "", line); print line }
+            else if (indent > child && line ~ /^api_host:/) {
+                sub(/^api_host:[[:space:]]*/, "", line); sub(/[[:space:]]+#.*/, "", line); print line
+            }
+        }' "${1}" 2>/dev/null
+    return 0
+}
+
+# Prints the `server:` values of the kubeconfig files (KUBECONFIG, a
+# colon-separated list, else ~/.kube/config).
+_sandbox_kube_servers() {
+    local file
+    local -a files=()
+    if [[ -n "${KUBECONFIG:-}" ]]; then
+        IFS=':' read -r -a files <<<"${KUBECONFIG}"
+    else
+        files=("${HOME}/.kube/config")
+    fi
+    for file in "${files[@]+"${files[@]}"}"; do
+        [[ -n "${file}" && -f "${file}" && -r "${file}" ]] || continue
+        awk '/^[[:space:]]*(-[[:space:]]+)?server:/ {
+                sub(/^[[:space:]]*(-[[:space:]]+)?server:[[:space:]]*/, ""); sub(/[[:space:]]+#.*/, ""); print
+            }' "${file}" 2>/dev/null
+    done
+    return 0
+}
+
+# Sets _AI_SANDBOX_PRIVATE_HOST_ARGS to the proxy's --allow-private-host
+# arguments (validated, deduplicated): AI_SANDBOX_PRIVATE_HOSTS entries,
+# then per opted-in service: AI_SANDBOX_PASS_GITLAB — GITLAB_HOST /
+# GL_HOST and the glab config's hosts (gitlab.com skipped);
+# AI_SANDBOX_PASS_KUBE — kubeconfig server host names (IP-literal servers
+# cannot be allowed by name); AI_SANDBOX_PASS_TAILSCALE (Linux) — ts.net
+# (MagicDNS; peers use 100.64.0.0/10). Shared by both backends' proxy start;
+# missing or unreadable files are skipped silently.
+_sandbox_private_host_args() {
+    local entry config_file
+    local -a entries=()
+    _AI_SANDBOX_PRIVATE_HOST_ARGS=()
+    _AI_SANDBOX_PRIVATE_HOSTS_SEEN=""
+    IFS=$', \t' read -r -a entries <<<"$(printf '%s' "${AI_SANDBOX_PRIVATE_HOSTS:-}" | tr '\n' ' ')"
+    for entry in "${entries[@]+"${entries[@]}"}"; do
+        [[ -n "${entry}" ]] && _sandbox_private_host_add "${entry}" AI_SANDBOX_PRIVATE_HOSTS
+    done
+    if [[ "${AI_SANDBOX_PASS_GITLAB:-0}" == "1" ]]; then
+        while IFS='|' read -r entry config_file; do
+            [[ "$(_sandbox_host_from_value "${entry}")" == "${_AI_SANDBOX_PUBLIC_GITLAB_HOST}" ]] && continue
+            _sandbox_private_host_add "${entry}" "AI_SANDBOX_PASS_GITLAB (${config_file})"
+        done < <(
+            [[ -n "${GITLAB_HOST:-}" ]] && printf '%s|GITLAB_HOST\n' "${GITLAB_HOST}"
+            [[ -n "${GL_HOST:-}" ]] && printf '%s|GL_HOST\n' "${GL_HOST}"
+            _sandbox_glab_config_files | while IFS= read -r config_file; do
+                _sandbox_glab_config_hosts "${config_file}" | while IFS= read -r entry; do
+                    printf '%s|%s\n' "${entry}" "${config_file}"
+                done
+            done
+        )
+    fi
+    if [[ "${AI_SANDBOX_PASS_KUBE:-0}" == "1" ]]; then
+        while IFS= read -r entry; do
+            _sandbox_private_host_add "${entry}" "AI_SANDBOX_PASS_KUBE (kubeconfig server)"
+        done < <(_sandbox_kube_servers)
+    fi
+    if [[ "${AI_SANDBOX_PASS_TAILSCALE:-0}" == "1" && "$(uname -s)" == Linux ]]; then
+        _sandbox_private_host_add "${_AI_SANDBOX_TAILSCALE_MAGICDNS_SUFFIX}" "AI_SANDBOX_PASS_TAILSCALE (MagicDNS)"
+    fi
+    return 0
+}
+
 # Starts the host egress proxy on a UNIX socket in a fresh private (0700)
 # directory under BASE (/tmp when empty) and
 # waits for its READY line. The proxy runs in its own session (Ctrl+C in
@@ -312,7 +464,8 @@ _AI_SANDBOX_NET_PROXY_ERROR=""
 # _AI_SANDBOX_NET_PROXY_DIR; on failure stops what it started, sets
 # _AI_SANDBOX_NET_PROXY_ERROR to the reason and returns 1. Runs in the
 # calling shell, never in $(...): the proxy's parent must be the shell
-# that launches the sandbox. Args: BASE
+# that launches the sandbox. Private-range host names come from
+# _sandbox_private_host_args (--allow-private-host). Args: BASE
 _sandbox_start_network_proxy() {
     local base="${1:-/tmp}" python_bin dir sock shell_pid polls=0 reason
     _AI_SANDBOX_NET_PROXY_ERROR=""
@@ -335,9 +488,11 @@ _sandbox_start_network_proxy() {
         _AI_SANDBOX_NET_PROXY_ERROR="socket path ${sock} is longer than ${_AI_SANDBOX_UNIX_SOCKET_PATH_MAX} bytes"; return 1
     fi
     _AI_SANDBOX_NET_PROXY_DIR="${dir}"
+    _sandbox_private_host_args
     # Read before the fork: an async command's words expand in the child.
     shell_pid="${BASHPID}"
     "${python_bin}" -I "${_AI_SANDBOX_NET_PROXY_HELPER}" --socket "${sock}" --parent-pid "${shell_pid}" \
+        "${_AI_SANDBOX_PRIVATE_HOST_ARGS[@]+"${_AI_SANDBOX_PRIVATE_HOST_ARGS[@]}"}" \
         >"${dir}/ready" 2>"${dir}/proxy.log" </dev/null &
     _AI_SANDBOX_NET_PROXY_PID=$!
     until grep -qxF "READY unix ${sock}" "${dir}/ready" 2>/dev/null; do
@@ -403,7 +558,7 @@ _sandbox_stop_network_proxy() {
     [[ -n "${dir}" && -d "${dir}" ]] || return 0
     blocked="$(grep -c '\[BLOCKED\]' "${dir}/proxy.log" 2>/dev/null)"
     if (( ${blocked:-0} > 0 )); then
-        echo_log "WARNING" "[${tag}] The sandbox network policy refused ${blocked} request(s) (loopback, LAN or link-local / cloud metadata destinations). AI_SANDBOX_DEBUG=1 lists them."
+        echo_log "WARNING" "[${tag}] The sandbox network policy refused ${blocked} request(s) (loopback, LAN or link-local / cloud metadata destinations). AI_SANDBOX_DEBUG=1 lists them; an internal host you trust can be opened by name with AI_SANDBOX_PRIVATE_HOSTS."
     fi
     if [[ "${AI_SANDBOX_DEBUG:-0}" == "1" && -s "${dir}/proxy.log" ]]; then
         echo_log "DEBUG" "[${tag}] network proxy log:"
@@ -659,7 +814,7 @@ _run_sandboxed_agent_linux() {
     # _user_extra_bind_dirs holds the resolved directories (what is bound),
     # _user_extra_bind_names the entries as given (classified too, see
     # _sandbox_sensitive_pair_kind, and named in refusals).
-    local -a _user_extra_bind_dirs=() _user_extra_bind_names=() _user_extra_bwrap_flags=()
+    local -a _user_extra_bind_dirs=() _user_extra_bind_names=() _user_extra_bwrap_flags=() _user_extra_ro_dirs=()
     local _extra_dirs_ifs _d _d_resolved _d_rc
     if [[ -n "${AI_SANDBOX_EXTRA_RW_DIRS:-}" ]]; then
         _extra_dirs_ifs="${IFS}"; IFS=','
@@ -687,7 +842,7 @@ _run_sandboxed_agent_linux() {
             _d_resolved="$(_sandbox_resolve_extra_dir "${agent_name}" AI_SANDBOX_EXTRA_RO_DIRS "${_d}")"; _d_rc=$?
             (( _d_rc == 2 )) && continue
             (( _d_rc == 0 )) || exit 1
-            extra_bwrap_flags+=(--ro-bind "${_d_resolved}" "${_d_resolved}")
+            _user_extra_ro_dirs+=("${_d_resolved}")
             _user_extra_bind_dirs+=("${_d_resolved}")
             _user_extra_bind_names+=("${_d}")
         done
@@ -696,10 +851,11 @@ _run_sandboxed_agent_linux() {
 
     # User RW extras mount BEFORE the wrapper's own binds: bwrap's later
     # mount wins, so an extra RW dir equal to or above a client profile
-    # must not cover the wrapper's read-only overlays on its persistent
-    # controls. User RO extras stay after them, so the wrapper's RW binds
-    # (profile pins, a linked worktree's git dir) cannot reopen a directory
-    # the user asked to be read-only. (The macOS backend renders RO as
+    # (or WORKDIR / a worktree's shared .git) must not cover the wrapper's
+    # read-only overlays on its persistent controls or git metadata layers.
+    # User RO extras stay after them, so the wrapper's RW binds (profile
+    # pins, a linked worktree's git dir) cannot reopen a directory the user
+    # asked to be read-only. (The macOS backend renders RO as
     # order-independent denies instead.)
     extra_bwrap_flags=("${_user_extra_bwrap_flags[@]+"${_user_extra_bwrap_flags[@]}"}" \
         "${extra_bwrap_flags[@]+"${extra_bwrap_flags[@]}"}")
@@ -790,6 +946,29 @@ _run_sandboxed_agent_linux() {
             esac
         done
     fi
+
+    # A user RO extra strictly above WORKDIR or an RW extra would mask it if
+    # mounted last, so it mounts first: above WORKDIR before the WORKDIR
+    # bind, above an RW extra before the RW extras. Everything nested inside
+    # (WORKDIR, RW extras, wrapper overlays, RO extras inside WORKDIR) is
+    # mounted later and wins, matching the macOS "most specific bind wins".
+    local -a _ro_above_workdir_binds=() _ro_above_rw_binds=()
+    local _rw_i
+    for _d in "${_user_extra_ro_dirs[@]+"${_user_extra_ro_dirs[@]}"}"; do
+        if [[ "${resolved_workdir}" == "${_d}"/* ]]; then
+            _ro_above_workdir_binds+=(--ro-bind "${_d}" "${_d}")
+            continue
+        fi
+        for (( _rw_i = 1; _rw_i < ${#_user_extra_bwrap_flags[@]}; _rw_i += 3 )); do
+            if [[ "${_user_extra_bwrap_flags[_rw_i]}" == "${_d}"/* ]]; then
+                _ro_above_rw_binds+=(--ro-bind "${_d}" "${_d}")
+                continue 2
+            fi
+        done
+        extra_bwrap_flags+=(--ro-bind "${_d}" "${_d}")
+    done
+    extra_bwrap_flags=("${_ro_above_rw_binds[@]+"${_ro_above_rw_binds[@]}"}" \
+        "${extra_bwrap_flags[@]+"${extra_bwrap_flags[@]}"}")
 
     # ===== PATH VALIDATION FOR BIND MOUNTS =====
 
@@ -922,6 +1101,7 @@ _run_sandboxed_agent_linux() {
     bwrap_args+=(
         "${under_bwrap_flags[@]+"${under_bwrap_flags[@]}"}"
         "${protected_home_binds[@]+"${protected_home_binds[@]}"}"
+        "${_ro_above_workdir_binds[@]+"${_ro_above_workdir_binds[@]}"}"
         # Working directory (read-write), from its resolved path
         --bind "${resolved_workdir}" "${resolved_workdir}"
     )
@@ -1206,6 +1386,10 @@ _run_sandboxed_agent_linux() {
     # bin/executable_claude_wrapper.bash). Fires before bwrap exec so the
     # callback can append its own --bind / --ro-bind / --setenv pairs to
     # bwrap_args. Symmetric with the Darwin hook in macos_sandbox_exec.bash.
+    # The hook may append host suffixes to AI_SANDBOX_PRIVATE_HOSTS for the
+    # egress proxy; the local copy keeps them to this launch (never saved
+    # to the preset, never repeated on the next launch).
+    local AI_SANDBOX_PRIVATE_HOSTS="${AI_SANDBOX_PRIVATE_HOSTS:-}"
     if declare -f _extra_sandbox_setup >/dev/null 2>&1; then
         _extra_sandbox_setup
     fi

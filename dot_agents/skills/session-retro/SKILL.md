@@ -7,9 +7,11 @@ description: >
   needed), what didn't (user had to clarify, correct, redirect, or
   request additional analysis), and notable patterns. For each "didn't
   go well" item, proposes a concrete fix — new skill, update to an
-  existing skill, or a memory to save. One-shot report; does not
-  modify skills or memory itself. Trigger: /session-retro, "do a retro",
-  "session retro", "retro this session", "retro the <topic> part".
+  existing skill, or a memory to save. Saves each report under
+  <agent home>/retros/; does not modify skills or memory itself.
+  Cross-session aggregation is the separate `retro-aggregate` skill.
+  Trigger: /session-retro, "do a retro", "session retro", "retro this
+  session", "retro the <topic> part".
 ---
 
 # Session Retro
@@ -25,6 +27,8 @@ change the user can act on.
   "session retro", "how could we improve here").
 - User names a slice ("retro the rebase part") — analyse only that
   slice.
+- User asks to aggregate retros across sessions, or names other
+  sessions to retro → use the `retro-aggregate` skill instead.
 
 Do **not** auto-invoke. The user decides when to retro.
 
@@ -90,16 +94,57 @@ One recommendation **per** §2 bullet. Exactly one of:
 - **New skill** — `<name>` · one-line purpose · trigger phrasing it
   should match · specific gap it closes.
 - **Update skill** — `<skill-name>` · what to add or change · which
-  section of the SKILL.md.
+  section of the SKILL.md · the skill's source repo, if known.
 - **Save memory** — type (user / feedback / project / reference) ·
   one-line content · why.
+
+**Skill over memory.** A rule about how work is done (a process, a
+team convention, a tool recipe) goes into a skill, so agents on other
+machines get it too. Save memory only for personal preferences and
+facts about this machine or environment. Check the visibility of the
+target skill's repo: never propose putting organisation-specific rules
+(internal hosts, ticket systems, team names) into a public repo; name
+the private repo instead, or say none exists.
 - **No action** — one-off that does not generalise, OR a user-side
   prompt hygiene issue (missing info was not inferable). State which
   and why.
 
+Write each recommendation so it can be decided without reopening the
+session: name the user intervention behind it (the `problem`).
+
 Recommendations are proposals. This skill does not create or edit
 skills or write memory — the user picks which recommendations to
 execute and invokes the follow-up work separately.
+
+## Saving the Report
+
+After printing the retro, save it to
+`<agent home>/retros/<YYYY-MM-DD>-<slug>.md` (slug: kebab-case session
+title or topic, ≤ 6 words; add `-2` on collision). `<agent home>` is the
+client's own config dir (`~/.claude`, `~/.codex`, …): sandboxed agents
+can write there but not to a shared `~/.agents`. `retro-aggregate` reads
+every readable `~/.*/retros/`, so this file format is the contract
+between the two skills. Body = the report as printed. Frontmatter:
+
+```yaml
+---
+date: 2026-01-31
+session_id: <$CLAUDE_SESSION_ID or client equivalent; omit if unknown>
+project: <cwd>
+title: <session title or topic>
+proposals:
+  - id: 1
+    target: <skill name | memory | new skill>
+    change: <one line>
+    problem: <one line: the user intervention behind it>
+    severity: H|M|L
+    status: proposed   # proposed | applied | skipped | rejected
+# aggregated: <YYYY-MM-DD>  -- added by retro-aggregate, never by this skill
+---
+```
+
+Do not ask for a session id. When the user later decides on or applies
+a proposal in this session, update its `status` in the file.
 
 ## Analysis Approach
 
@@ -146,6 +191,8 @@ Read the whole session (or the named slice) before writing anything.
 
 ## What This Skill Does Not Do
 
-- No file edits, no commits, no memory writes.
+- No skill edits, no commits, no memory writes; the only files it
+  writes are under `<agent home>/retros/`.
 - No further codebase investigation — works from the transcript.
+- No cross-session work — that is `retro-aggregate`.
 - Does not chain into skill creation. The user does that afterward.

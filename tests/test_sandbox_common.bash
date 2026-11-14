@@ -30,13 +30,13 @@ source "${REPO_ROOT}/tests/lib_test_helpers.bash"
 # RW inside the sandbox, transitively covering the fake ~/.ssh/id_rsa and
 # defeating the credential-fence assertion below. Real $HOME sits outside
 # every file* subpath grant on both OSes.
-FAKE_HOME="$(mktemp -d "${HOME}/ai-wrapper-test.XXXXXX")"
+FAKE_HOME="$(_safe_mktemp_d "${HOME}/ai-wrapper-test.XXXXXX")" || exit 1
 isolate_test_env "${FAKE_HOME}"
 # shellcheck source=../bin/ai_agent_universal_wrapper.bash
 source "${REPO_ROOT}/bin/ai_agent_universal_wrapper.bash"
 mkdir -p "${FAKE_HOME}/project"
 
-cleanup() { rm -rf "${FAKE_HOME}"; }
+cleanup() { _safe_rm_rf "${FAKE_HOME}"; }
 trap cleanup EXIT
 
 echo "== sandbox smoke tests ($(uname -s)) =="

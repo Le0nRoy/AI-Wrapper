@@ -16,12 +16,12 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=./lib_test_helpers.bash
 source "${REPO_ROOT}/tests/lib_test_helpers.bash"
 
-FAKE_HOME="$(mktemp -d "${HOME}/ai-wrapper-test.XXXXXX")"
+FAKE_HOME="$(_safe_mktemp_d "${HOME}/ai-wrapper-test.XXXXXX")" || exit 1
 FAKE_HOME="$(cd "${FAKE_HOME}" && pwd -P)"
 isolate_test_env "${FAKE_HOME}"
 mkdir -p "${FAKE_HOME}/work"
 
-cleanup() { rm -rf "${FAKE_HOME}"; }
+cleanup() { _safe_rm_rf "${FAKE_HOME}"; }
 trap cleanup EXIT
 
 OS="$(uname -s)"
@@ -401,7 +401,7 @@ assert_eq "$([[ -e "${FAKE_HOME}/.gemini/antigravity-cli/settings.json" ]] && ec
 assert_eq "${out##*${NL}}" "NAME=Antigravity CLI" "default account keeps the plain agent name"
 assert_eq "$(_bind '')" "$(_bind 'private')" "empty AGY_ACCOUNT behaves like 'private'"
 
-outside="$(mktemp -d)"
+outside="$(_safe_mktemp_d)" || exit 1
 rm -rf "${FAKE_HOME}/.gemini"
 ln -s "${outside}" "${FAKE_HOME}/.gemini"
 out="$(_bind 'private')"; rc=$?
@@ -540,7 +540,7 @@ STUB
     assert_contains "${out}" "SETTINGS_OK" "antigravity-cli/settings.json is visible inside the sandbox"
     assert_contains "${out}" "SKILL_OK" "orchestrator-mode skill is visible inside the sandbox"
 
-    _fresh_dir="$(mktemp -d "${FAKE_HOME}/work-invalid-XXXXXX")"
+    _fresh_dir="$(_safe_mktemp_d "${FAKE_HOME}/work-invalid-XXXXXX")" || exit 1
     out="$(cd "${_fresh_dir}" && PATH="${agy_path}" AGY_ACCOUNT='x;y' \
         bash "${REPO_ROOT}/bin/executable_agy_wrapper.bash" chat hello </dev/null 2>&1)"
     rc=$?

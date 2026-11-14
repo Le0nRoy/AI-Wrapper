@@ -23,14 +23,14 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${REPO_ROOT}/tests/lib_test_helpers.bash"
 
 REAL_HOME="${HOME}"
-FAKE_HOME="$(mktemp -d "${HOME}/ai-wrapper-test.XXXXXX")"
+FAKE_HOME="$(_safe_mktemp_d "${HOME}/ai-wrapper-test.XXXXXX")" || exit 1
 FAKE_HOME="$(cd "${FAKE_HOME}" && pwd -P)"
 # Outside the real HOME so its PATH entry survives the filter, like a
 # system-wide install would.
-LIVE_DIR="$(mktemp -d)"
+LIVE_DIR="$(_safe_mktemp_d)" || exit 1
 LIVE_MARK="${LIVE_DIR}/reached"
 HOME_LIVE_DIR="${FAKE_HOME}-homebin"
-cleanup() { rm -rf "${FAKE_HOME}" "${LIVE_DIR}" "${HOME_LIVE_DIR}"; }
+cleanup() { _safe_rm_rf "${FAKE_HOME}" "${LIVE_DIR}" "${HOME_LIVE_DIR}"; }
 trap cleanup EXIT
 
 OS="$(uname -s)"

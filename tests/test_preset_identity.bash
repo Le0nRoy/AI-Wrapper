@@ -23,10 +23,10 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=./lib_test_helpers.bash
 source "${REPO_ROOT}/tests/lib_test_helpers.bash"
 
-FAKE_HOME="$(mktemp -d "${HOME}/ai-wrapper-test.XXXXXX")"
+FAKE_HOME="$(_safe_mktemp_d "${HOME}/ai-wrapper-test.XXXXXX")" || exit 1
 FAKE_HOME="$(cd "${FAKE_HOME}" && pwd -P)"
 isolate_test_env "${FAKE_HOME}"
-cleanup() { rm -rf "${FAKE_HOME}"; }
+cleanup() { _safe_rm_rf "${FAKE_HOME}"; }
 trap cleanup EXIT
 
 PRESET_DIR="${XDG_CONFIG_HOME}/ai-wrapper/last-preset"

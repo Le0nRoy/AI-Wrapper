@@ -87,7 +87,9 @@ The sandbox bounds *writes* — it does not bound *reads* or *network*. Be aware
   the file or a parent (WORKDIR, extra dirs, `--bind`) exposes them.
 - `AI_SANDBOX_ALLOW_KEYCHAIN=1` — grant RW on `~/Library/Keychains` and
   lookups of the `com.apple.SecurityServer` / `com.apple.securityd`
-  keychain daemons. **Off by default:** the agent cannot read keychain
+  keychain daemons and of secd (`com.apple.securityd.xpc`, the Data
+  Protection keychain some CLIs such as incident.io's use).
+  **Off by default:** the agent cannot read keychain
   files or ask securityd for items. Claude Code keeps its macOS login in
   the Keychain, so with the default either pass `CLAUDE_CODE_OAUTH_TOKEN`
   (from `claude setup-token`) or set this to `1`. When on, the agent can
@@ -247,12 +249,15 @@ The sandbox bounds *writes* — it does not bound *reads* or *network*. Be aware
   `localhost` direct, so dev servers inside the sandbox still work. The
   proxy refuses (403) any destination that resolves to loopback, private
   LAN (RFC 1918, `100.64.0.0/10` incl. Tailscale, IPv6 ULA), link-local /
-  cloud metadata (`169.254.169.254`), multicast or reserved addresses;
-  at exit the wrapper reports how many requests it refused
+  cloud metadata (`169.254.169.254`), multicast or reserved addresses
+  (private LAN only for names allowed by `AI_SANDBOX_PRIVATE_HOSTS`, see
+  below); at exit the wrapper reports how many requests it refused
   (`AI_SANDBOX_DEBUG=1` lists them). Clients that ignore the proxy
   variables, SSH (`git@github.com:` remotes; use `https://`), raw TCP/UDP
   and LAN or cluster endpoints (`kubectl` to a LAN cluster) do not work.
-  Unix-socket grants (Docker, SSH agent, Tailscale) are unaffected. The
+  Unix-socket grants (Docker, SSH agent, Tailscale) are unaffected.
+  `AI_SANDBOX_PASS_TAILSCALE=1` also lets the proxy reach `*.ts.net`
+  (MagicDNS) names on Tailscale addresses. The
   wrapper needs a `python3` in `/usr/bin`, `/bin` or `/usr/local/bin`
   for the in-sandbox relay; if the proxy cannot start the launch stops
   with the reason.
@@ -301,7 +306,8 @@ and `KIND_EXPERIMENTAL_PROVIDER` is not passed; Kubernetes access is `AI_SANDBOX
   with `Operation not permitted`. The proxy refuses (403) any destination
   that resolves to loopback, private LAN (RFC 1918, `100.64.0.0/10` incl.
   Tailscale, IPv6 ULA), link-local / cloud metadata, multicast or
-  reserved addresses; at exit the wrapper reports how many requests it
+  reserved addresses (private LAN only for names allowed by
+  `AI_SANDBOX_PRIVATE_HOSTS`, see below); at exit the wrapper reports how many requests it
   refused (`AI_SANDBOX_DEBUG=1` lists them). Clients that ignore the proxy
   variables, SSH (`git@github.com:` remotes; use `https://`), raw TCP/UDP,
   LAN or cluster endpoints and dev servers inside the sandbox do not
@@ -326,6 +332,30 @@ and `KIND_EXPERIMENTAL_PROVIDER` is not passed; Kubernetes access is `AI_SANDBOX
   the network or firewall layer if they matter. macOS only — no Linux
   backend.
 <!-- os:end -->
+- `AI_SANDBOX_PRIVATE_HOSTS="corp.example gitlab.corp.example"` — space-
+  or comma-separated host suffixes the egress proxy may connect to when
+  they resolve to private LAN addresses (`10/8`, `172.16/12`,
+  `192.168/16`, `100.64/10`, `fc00::/7`); a suffix also covers its
+  subdomains (`corp.example` allows `git.corp.example`, not
+  `evilcorp.example`). Loopback, link-local / cloud metadata, multicast
+  and reserved addresses stay blocked for these names, and IP addresses
+  typed into a request are never matched. Entries need two or more labels;
+  IP addresses, wildcards (`*.x`) and single labels are ignored with a
+  `WARNING`. Service settings add their own hosts: `AI_SANDBOX_PASS_GITLAB`
+  adds `GITLAB_HOST` / `GL_HOST` and the `hosts:` keys and `api_host:`
+  values of glab's `config.yml` (gitlab.com excluded);
+  `AI_SANDBOX_PASS_KUBE` adds the host names of the kubeconfig `server:`
+  URLs (a server given as an IP address cannot be allowed by name; use
+  its DNS name). `AI_SANDBOX_DEBUG=1` logs every host added. Risk: whoever
+  controls DNS for an allowed name can point it at any other internal
+  address; list only names you trust. Saved in presets like other text
+  settings.
+- `AI_SANDBOX_EXTRA_RW_DIRS` entries that are a git dir or a repository
+  work tree get a WARN: the raw grant has none of the read-only `config` /
+  `hooks/` layers, so the agent can make host git run commands. For a
+  linked worktree, launch from the worktree instead (with
+  `AI_SANDBOX_ALLOW_EXTERNAL_WORKTREES=1` when the repository is outside
+  `$HOME`). The grant itself still applies.
 - `AI_SANDBOX_ALLOW_DOCKER=1` — emit RW rules for
   `/var/run/docker.sock`, `~/.colima`, `~/.docker`. **Off by default.**
   **WARNING:** when on and the Docker / Colima daemon is running, the
@@ -347,6 +377,8 @@ and `KIND_EXPERIMENTAL_PROVIDER` is not passed; Kubernetes access is `AI_SANDBOX
   paths, unlike sandbox-exec. The source path must exist at launch — a
   missing source is a hard error (exit 1), not a silent skip.
 <!-- os:end -->
+- An `AI_SANDBOX_EXTRA_RO_DIRS` entry that contains WORKDIR or an
+  `AI_SANDBOX_EXTRA_RW_DIRS` entry does not mask them; they stay writable.
 
 ### Env scrubbing (Phase 1, 2026-05-24)
 
@@ -483,6 +515,7 @@ account row exists in the Claude, Codex and AGY wrappers):
 - **Share GitLab token + glab config** (`AI_SANDBOX_PASS_GITLAB`): the agent uses glab or pushes to GitLab over HTTPS.
 - **Share OpenAI credentials** (`AI_SANDBOX_PASS_OPENAI`): code the agent runs (tests, scripts, evals) calls the OpenAI API with your key.
 - **Allow unrestricted network access** (`AI_SANDBOX_ALLOW_UNRESTRICTED_NET`): SSH git remotes (git@github.com:...), ssh, scp or rsync; tools that ignore http_proxy; reaching localhost dev servers or databases on the host; LAN or Tailscale hosts; raw TCP/UDP.
+- **Reach internal hosts by name through the proxy** (`AI_SANDBOX_PRIVATE_HOSTS`): the agent must reach internal HTTP(S) APIs, package mirrors, artifact registries or docs on private LAN addresses without opening unrestricted network access.
 - **Mount Docker / Colima socket** (`AI_SANDBOX_ALLOW_DOCKER`): the session must build or run containers (docker build, docker compose up, testcontainers) and you accept the host-root risk.
 - **Share Docker client env vars + ~/.docker** (`AI_SANDBOX_PASS_DOCKER`): the docker client needs your DOCKER_HOST, contexts or registry logins, e.g. pulling private images or docker push.
 - **Account profile** (`CLAUDE_ACCOUNT`, `CODEX_ACCOUNT`, `AGY_ACCOUNT`): this session should run under another login, e.g. a work account kept in `~/.claude-work` (`~/.codex-work`, `~/.gemini-work`).
@@ -640,7 +673,11 @@ particular callback is a zero-behavior-change no-op:
 - `_extra_sandbox_setup` — fires in both backends right before binds bake
   into the SBPL profile (Darwin) / bwrap exec (Linux). Append to
   `binds_rw` / `binds_ro` / `binds_meta` / `env_allowlist` on macOS or to
-  `bwrap_args` on Linux.
+  `bwrap_args` on Linux. It runs before the egress proxy starts, so it can
+  also append host suffixes to `AI_SANDBOX_PRIVATE_HOSTS` (e.g.
+  `AI_SANDBOX_PRIVATE_HOSTS+=" mcp.corp.example"`) to open internal
+  services the plugin needs; the addition applies to that launch only and
+  is never saved to the preset.
 - `_extra_post_menu_setup` — fires after the interactive menu (and on the
   non-interactive path) before dispatch. Mutate `AGENT_FLAGS` /
   `AI_SANDBOX_PROFILE` / any env-var toggle.
@@ -680,7 +717,9 @@ Run setup with:
 
 Key skills:
 - `orchestrator-mode` — Delegated investigation, planning, and implementation
-- `session-retro` — Session analysis and reusable lessons
+- `retro-aggregate` — Merge saved retros across sessions into one decidable backlog and apply approved changes
+- `session-retro` — Session analysis and saved retros
+- `skill-sync` — Keep installed skills in sync with their source repos
 - `caveman` — Concise responses without losing technical substance
 - `ponytail` — Smallest complete solution and evidence-based scope pushback
 - `tortuga` — On-demand use of the existing GitHub runner

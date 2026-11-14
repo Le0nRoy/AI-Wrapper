@@ -343,9 +343,12 @@ Downstream plugins loaded via `AI_WRAPPER_EXTRA_PROFILE` can register
 MCP servers, extra binds, and extra env-scrub passthrough that widen
 the agent's reach beyond what the base sandbox fences. MCP tool
 traffic in particular leaves over the network and uses the user's
-credentials, which the sandbox cannot inspect. See the plugin repo's
-own security notes for the concrete authority any given plugin adds
-and its per-tool allow/deny options.
+credentials, which the sandbox cannot inspect. A plugin's
+`_extra_sandbox_setup` hook can also append host suffixes to
+`AI_SANDBOX_PRIVATE_HOSTS`, opening those names' private LAN addresses
+through the egress proxy for that launch (S-ξ "Private hosts"). See the
+plugin repo's own security notes for the concrete authority any given
+plugin adds and its per-tool allow/deny options.
 
 ### S-γ — `/private/tmp` shared with the host (RESOLVED, 2026-05-24, WS5)
 
@@ -749,6 +752,12 @@ M3, M1, CC-4.
   `AI_WRAPPER_TEST_SYNTHETIC_KEYCHAIN=1` — a keychain created with
   `security create-keychain` in the fake home, named explicitly on every
   call and deleted on exit. The default keychain is never queried.
+  Follow-up: the Data Protection keychain (SecItem with
+  `kSecUseDataProtectionKeychain`) is brokered by secd over
+  `com.apple.securityd.xpc`, which the gate did not name, so such clients
+  (incident.io's `incident mcp`) failed with `errSecNotAvailable`
+  (-25291) even with `ALLOW_KEYCHAIN=1`. The lookup is now inside the
+  same `ALLOW_KEYCHAIN` block; default behaviour is unchanged.
 - **Custom-profile check (CC-4).** U-C / 3.K inspected only the first 80
   non-comment lines and matched `(version 1)`, `(deny default)` and
   `(allow default)` as line prefixes, so `(allow default)` on line 81, after
@@ -803,10 +812,32 @@ curl/git, reqwest, Go and pip only accept `http://HOST:PORT` proxies.
 **Residual / tradeoffs.**
 - Public internet stays reachable through the proxy, so read + network
   exfiltration (top of this file) is unchanged; the proxy filters
-  destinations, not content, and keeps no allowlist.
+  destinations, not content. Its only allowlist is the name-scoped
+  private-range exemption below, off unless the user opts in.
+- **Private hosts** (`--allow-private-host SUFFIX`, wrapper
+  `AI_SANDBOX_PRIVATE_HOSTS`): a request host equal to SUFFIX or ending
+  in `.SUFFIX` may resolve to the private LAN ranges only (10/8,
+  172.16/12, 192.168/16, 100.64/10, fc00::/7, also when embedded in
+  IPv6). Loopback, link-local / metadata, 0/8, multicast and reserved
+  stay blocked for every host; IP-literal request hosts never match;
+  suffixes must be host names with two or more labels (no IPs,
+  wildcards, single labels). The proxy still connects to the address it
+  checked. Besides the user's list, `AI_SANDBOX_PASS_GITLAB` adds the
+  GitLab hosts from `GITLAB_HOST` / `GL_HOST` and glab's `config.yml`
+  (gitlab.com excluded), `AI_SANDBOX_PASS_KUBE` the kubeconfig
+  `server:` host names (IP-literal servers cannot be allowed by name),
+  `AI_SANDBOX_PASS_TAILSCALE` (Linux) `ts.net`, and plugins may append
+  in `_extra_sandbox_setup` (per launch, never saved). Risk: whoever
+  controls DNS for an allowed name (the corporate resolver, a wildcard
+  record, a compromised zone) can point it at any other internal
+  address, so the agent can reach internal services by a name under an
+  allowed suffix. Mitigated by scoping the exemption to the private
+  ranges only and only for suffixes the user opted into; the proxy logs
+  the allowed suffixes at startup (`AI_SANDBOX_DEBUG=1` shows them).
 - Clients that ignore the proxy variables, SSH (git `git@` remotes),
   raw TCP/UDP, DNS lookups inside the sandbox and LAN / Tailscale /
-  cluster endpoints fail; those sessions need the opt-out. Unix-socket
+  cluster endpoints not covered by a private-host suffix fail; those
+  sessions need the opt-out. Unix-socket
   grants (Docker, SSH agent, Tailscale LocalAPI) are unchanged; a host
   Docker daemon reachable through `AI_SANDBOX_ALLOW_DOCKER=1` can still
   run containers on the host network.
@@ -870,7 +901,11 @@ agent and Docker sockets, still gated by their own settings).
   containers with open networking. DNS queries through mDNSResponder
   remain possible (a low-bandwidth channel; the proxy is what connects).
 - Clients that ignore the proxy variables, SSH remotes, raw TCP/UDP and
-  LAN / cluster endpoints fail, as on Linux.
+  LAN / cluster endpoints fail, as on Linux. The same private-host
+  exemption (S-ξ) applies: names from `AI_SANDBOX_PRIVATE_HOSTS`,
+  `AI_SANDBOX_PASS_GITLAB`, `AI_SANDBOX_PASS_KUBE` and plugins may reach
+  private LAN addresses through the proxy; loopback and metadata stay
+  blocked.
 - A custom `AI_SANDBOX_PROFILE` decides its own network rules; the
   wrapper still passes `ALLOW_UNRESTRICTED_NET` / `PROXY_PORT` and starts
   the proxy.
@@ -1104,14 +1139,20 @@ nested in an `--ro-bind` dir is carved out of its write deny. Now:
   overlays, credential overlays and `AI_SANDBOX_EXTRA_RO_DIRS`. Every
   read-only overlay and pin wins wherever it sits relative to the git
   dir. A git dir inside a read-only overlay is then read-only too (git
-  reads work, writes do not).
+  reads work, writes do not). A user RO extra dir strictly above
+  WORKDIR or an RW extra dir is the exception: it mounts before them,
+  so they stay writable and RO binds nested inside them still apply,
+  matching macOS.
 - Seatbelt (`macos_sandbox_exec.bash`): `--under-bind` renders the same
   `(allow file* (subpath ...))` as `--bind`, but is never an exception
   in `_append_ro_deny_rules`. The write denies and pins are rendered
   after every allow and Seatbelt applies the last matching rule, so
-  they win when equal to, inside or containing the git dir. Seatbelt
-  has no other read-only overlays: credential paths are simply not
-  granted, as on bwrap where they are not mounted.
+  they win when equal to, inside or containing the git dir. WORKDIR and
+  RW extra dirs count as nested RW paths too, so an
+  `AI_SANDBOX_EXTRA_RO_DIRS` entry above WORKDIR or an RW extra dir
+  does not mask them; they stay writable. Seatbelt has no other
+  read-only overlays: credential paths are simply not granted, as on
+  bwrap where they are not mounted.
 
 Coverage: `tests/test_git_dirs.bash` (bwrap argv order through a stub
 bwrap, e2e on both OSes with a read-only extra dir inside a git dir and
@@ -1441,7 +1482,8 @@ when that plugin is loaded.
 - **S2** — `(allow network*)`. Closed: Linux isolates the network since
   #77 (S-ξ), macOS since #78 (S-ο); both route HTTP(S) through the
   filtering egress proxy, and `(allow network*)` remains only under
-  `AI_SANDBOX_ALLOW_UNRESTRICTED_NET=1`.
+  `AI_SANDBOX_ALLOW_UNRESTRICTED_NET=1`. Private LAN destinations open
+  only by name for opted-in host suffixes (S-ξ "Private hosts").
 - **S4** — `~/Library/Keychains` RW. Closed by #67 (S-ν): gated on
   `AI_SANDBOX_ALLOW_KEYCHAIN`, default off.
 - **S7** — `~/Library/Caches/claude-cli-nodejs` RW. Today log-only, no
