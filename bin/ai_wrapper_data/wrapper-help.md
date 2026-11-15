@@ -162,16 +162,16 @@ The sandbox bounds *writes* — it does not bound *reads* or *network*. Be aware
   `AI_SANDBOX_ALLOW_GIT_CONFIG`, `AI_SANDBOX_ALLOW_EXTERNAL_WORKTREES`
   and `AI_SANDBOX_BLOCK_LINKED_GIT_DIRS` are retired (see "Retired
   settings" under the per-workdir preset below).
+- `AI_SANDBOX_ALLOW_AGENTS_SKILLS_RW=1` — bind the shared skill sources
+  `~/ai-wrapper/.agents` and `~/.agents` read-write. Off by default (read-only):
+  `setup_skills.bash` copies them into every client's skill directory, so a
+  writable copy lets the agent rewrite skills other sessions load. Red
+  banner.
 <!-- os:linux -->
 - `AI_SANDBOX_ALLOW_BIN_RW=1` — bind `~/bin` read-write. Off by default:
   `~/bin` is read-only, so its programs still run (it is first on the
   sandbox PATH) but cannot be added, replaced or deleted. On, the agent
   can plant programs you later run outside the sandbox. Red banner.
-- `AI_SANDBOX_ALLOW_AGENTS_SKILLS_RW=1` — bind the shared skill source
-  `~/ai-wrapper/.agents` read-write. Off by default (read-only):
-  `setup_skills.bash` copies it into every client's skill directory, so a
-  writable copy lets the agent rewrite skills other sessions load. Red
-  banner.
 - `AI_SANDBOX_ALLOW_ANDROID=1` — bind `~/Android` (SDK, emulator images,
   debug keystores) read-write. Off by default: not visible in the sandbox.
 - `AI_SANDBOX_PASS_TAILSCALE=1` — bind `/run/tailscale/tailscaled.sock`
@@ -519,10 +519,10 @@ account row exists in the Claude, Codex and AGY wrappers):
 - **Mount Docker / Colima socket** (`AI_SANDBOX_ALLOW_DOCKER`): the session must build or run containers (docker build, docker compose up, testcontainers) and you accept the host-root risk.
 - **Share Docker client env vars + ~/.docker** (`AI_SANDBOX_PASS_DOCKER`): the docker client needs your DOCKER_HOST, contexts or registry logins, e.g. pulling private images or docker push.
 - **Account profile** (`CLAUDE_ACCOUNT`, `CODEX_ACCOUNT`, `AGY_ACCOUNT`): this session should run under another login, e.g. a work account kept in `~/.claude-work` (`~/.codex-work`, `~/.gemini-work`).
+- **Allow editing the shared agent-skill source** (`AI_SANDBOX_ALLOW_AGENTS_SKILLS_RW`): developing or editing the shared skills themselves from a session.
 <!-- os:linux -->
 - **Share ~/Android (read-write)** (`AI_SANDBOX_ALLOW_ANDROID`): building or testing Android apps (gradle, adb, the emulator) from the sandbox.
 - **Allow writing ~/bin** (`AI_SANDBOX_ALLOW_BIN_RW`): the task is to add or update your own scripts in ~/bin and you review them before running them.
-- **Allow editing the shared agent-skill source** (`AI_SANDBOX_ALLOW_AGENTS_SKILLS_RW`): developing or editing the shared skills themselves from a session.
 - **Share the whole user runtime dir (read-write)** (`AI_SANDBOX_ALLOW_XDG_RUNTIME_RW`): the agent must reach a session service the named sockets do not cover, e.g. systemctl --user or other D-Bus clients, a GPG agent, the keyring, Wayland or X11 apps, PipeWire audio; prefer the SSH-agent and Docker settings when they suffice.
 - **Allow nested user namespaces** (`AI_SANDBOX_ALLOW_NESTED_USERNS`): the agent runs tools that build their own sandbox or containers inside this one. Needs it: npx playwright test, headless Chrome with its own sandbox, podman run / buildah bud inside the sandbox, bwrap, flatpak run, unshare -Ur. Not needed: docker/podman via the host socket, Chromium --no-sandbox. Each namespace gives the agent namespace-root capabilities and more kernel attack surface. Off: creating a user namespace fails; the launch is refused if bubblewrap cannot enforce that.
 - **Allow terminal input injection (TIOCSTI)** (`AI_SANDBOX_ALLOW_TIOCSTI`): that refusal blocks you: the host lacks python3 or the libseccomp runtime, an unsupported CPU architecture, a bubblewrap too old for --add-seccomp-fd, or the kernel rejects the filter. Usually harmless where sysctl dev.tty.legacy_tiocsti=0 (Linux 6.2+ then refuses TIOCSTI to unprivileged processes).

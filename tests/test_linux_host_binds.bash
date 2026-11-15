@@ -35,7 +35,7 @@ trap cleanup EXIT
 
 RUN_ID="$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
 WORK="${FAKE_HOME}/project-${RUN_ID}"
-mkdir -p "${WORK}" "${FAKE_HOME}/bin" "${FAKE_HOME}/ai-wrapper/.agents/skills" \
+mkdir -p "${WORK}" "${FAKE_HOME}/bin" "${FAKE_HOME}/ai-wrapper/.agents/skills" "${FAKE_HOME}/.agents/skills" \
     "${FAKE_HOME}/.kind" "${FAKE_HOME}/kind_dot_kube" "${FAKE_HOME}/.kube"
 echo "kind-cred-${RUN_ID}" >"${FAKE_HOME}/kind_dot_kube/config"
 echo "kube-cred-${RUN_ID}" >"${FAKE_HOME}/.kube/config"
@@ -98,6 +98,10 @@ assert_eq "$(_yes _has_bind "${argv}" --ro-bind "${H}/ai-wrapper/.agents" "${H}/
     "~/ai-wrapper/.agents is --ro-bind by default"
 assert_eq "$(_yes _has_bind "${argv}" --bind "${H}/ai-wrapper/.agents" "${H}/ai-wrapper/.agents")" no \
     "~/ai-wrapper/.agents is not --bind by default"
+assert_eq "$(_yes _has_bind "${argv}" --ro-bind "${H}/.agents" "${H}/.agents")" yes \
+    "~/.agents is --ro-bind by default"
+assert_eq "$(_yes _has_bind "${argv}" --bind "${H}/.agents" "${H}/.agents")" no \
+    "~/.agents is not --bind by default"
 assert_not_contains "${argv}" "/run/tailscale" "Tailscale socket absent by default"
 assert_not_contains "${argv}" "${H}/.kind" "~/.kind never mounted"
 assert_not_contains "${argv}" "${H}/kind_dot_kube" "~/kind_dot_kube never mounted"
@@ -129,6 +133,8 @@ assert_eq "$(_yes _has_bind "${argv}" --ro-bind "${H}/ai-wrapper/.agents" "${H}/
 argv="$(_argv AI_SANDBOX_ALLOW_AGENTS_SKILLS_RW=1)"
 assert_eq "$(_yes _has_bind "${argv}" --bind "${H}/ai-wrapper/.agents" "${H}/ai-wrapper/.agents")" yes \
     "AI_SANDBOX_ALLOW_AGENTS_SKILLS_RW=1 binds skills RW"
+assert_eq "$(_yes _has_bind "${argv}" --bind "${H}/.agents" "${H}/.agents")" yes \
+    "AI_SANDBOX_ALLOW_AGENTS_SKILLS_RW=1 binds ~/.agents RW"
 assert_eq "$(_yes _has_bind "${argv}" --ro-bind "${H}/bin" "${H}/bin")" yes \
     "AI_SANDBOX_ALLOW_AGENTS_SKILLS_RW=1 leaves ~/bin RO (separate control)"
 argv="$(_argv AI_SANDBOX_ALLOW_BIN_RW=yes)"

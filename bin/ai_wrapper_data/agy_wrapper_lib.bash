@@ -1227,57 +1227,7 @@ _agent_resume_args() {
 # relying on symlinks outside the sandbox mount.
 _agy_sync_profile_skills() {
     local profile_dir="${1}"
-    local skills_src="${HOME}/ai-wrapper/.agents/skills"
-    if [[ ! -d "${skills_src}" ]]; then
-        local repo_skills
-        repo_skills="$(_realpath "${WRAPPER_DATA_DIR}/../../dot_agents/skills" 2>/dev/null)" || repo_skills=""
-        [[ -n "${repo_skills}" && -d "${repo_skills}" ]] && skills_src="${repo_skills}"
-    fi
-    [[ -d "${skills_src}" ]] || return 0
-
-    local config_dir="${profile_dir}/config"
-    local skills_dst="${config_dir}/skills"
-    local marker=".setup_skills_managed"
-
-    _wrapper_check_config_symlink "${config_dir}" || return 1
-    if [[ -e "${config_dir}" && ! -d "${config_dir}" ]]; then
-        echo "ERROR: ${config_dir} exists but is not a directory." >&2
-        return 1
-    fi
-    _wrapper_check_config_symlink "${skills_dst}" || return 1
-    if [[ -e "${skills_dst}" && ! -d "${skills_dst}" ]]; then
-        echo "ERROR: ${skills_dst} exists but is not a directory." >&2
-        return 1
-    fi
-    mkdir -p "${skills_dst}" || return 1
-
-    local skill_path name src dest
-    for skill_path in "${skills_src}"/*/; do
-        [[ -d "${skill_path}" ]] || continue
-        name="$(basename "${skill_path}")"
-        src="${skill_path%/}"
-        dest="${skills_dst}/${name}"
-
-        # Never clobber symlinks or user-managed skill directories (those
-        # without our marker file).
-        if [[ -L "${dest}" ]]; then
-            continue
-        elif [[ -d "${dest}" ]]; then
-            [[ -f "${dest}/${marker}" ]] || continue
-        elif [[ -e "${dest}" ]]; then
-            continue
-        fi
-
-        rm -rf "${dest}.new" 2>/dev/null || true
-        if cp -a "${src}" "${dest}.new" 2>/dev/null; then
-            printf '%s\n' "${src}" >"${dest}.new/${marker}"
-            rm -rf "${dest}" 2>/dev/null || true
-            mv -f "${dest}.new" "${dest}" 2>/dev/null || rm -rf "${dest}.new" 2>/dev/null
-        else
-            rm -rf "${dest}.new" 2>/dev/null || true
-        fi
-    done
-    return 0
+    _wrapper_sync_client_skills "${profile_dir}/config/skills"
 }
 
 # ===== PERSISTENT CONTROLS (#48 / #87) =====

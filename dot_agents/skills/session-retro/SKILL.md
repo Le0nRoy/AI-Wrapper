@@ -96,12 +96,16 @@ One recommendation **per** §2 bullet. Exactly one of:
 - **Update skill** — `<skill-name>` · what to add or change · which
   section of the SKILL.md · the skill's source repo, if known.
 - **Save memory** — type (user / feedback / project / reference) ·
-  one-line content · why.
+  one-line content · why. Prefer the provider-agnostic `second-brain`
+  at `${HERMES_SECOND_BRAIN_DIR:-$HOME/.hermes/second-brain}`
+  (`RULES.md` / `INDEX.md`) over provider-specific memory (`MEMORY.md`)
+  in every session.
 
 **Skill over memory.** A rule about how work is done (a process, a
 team convention, a tool recipe) goes into a skill, so agents on other
 machines get it too. Save memory only for personal preferences and
-facts about this machine or environment. Check the visibility of the
+facts about this machine or environment (routed to `second-brain` by
+default rather than provider-locked `MEMORY.md`). Check the visibility of the
 target skill's repo: never propose putting organisation-specific rules
 (internal hosts, ticket systems, team names) into a public repo; name
 the private repo instead, or say none exists.
