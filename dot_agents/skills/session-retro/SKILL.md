@@ -97,7 +97,7 @@ One recommendation **per** §2 bullet. Exactly one of:
   section of the SKILL.md · the skill's source repo, if known.
 - **Save memory** — type (user / feedback / project / reference) ·
   one-line content · why. Prefer the provider-agnostic `second-brain`
-  at `/Data/Everything/ProgrammingWorkspace/hermes/second-brain`
+  at `${HERMES_SECOND_BRAIN_DIR:-$HOME/.hermes/second-brain}`
   (`RULES.md` / `INDEX.md`) over provider-specific memory (`MEMORY.md`)
   in every session.
 

@@ -616,12 +616,9 @@ _wrapper_sync_client_skills() {
         skill_sources+=("${primary_src}")
     else
         local repo_skills="${WRAPPER_DATA_DIR}/../../dot_agents/skills" repo_real=""
-        if [[ ! -L "${repo_skills}" && -d "${repo_skills}" ]]; then
-            repo_real="$(_realpath "${repo_skills}" 2>/dev/null)" || repo_real=""
-            if [[ -n "${repo_real}" && -d "${repo_real}" && ! -L "${repo_real}" ]]; then
-                primary_real="${repo_real}"
-                skill_sources+=("${repo_real}")
-            fi
+        if [[ ! -L "${repo_skills}" ]] && repo_real="$(_realpath "${repo_skills}" 2>/dev/null)" && [[ -d "${repo_real}" ]]; then
+            primary_real="${repo_real}"
+            skill_sources+=("${repo_real}")
         fi
     fi
     local user_src="${HOME}/.agents/skills" user_real=""
@@ -645,6 +642,7 @@ _wrapper_sync_client_skills() {
             src="${skill_path%/}"
             [[ ! -L "${src}" && -f "${src}/SKILL.md" && ! -L "${src}/SKILL.md" ]] || continue
             name="$(basename "${src}")"
+            [[ "${src_dir}" != "${skill_sources[0]}" && -d "${skill_sources[0]}/${name}" ]] && continue
             case " ${_WRAPPER_RETIRED_SKILLS[*]} " in *" ${name} "*) continue ;; esac
             dest="${skills_dst}/${name}"
             if [[ -L "${dest}" ]]; then continue
@@ -655,10 +653,9 @@ _wrapper_sync_client_skills() {
             rm -rf "${tmp_stage}" 2>/dev/null || true
             if cp -a "${src}" "${tmp_stage}" 2>/dev/null && printf '%s\n' "${src}" >"${tmp_stage}/${marker}" 2>/dev/null; then
                 rm -rf "${dest}" 2>/dev/null || true
-                mv -f "${tmp_stage}" "${dest}" 2>/dev/null || rm -rf "${tmp_stage}" 2>/dev/null || true
-            else
-                rm -rf "${tmp_stage}" 2>/dev/null || true
+                mv -f "${tmp_stage}" "${dest}" 2>/dev/null || true
             fi
+            rm -rf "${tmp_stage}" 2>/dev/null || true
         done
     done
     return 0
@@ -883,7 +880,7 @@ _AI_SETTINGS_LIST=(
     "AI_SANDBOX_ALLOW_SENSITIVE_WORKDIR|bool|0|red|Allow launch from sensitive dirs|Permits launching from \$HOME itself, a dotfile dir directly under \$HOME${_ai_sensitive_workdir_extra}${_ai_sensitive_workdir_system} — the write fence then grants RW there, which likely exposes credentials. Use when: you deliberately let the agent edit your dotfiles or \$HOME itself (e.g. maintaining ~/.config) and accept that write fence.|sensitive"
     "AI_SANDBOX_ALLOW_SETTINGS|bool|0|red|Allow editing client settings and skills|Leaves the client profile's settings, skills, plugins, hooks and prompts writable (advanced: maintaining them from a session). The agent can then change how later sessions, also unsandboxed ones, behave. Off: the ones present at launch are read-only and their directories pinned; controls inside WORKDIR stay editable. Use when: you edit the client's own settings, skills, plugins or hooks from a session (e.g. developing a skill in place) and review the result.|sensitive"
     "AI_SANDBOX_ALLOW_BIN_RW|bool|0|red|Allow writing ~/bin|Binds ~/bin RW instead of read-only. ~/bin is first on the sandbox PATH and on yours, so the agent can plant or replace programs you later run outside the sandbox. Off: ~/bin stays usable (read and run) but not writable. Use when: the task is to add or update your own scripts in ~/bin and you review them before running them.|sensitive|linux"
-    "AI_SANDBOX_ALLOW_AGENTS_SKILLS_RW|bool|0|red|Allow editing the shared agent-skill source|Binds ~/ai-wrapper/.agents RW instead of read-only. setup_skills copies it into every client's skill dir, so the agent can rewrite skills other clients and sessions load. Off: skills stay readable but not writable. Use when: developing or editing the shared skills themselves from a session.|sensitive|linux"
+    "AI_SANDBOX_ALLOW_AGENTS_SKILLS_RW|bool|0|red|Allow editing the shared agent-skill source|Binds ~/ai-wrapper/.agents and ~/.agents RW instead of read-only. setup_skills copies it into every client's skill dir, so the agent can rewrite skills other clients and sessions load. Off: skills stay readable but not writable. Use when: developing or editing the shared skills themselves from a session.|sensitive"
     "AI_SANDBOX_ALLOW_XDG_RUNTIME_RW|bool|0|red|Share the whole user runtime dir (read-write)|Binds your \$XDG_RUNTIME_DIR (usually /run/user/UID) RW after checking it is your own, non-shared directory. Every socket in it becomes reachable with your user ID — D-Bus session bus, systemd --user, keyring, display and audio servers, SSH/GPG agents, rootless Docker/Podman — whatever the SSH-agent and Docker settings say; what the agent can do depends on each service and may include running programs outside the sandbox. Off: the sandbox gets a private, empty runtime dir with only the sockets you enable. Use when: the agent must reach a session service the named sockets do not cover, e.g. systemctl --user or other D-Bus clients, a GPG agent, the keyring, Wayland or X11 apps, PipeWire audio; prefer the SSH-agent and Docker settings when they suffice.|sensitive|linux"
     "AI_SANDBOX_ALLOW_NESTED_USERNS|bool|0|red|Allow nested user namespaces|Lets the agent create its own user namespaces inside the sandbox (needed by nested bubblewrap/Flatpak, Chromium or Playwright without --no-sandbox, and rootless container engines run inside the sandbox; Docker/Podman through a shared host socket work without it). Use when: the agent runs tools that build their own sandbox or containers inside this one. Needs it: npx playwright test, headless Chrome with its own sandbox, podman run / buildah bud inside the sandbox, bwrap, flatpak run, unshare -Ur. Not needed: docker/podman via the host socket, Chromium --no-sandbox. Each namespace gives the agent namespace-root capabilities and more kernel attack surface. Off: creating a user namespace fails; the launch is refused if bubblewrap cannot enforce that.|sensitive|linux"
     "AI_SANDBOX_ALLOW_TIOCSTI|bool|0|yellow|Allow terminal input injection (TIOCSTI)|Launches without the seccomp filter that blocks ioctl(TIOCSTI) and ioctl(TIOCLINUX). On kernels that still allow TIOCSTI the agent can then type commands into your terminal that run after the session ends. Off: the filter is built with python3 + libseccomp and the launch is refused if it cannot be; the terminal, /dev/tty, resize and Ctrl+C work as usual. Use when: that refusal blocks you: the host lacks python3 or the libseccomp runtime, an unsupported CPU architecture, a bubblewrap too old for --add-seccomp-fd, or the kernel rejects the filter. Usually harmless where sysctl dev.tty.legacy_tiocsti=0 (Linux 6.2+ then refuses TIOCSTI to unprivileged processes).|sensitive|linux"

@@ -301,23 +301,31 @@ while IFS= read -r -d '' doc; do
 done < <(find "${REPO_ROOT}/dot_agents/skills" -name '*.md' -print0)
 
 # User-installed skills in ~/.agents/skills are also synced by setup_skills.bash
-mkdir -p "${FAKE_HOME}/.agents/skills/user-custom"
+mkdir -p "${FAKE_HOME}/.agents/skills/user-custom" "${FAKE_HOME}/.agents/skills/caveman"
 echo "# user custom skill" > "${FAKE_HOME}/.agents/skills/user-custom/SKILL.md"
+echo "# user override attempt" > "${FAKE_HOME}/.agents/skills/caveman/SKILL.md"
 HOME="${FAKE_HOME}" "${BASH}" "${SETUP}" >/dev/null
 for destination in "${destinations[@]}"; do
     [[ -f "${FAKE_HOME}/${destination}/user-custom/SKILL.md" ]] \
         || fail "user skill missing in ${destination}"
     [[ "$(cat "${FAKE_HOME}/${destination}/user-custom/.setup_skills_managed")" == "${FAKE_HOME}/.agents/skills/user-custom" ]] \
         || fail "user skill marker wrong in ${destination}"
-    checks=$((checks + 2))
+    [[ "$(cat "${FAKE_HOME}/${destination}/caveman/SKILL.md")" != "# user override attempt" ]] \
+        || fail "setup_skills overwritten repo skill with user skill in ${destination}"
+    [[ "$(cat "${FAKE_HOME}/${destination}/caveman/.setup_skills_managed")" == "${SRC}/caveman" ]] \
+        || fail "setup_skills marker wrong for repo skill in ${destination}"
+    checks=$((checks + 4))
 done
 
 # Wrapper launch auto-syncs skills (repo + ~/.agents/skills) for all clients
 (
     export HOME="${FAKE_HOME}/launch-sync"
-    mkdir -p "${HOME}/ai-wrapper/.agents/skills/repo-skill" "${HOME}/.agents/skills/user-skill"
+    mkdir -p "${HOME}/ai-wrapper/.agents/skills/repo-skill" "${HOME}/.agents/skills/user-skill" \
+        "${HOME}/ai-wrapper/.agents/skills/precedence-skill" "${HOME}/.agents/skills/precedence-skill"
     echo "repo" > "${HOME}/ai-wrapper/.agents/skills/repo-skill/SKILL.md"
     echo "user" > "${HOME}/.agents/skills/user-skill/SKILL.md"
+    echo "repo-wins" > "${HOME}/ai-wrapper/.agents/skills/precedence-skill/SKILL.md"
+    echo "user-loses" > "${HOME}/.agents/skills/precedence-skill/SKILL.md"
     mkdir -p "${HOME}/.claude/skills/unmanaged"
     echo "keep" > "${HOME}/.claude/skills/unmanaged/SKILL.md"
     WRAPPER_DATA_DIR="${REPO_ROOT}/bin/ai_wrapper_data"
@@ -335,10 +343,14 @@ done
     for dir in ".claude/skills" ".codex/skills" ".copilot/skills" ".gemini/config/skills"; do
         [[ -f "${HOME}/${dir}/repo-skill/SKILL.md" ]] || fail "auto-sync missing repo-skill in ${dir}"
         [[ -f "${HOME}/${dir}/user-skill/SKILL.md" ]] || fail "auto-sync missing user-skill in ${dir}"
+        [[ "$(cat "${HOME}/${dir}/precedence-skill/SKILL.md")" == "repo-wins" ]] \
+            || fail "auto-sync allowed user skill to overwrite repo skill in ${dir}"
+        [[ "$(cat "${HOME}/${dir}/precedence-skill/.setup_skills_managed")" == "${HOME}/ai-wrapper/.agents/skills/precedence-skill" ]] \
+            || fail "auto-sync marker pointed to user skill in ${dir}"
         [[ "${WRAPPER_FLAGS[*]}" == *"--ro-bind ${HOME}/${dir}"* ]] || fail "missing --ro-bind for ${dir}"
     done
     [[ "$(cat "${HOME}/.claude/skills/unmanaged/SKILL.md")" == "keep" ]] || fail "unmanaged skill clobbered"
 ) || exit 1
-checks=$((checks + 13))
+checks=$((checks + 21))
 
 echo "${checks} skill destination checks passed"

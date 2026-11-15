@@ -206,7 +206,7 @@ build/deployment verification (`make build-all && make bridge-up`, verify
 
 ## Provider-agnostic memory
 
-Prefer `/Data/Everything/ProgrammingWorkspace/hermes/second-brain` over
+Prefer `${HERMES_SECOND_BRAIN_DIR:-$HOME/.hermes/second-brain}` over
 provider-specific memory in every session when reading or persisting
 cross-session facts, decisions, and environment rules.
 

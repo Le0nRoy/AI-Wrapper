@@ -60,7 +60,7 @@ heading text anywhere in the file.
 3. Choose the target with the `session-retro` rule: process rules go to
    skills, personal or environment facts go to memory (preferring the
    provider-agnostic `second-brain` at
-   `/Data/Everything/ProgrammingWorkspace/hermes/second-brain` (`RULES.md`
+   `${HERMES_SECOND_BRAIN_DIR:-$HOME/.hermes/second-brain}` (`RULES.md`
    / `INDEX.md`) over provider-specific `MEMORY.md` in every session).
    Retarget a proposal when its retro picked memory for a process rule,
    or provider-specific `MEMORY.md` for a shared environment/project fact.
@@ -123,7 +123,7 @@ proposed change, and a recommendation (approve, decline, or retarget).
   scratchpad and give the user one copy command. Don't try other
   routes around the block.
 - **Memory.** Persist approved memory proposals to the provider-agnostic
-  `second-brain` (`/Data/Everything/ProgrammingWorkspace/hermes/second-brain`,
+  `second-brain` (`${HERMES_SECOND_BRAIN_DIR:-$HOME/.hermes/second-brain}`,
   updating its `INDEX.md` and `log.md` per `RULES.md`) rather than
   provider-specific `MEMORY.md`. When a rule moves into a skill, delete
   or slim the memories that held it, and repoint links to them.
