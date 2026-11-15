@@ -189,6 +189,13 @@ for name in '"com.apple.SecurityServer"' '"com.apple.securityd"' '"com.apple.sec
     assert_eq "${ok}" "1" "${name} granted only under ALLOW_KEYCHAIN"
 done
 assert_contains "${SB}" '(global-name "com.apple.trustd")' "trustd (TLS evaluation) stays unconditionally reachable"
+out="$(_dryrun)"
+assert_contains "${out}" "ALLOW_AGENTS_SKILLS_RW=0" "AI_SANDBOX_ALLOW_AGENTS_SKILLS_RW defaults to ALLOW_AGENTS_SKILLS_RW=0"
+out="$(AI_SANDBOX_ALLOW_AGENTS_SKILLS_RW=1 _dryrun)"
+assert_contains "${out}" "ALLOW_AGENTS_SKILLS_RW=1" "AI_SANDBOX_ALLOW_AGENTS_SKILLS_RW=1 passes ALLOW_AGENTS_SKILLS_RW=1"
+assert_contains "${SB}" '(subpath (string-append (param "HOME_DIR") "/ai-wrapper/.agents"))' "Seatbelt profile grants read on ~/ai-wrapper/.agents"
+assert_contains "${SB}" '(subpath (string-append (param "HOME_DIR") "/.agents"))' "Seatbelt profile grants read on ~/.agents"
+assert_contains "${SB}" '(when (equal? (param "ALLOW_AGENTS_SKILLS_RW") "1")' "Seatbelt profile gates write to .agents on ALLOW_AGENTS_SKILLS_RW"
 
 # ---------------------------------------------------------------------------
 if [[ "${OS}" != "Darwin" ]]; then

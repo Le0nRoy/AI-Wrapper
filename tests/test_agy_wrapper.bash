@@ -363,9 +363,13 @@ assert_eq "${skill_synced}" "1" "orchestrator-mode skill synced into named profi
 mkdir -p "${FAKE_HOME}/.gemini-alt/config/skills/orchestrator-mode"
 rm -f "${FAKE_HOME}/.gemini-alt/config/skills/orchestrator-mode/.setup_skills_managed"
 echo "custom-user-skill" >"${FAKE_HOME}/.gemini-alt/config/skills/orchestrator-mode/SKILL.md"
+mkdir -p "${FAKE_HOME}/.agents/skills/user-extra"
+echo "user-extra-skill" >"${FAKE_HOME}/.agents/skills/user-extra/SKILL.md"
 _bind 'alt' Linux >/dev/null
 assert_eq "$(cat "${FAKE_HOME}/.gemini-alt/config/skills/orchestrator-mode/SKILL.md")" "custom-user-skill" \
     "unmanaged skill directory is not overwritten"
+assert_eq "$(cat "${FAKE_HOME}/.gemini-alt/config/skills/user-extra/SKILL.md" 2>/dev/null)" "user-extra-skill" \
+    "user-installed skill in ~/.agents/skills synced into named profile's config/skills/"
 
 out="$(_bind 'private')"; rc=$?
 assert_eq "${rc}" "0" "default account binds without any settings.json (${out})"

@@ -515,7 +515,7 @@ _WRAPPER_CONFIG_SYMLINK_DENIED=(
     "Library/Application Support/glab-cli" Library/Keychains Library/LaunchAgents
     .bashrc .bash_profile .bash_login .bash_logout .profile
     .zshrc .zshenv .zprofile .zlogin .zlogout .config/fish
-    bin ai-wrapper/.agents
+    bin ai-wrapper/.agents .agents
 )
 # Broad roots refused even when nothing listed above exists below them.
 _WRAPPER_CONFIG_SYMLINK_BROAD_ROOTS=(
@@ -592,6 +592,76 @@ _wrapper_check_config_symlink() {
         echo "ERROR: ${p} is a ${kind} into or above a credential location or host-executed path (${home}/${entry#denied }; resolves to ${resolved}). Refusing — the bind would grant RW on it." >&2
     fi
     return 1
+}
+
+_WRAPPER_RETIRED_SKILLS=(
+    brainstorming Find-Skills plan-review executing-plans find-skills
+    finishing-a-development-branch implementing-tasks planning-tests
+    requesting-code-review subagent-driven-development updating-documentation
+    using-git-worktrees writing-automated-tests writing-plans
+)
+
+_wrapper_sync_client_skills() {
+    local skills_dst="${1%/}"
+    [[ -n "${skills_dst}" ]] || return 0
+    local parent_dir
+    parent_dir="$(dirname "${skills_dst}")"
+    [[ -L "${parent_dir}" || -L "${skills_dst}" ]] && return 0
+    [[ ( -e "${parent_dir}" && ! -d "${parent_dir}" ) || ( -e "${skills_dst}" && ! -d "${skills_dst}" ) ]] && return 0
+
+    local -a skill_sources=()
+    local primary_src="${HOME}/ai-wrapper/.agents/skills" primary_real=""
+    if [[ ! -L "${HOME}/ai-wrapper/.agents" && ! -L "${primary_src}" && -d "${primary_src}" ]]; then
+        primary_real="$(_realpath "${primary_src}" 2>/dev/null)" || primary_real="${primary_src}"
+        skill_sources+=("${primary_src}")
+    else
+        local repo_skills="${WRAPPER_DATA_DIR}/../../dot_agents/skills" repo_real=""
+        if [[ ! -L "${repo_skills}" && -d "${repo_skills}" ]]; then
+            repo_real="$(_realpath "${repo_skills}" 2>/dev/null)" || repo_real=""
+            if [[ -n "${repo_real}" && -d "${repo_real}" && ! -L "${repo_real}" ]]; then
+                primary_real="${repo_real}"
+                skill_sources+=("${repo_real}")
+            fi
+        fi
+    fi
+    local user_src="${HOME}/.agents/skills" user_real=""
+    if [[ ! -L "${HOME}/.agents" && ! -L "${user_src}" && -d "${user_src}" ]]; then
+        user_real="$(_realpath "${user_src}" 2>/dev/null)" || user_real="${user_src}"
+        if [[ -z "${primary_real}" || "${user_real%/}" != "${primary_real%/}" ]]; then
+            skill_sources+=("${user_src}")
+        fi
+    fi
+    [[ ${#skill_sources[@]} -gt 0 ]] || return 0
+    mkdir -p "${skills_dst}" 2>/dev/null || return 0
+
+    local marker=".setup_skills_managed" retired dest src_dir skill_path name src tmp_stage
+    for retired in "${_WRAPPER_RETIRED_SKILLS[@]}"; do
+        dest="${skills_dst}/${retired}"
+        [[ -d "${dest}" && ! -L "${dest}" && -f "${dest}/${marker}" ]] && rm -rf "${dest}" 2>/dev/null || true
+    done
+    for src_dir in "${skill_sources[@]}"; do
+        for skill_path in "${src_dir}"/*/; do
+            [[ -d "${skill_path}" ]] || continue
+            src="${skill_path%/}"
+            [[ ! -L "${src}" && -f "${src}/SKILL.md" && ! -L "${src}/SKILL.md" ]] || continue
+            name="$(basename "${src}")"
+            case " ${_WRAPPER_RETIRED_SKILLS[*]} " in *" ${name} "*) continue ;; esac
+            dest="${skills_dst}/${name}"
+            if [[ -L "${dest}" ]]; then continue
+            elif [[ -d "${dest}" ]]; then [[ -f "${dest}/${marker}" ]] || continue
+            elif [[ -e "${dest}" ]]; then continue
+            fi
+            tmp_stage="${skills_dst}/.tmp_${name}_$$"
+            rm -rf "${tmp_stage}" 2>/dev/null || true
+            if cp -a "${src}" "${tmp_stage}" 2>/dev/null && printf '%s\n' "${src}" >"${tmp_stage}/${marker}" 2>/dev/null; then
+                rm -rf "${dest}" 2>/dev/null || true
+                mv -f "${tmp_stage}" "${dest}" 2>/dev/null || rm -rf "${tmp_stage}" 2>/dev/null || true
+            else
+                rm -rf "${tmp_stage}" 2>/dev/null || true
+            fi
+        done
+    done
+    return 0
 }
 
 # ===== CLIENT PERSISTENT CONTROLS (#48 / #86) =====

@@ -202,19 +202,18 @@ for client in ${CLIENTS}; do
     assert_eq "$(_overlays_last "${out}")" "1" "${client}: no RW bind or pin mounted over a read-only overlay"
 done
 
-# Profile without any control (fresh machine): base pinned, nothing RO.
+# Profile without any prior control (fresh machine): base pinned, synced skills RO.
 for client in ${CLIENTS}; do
     _reset_home
     out="$(_flags "${client}" Linux)"
     assert_contains "${out}" "rc=0" "${client}: fresh profile still launches"
-    if [[ "${client}" == "agy" ]]; then
-        # _bind_agy_account syncs the managed skills into config/skills
-        # first, so that is the one control present.
-        assert_eq "$(_count_line "${out}" --ro-bind)" "1" "agy: fresh profile has one read-only overlay"
-        assert_contains "${out}" "$(_ro3 "${HOME}/.gemini/config/skills")" "agy: ... the synced config/skills"
-    else
-        assert_not_contains "${out}" "--ro-bind" "${client}: fresh profile adds no read-only overlay"
-    fi
+    assert_eq "$(_count_line "${out}" --ro-bind)" "1" "${client}: fresh profile has one read-only overlay (synced skills)"
+    case "${client}" in
+        claude)  assert_contains "${out}" "$(_ro3 "${HOME}/.claude/skills")" "claude: ... the synced skills" ;;
+        codex)   assert_contains "${out}" "$(_ro3 "${HOME}/.codex/skills")" "codex: ... the synced skills" ;;
+        copilot) assert_contains "${out}" "$(_ro3 "${HOME}/.copilot/skills")" "copilot: ... the synced skills" ;;
+        agy)     assert_contains "${out}" "$(_ro3 "${HOME}/.gemini/config/skills")" "agy: ... the synced config/skills" ;;
+    esac
 done
 
 echo "-- macOS shape (single-arg flags)"

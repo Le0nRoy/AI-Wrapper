@@ -1043,13 +1043,13 @@ _run_sandboxed_agent_linux() {
     # paths are skipped, never created.
     local -a protected_home_binds=()
     local _p_dir _p_rw _p_var
-    for _p_dir in bin ai-wrapper/.agents; do
+    for _p_dir in bin ai-wrapper/.agents .agents; do
         if [[ "${_p_dir}" == "bin" ]]; then
             _p_rw="${allow_bin_rw}"; _p_var=AI_SANDBOX_ALLOW_BIN_RW
         else
             _p_rw="${allow_skills_rw}"; _p_var=AI_SANDBOX_ALLOW_AGENTS_SKILLS_RW
         fi
-        [[ -d "${HOME_DIR}/${_p_dir}" ]] || continue
+        [[ -d "${HOME_DIR}/${_p_dir}" && ! -L "${HOME_DIR}/${_p_dir}" ]] || continue
         if [[ "${_p_rw}" == "1" ]]; then
             echo_log "WARNING" "[$agent_name] ${_p_var}=1: ~/${_p_dir} is writable inside the sandbox; the agent can change files the host runs or loads outside it."
             protected_home_binds+=(--bind "${HOME_DIR}/${_p_dir}" "${HOME_DIR}/${_p_dir}")

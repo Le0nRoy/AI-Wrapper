@@ -96,6 +96,16 @@ if [[ ! -d "${SKILLS_SRC}" ]]; then
     exit 1
 fi
 
+USER_SKILLS_SRC="${HOME}/.agents/skills"
+SKILLS_SRCS=("${SKILLS_SRC}")
+if [[ ! -L "${HOME}/.agents" && ! -L "${USER_SKILLS_SRC}" && -d "${USER_SKILLS_SRC}" ]]; then
+    _src_real="$(cd "${SKILLS_SRC}" 2>/dev/null && pwd -P)" || _src_real="${SKILLS_SRC}"
+    _user_real="$(cd "${USER_SKILLS_SRC}" 2>/dev/null && pwd -P)" || _user_real="${USER_SKILLS_SRC}"
+    if [[ "${_user_real%/}" != "${_src_real%/}" ]]; then
+        SKILLS_SRCS+=("${USER_SKILLS_SRC}")
+    fi
+fi
+
 # Prefer rsync to fill the staging copy; fall back to cp when rsync is
 # missing (uncommon on macOS but cheap to support).
 have_rsync=0
@@ -221,9 +231,11 @@ for skills_dst in "${SKILLS_DSTS[@]}"; do
         continue
     fi
 
-    for skill_path in "${SKILLS_SRC}"/*/; do
-        [[ -d "${skill_path}" ]] || continue
+    for skills_src_root in "${SKILLS_SRCS[@]}"; do
+    for skill_path in "${skills_src_root}"/*/; do
+        [[ -d "${skill_path}" && ! -L "${skill_path%/}" ]] || continue
         name="$(basename "${skill_path}")"
+        [[ "${skills_src_root}" != "${SKILLS_SRC}" && -d "${SKILLS_SRC}/${name}" ]] && continue
         # Reachable in dry mode or after a failed archive; never redeploy.
         [[ " ${RETIRED_SKILLS[*]} " == *" ${name} "* ]] && continue
         src="${skill_path%/}"
@@ -272,6 +284,7 @@ for skills_dst in "${SKILLS_DSTS[@]}"; do
             echo "COPY    ${name}: ${src} -> ${dest}"
             deploy copied "${src}" "${dest}"
         fi
+    done
     done
 done
 

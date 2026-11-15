@@ -164,6 +164,7 @@ _bind_codex_account() {
     # Bind the resolved path, never a (checked) symlink unresolved.
     local bind_src
     bind_src="$(_realpath "${codex_dir}")" || bind_src="${codex_dir}"
+    _wrapper_sync_client_skills "${bind_src}/skills"
     _wrapper_add_bind "${bind_src}" "${HOME}/.codex"
     _wrapper_protect_client_controls "codex" "${bind_src}" "${HOME}/.codex" \
         "${_CODEX_CLIENT_CONTROLS[@]}" || exit 1

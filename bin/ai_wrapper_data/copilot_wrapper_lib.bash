@@ -78,6 +78,9 @@ _copilot_bind_config_dirs() {
     _copilot_bind_config_path "${HOME}/.copilot" required || return 1
     _copilot_bind_config_path "${HOME}/.config/github-copilot" || return 1
     _copilot_bind_config_path "${HOME}/.local/share/copilot" || return 1
+    local copilot_dir
+    copilot_dir="$(_realpath "${HOME}/.copilot" 2>/dev/null)" || copilot_dir="${HOME}/.copilot"
+    _wrapper_sync_client_skills "${copilot_dir}/skills"
     _wrapper_protect_client_controls "copilot" "${HOME}/.copilot" "${HOME}/.copilot" \
         "${_COPILOT_CLIENT_CONTROLS[@]}" || return 1
     _wrapper_protect_client_controls "copilot" "${HOME}/.config/github-copilot" \

@@ -66,13 +66,25 @@ call to a scratchpad progress file named in its prompt. Right after
 dispatch, the main thread arms `Monitor` on that file
 (`tail -n 0 -F … | grep --line-buffered -v '<noise>'`, 30 min, re-arm
 on expiry) and relays each event in one or two lines. Stop the Monitor
-when the agent finishes.
+when the agent finishes. Emit concise status updates on major state
+transitions (`queued -> building/testing -> review dispatched -> complete`)
+rather than unchanged heartbeats.
+
+When the user grants chained authorization (`"approve. After that proceed
+with..."`), treat the child task sequence and nested integration merges
+as pre-authorized without redundant confirmation gates, stopping only at
+genuine scope/policy ambiguity, destructive operations, or the final PR
+targeting `main`. Acknowledge successor handoffs once and use precise,
+neutral operational phrasing.
 
 ### Preflight before multi-run dispatch
 
 Before dispatching a loop or multi-run subagent, run each external write
 it needs once in the main thread (DB insert grant, API auth, mock
 registration). Prove the cheap path works before spending N runs on it.
+Also check host RAM and swap (`free -h`, `swapon --show`); cap
+concurrency at 1 DinD container unless host swap is configured, and at
+most 2 concurrent runners under current physical RAM headroom.
 
 ### Service-call budget
 
@@ -111,6 +123,15 @@ The mission's output goes in the assistant's chat turn:
 
 Do not write `reports/orchestrator-*.md`, `docs/plans/*.md`, or similar
 scratch files.
+
+**Open decisions:** whenever a report leaves something for the user to
+decide, give for each item: (1) what it is (concrete files and behaviour),
+(2) why it matters (the risk or what it blocks), (3) the options, each
+with its trade-offs, and (4) your recommendation. One-line items like
+"keep X?" are not enough. Ask open decisions coming out of subagent
+reports with the `AskUserQuestion` / `ask_question` tool (at most 4
+questions, options with a recommended first choice), not listed only as
+prose at the end of the chat report.
 
 ## Investigation mission
 
@@ -169,6 +190,25 @@ and the change needs tests, say so and stop.
 If a diff review is warranted, `caveman-review` and `ponytail-review`
 (both plugin-provided) are the current review tools — invoke them like
 any other skill. Advisory, not mandatory.
+
+For UI, menu, or help-text changes, the implementer subagent must render
+the real output the user will see (e.g. drive the interactive menu
+through a pty / `script`, or call the render function) and report what is
+actually visible (truncation, scrolling, whether text only shows on
+demand), plus state any deploy step needed before the user sees it (e.g.
+`chezmoi apply`).
+
+**Proactive acceptance gate:** when a milestone umbrella PR achieves
+green CI across all checks and current-head review approval, do not idle
+at the PR view; proactively present and run acceptance branch
+build/deployment verification (`make build-all && make bridge-up`, verify
+`/health` where applicable) prior to final merge to `main`.
+
+## Provider-agnostic memory
+
+Prefer `/Data/Everything/ProgrammingWorkspace/hermes/second-brain` over
+provider-specific memory in every session when reading or persisting
+cross-session facts, decisions, and environment rules.
 
 ## Agent dispatch reference
 

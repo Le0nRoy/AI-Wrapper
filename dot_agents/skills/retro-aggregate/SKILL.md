@@ -58,12 +58,17 @@ heading text anywhere in the file.
    in one line), sessions that raised it, severity H/M/L,
    score = count × weight (H=3, M=2, L=1).
 3. Choose the target with the `session-retro` rule: process rules go to
-   skills, personal or environment facts go to memory. Retarget a
-   proposal when its retro picked memory for a process rule.
+   skills, personal or environment facts go to memory (preferring the
+   provider-agnostic `second-brain` at
+   `/Data/Everything/ProgrammingWorkspace/hermes/second-brain` (`RULES.md`
+   / `INDEX.md`) over provider-specific `MEMORY.md` in every session).
+   Retarget a proposal when its retro picked memory for a process rule,
+   or provider-specific `MEMORY.md` for a shared environment/project fact.
 
 ## 3. Verify status
 
-Grep each target SKILL.md / memory for the proposed text. Status is
+Grep each target SKILL.md / memory (checking `second-brain` first, then
+provider-specific `MEMORY.md`) for the proposed text. Status is
 one of `open`, `partial` (e.g. in memory but not in the skill),
 `applied`, or `cannot verify`.
 
@@ -117,8 +122,11 @@ proposed change, and a recommendation (approve, decline, or retarget).
 - **Blocked writes** (sandbox / permissions): stage the edits in the
   scratchpad and give the user one copy command. Don't try other
   routes around the block.
-- **Memory.** When a rule moves into a skill, delete or slim the
-  memories that held it, and repoint links to them.
+- **Memory.** Persist approved memory proposals to the provider-agnostic
+  `second-brain` (`/Data/Everything/ProgrammingWorkspace/hermes/second-brain`,
+  updating its `INDEX.md` and `log.md` per `RULES.md`) rather than
+  provider-specific `MEMORY.md`. When a rule moves into a skill, delete
+  or slim the memories that held it, and repoint links to them.
 
 Then hand off to `skill-sync` (commit / MR) when the user asks. Never
 commit, push, or open an MR without the user's explicit request.

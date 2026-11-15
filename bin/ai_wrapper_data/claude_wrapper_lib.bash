@@ -167,6 +167,7 @@ _bind_claude_account() {
         echo "ERROR: cannot resolve ${claude_json_src}" >&2
         exit 1
     fi
+    _wrapper_sync_client_skills "${claude_dir_src}/skills"
     _wrapper_add_bind "${claude_dir_src}" "${HOME}/.claude"
     _wrapper_add_bind "${claude_json_bind_src}" "${HOME}/.claude.json"
     _wrapper_protect_client_controls "claude" "${claude_dir_src}" "${HOME}/.claude" \

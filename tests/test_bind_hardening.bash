@@ -291,7 +291,7 @@ _cfg_check() { ( _load codex; _wrapper_check_config_symlink "${1}" ) 2>&1; }
 C="${FAKE_HOME}/cfg-${RES_ID}"
 mkdir -p "${C}" "${FAKE_HOME}/.config/gh" "${FAKE_HOME}/.config/systemd/user" \
     "${FAKE_HOME}/.local/share" "${FAKE_HOME}/.password-store" "${FAKE_HOME}/bin" \
-    "${FAKE_HOME}/ai-wrapper/.agents/skills" "${FAKE_HOME}/.config/claude" \
+    "${FAKE_HOME}/ai-wrapper/.agents/skills" "${FAKE_HOME}/.agents/skills" "${FAKE_HOME}/.config/claude" \
     "${FAKE_HOME}/.local/share/gemini" "${FAKE_HOME}/profiles/work" "${FAKE_HOME}/dotfiles"
 : >"${FAKE_HOME}/.gitconfig"; : >"${FAKE_HOME}/.bashrc"; : >"${FAKE_HOME}/dotfiles/claude.json"
 _cfg_reject() {  # LINK_NAME TARGET LABEL [EXPECTED_SUBSTRING]
@@ -316,6 +316,7 @@ _cfg_reject local "${FAKE_HOME}/.local" "~/.local (broad root)"
 _cfg_reject share "${FAKE_HOME}/.local/share" "~/.local/share (broad root)"
 _cfg_reject bin "${FAKE_HOME}/bin" "~/bin (read-only by default, #62)"
 _cfg_reject aiw "${FAKE_HOME}/ai-wrapper" "~/ai-wrapper (above the skill source)"
+_cfg_reject agents "${FAKE_HOME}/.agents" "~/.agents (user skill source)"
 _cfg_reject gh "${FAKE_HOME}/.config/gh" "~/.config/gh" "credential location"
 _cfg_reject pass "${FAKE_HOME}/.password-store" "~/.password-store" "credential location"
 _cfg_reject sysd "${FAKE_HOME}/.config/systemd/user" "~/.config/systemd/user"

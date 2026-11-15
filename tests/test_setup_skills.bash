@@ -45,7 +45,7 @@ if ! HOME="${FAKE_HOME}" bash "${REPO_ROOT}/bin/executable_setup_skills.bash" >/
     exit 1
 fi
 
-skills=(caveman orchestrator-mode ponytail retro-aggregate session-retro skill-sync tortuga)
+skills=(caveman orchestrator-mode ponytail retro-aggregate session-retro skill-sync tortuga tortuga-operations)
 destinations=(
     ".claude/skills"
     ".codex/skills"
@@ -299,5 +299,46 @@ while IFS= read -r -d '' doc; do
         checks=$((checks + 1))
     done < <(grep -oE "${link_re}" "${doc}" | sed -E 's/^\]\(//')
 done < <(find "${REPO_ROOT}/dot_agents/skills" -name '*.md' -print0)
+
+# User-installed skills in ~/.agents/skills are also synced by setup_skills.bash
+mkdir -p "${FAKE_HOME}/.agents/skills/user-custom"
+echo "# user custom skill" > "${FAKE_HOME}/.agents/skills/user-custom/SKILL.md"
+HOME="${FAKE_HOME}" "${BASH}" "${SETUP}" >/dev/null
+for destination in "${destinations[@]}"; do
+    [[ -f "${FAKE_HOME}/${destination}/user-custom/SKILL.md" ]] \
+        || fail "user skill missing in ${destination}"
+    [[ "$(cat "${FAKE_HOME}/${destination}/user-custom/.setup_skills_managed")" == "${FAKE_HOME}/.agents/skills/user-custom" ]] \
+        || fail "user skill marker wrong in ${destination}"
+    checks=$((checks + 2))
+done
+
+# Wrapper launch auto-syncs skills (repo + ~/.agents/skills) for all clients
+(
+    export HOME="${FAKE_HOME}/launch-sync"
+    mkdir -p "${HOME}/ai-wrapper/.agents/skills/repo-skill" "${HOME}/.agents/skills/user-skill"
+    echo "repo" > "${HOME}/ai-wrapper/.agents/skills/repo-skill/SKILL.md"
+    echo "user" > "${HOME}/.agents/skills/user-skill/SKILL.md"
+    mkdir -p "${HOME}/.claude/skills/unmanaged"
+    echo "keep" > "${HOME}/.claude/skills/unmanaged/SKILL.md"
+    WRAPPER_DATA_DIR="${REPO_ROOT}/bin/ai_wrapper_data"
+    # shellcheck source=../bin/ai_agent_universal_wrapper.bash
+    source "${REPO_ROOT}/bin/ai_agent_universal_wrapper.bash"
+    source "${WRAPPER_DATA_DIR}/claude_wrapper_lib.bash"
+    source "${WRAPPER_DATA_DIR}/codex_wrapper_lib.bash"
+    source "${WRAPPER_DATA_DIR}/copilot_wrapper_lib.bash"
+    source "${WRAPPER_DATA_DIR}/agy_wrapper_lib.bash"
+    WRAPPER_FLAGS=()
+    _bind_claude_account
+    _bind_codex_account
+    _copilot_bind_config_dirs
+    _bind_agy_account
+    for dir in ".claude/skills" ".codex/skills" ".copilot/skills" ".gemini/config/skills"; do
+        [[ -f "${HOME}/${dir}/repo-skill/SKILL.md" ]] || fail "auto-sync missing repo-skill in ${dir}"
+        [[ -f "${HOME}/${dir}/user-skill/SKILL.md" ]] || fail "auto-sync missing user-skill in ${dir}"
+        [[ "${WRAPPER_FLAGS[*]}" == *"--ro-bind ${HOME}/${dir}"* ]] || fail "missing --ro-bind for ${dir}"
+    done
+    [[ "$(cat "${HOME}/.claude/skills/unmanaged/SKILL.md")" == "keep" ]] || fail "unmanaged skill clobbered"
+) || exit 1
+checks=$((checks + 13))
 
 echo "${checks} skill destination checks passed"

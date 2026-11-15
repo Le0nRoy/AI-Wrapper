@@ -653,6 +653,9 @@ _run_sandboxed_agent_impl() {
     local allow_keychain="${AI_SANDBOX_ALLOW_KEYCHAIN:-0}"
     [[ "${allow_keychain}" == "1" ]] || allow_keychain=0
 
+    local allow_skills_rw="${AI_SANDBOX_ALLOW_AGENTS_SKILLS_RW:-0}"
+    [[ "${allow_skills_rw}" == "1" ]] || allow_skills_rw=0
+
     # Env scrubbing (Phase 1 of the sandbox-migration plan; closes U-A/U-B).
     # Without this, the agent inherits the parent shell's full environment,
     # including SSH_AUTH_SOCK (ssh-agent forwarding to corporate hosts),
@@ -977,6 +980,7 @@ _run_sandboxed_agent_impl() {
             -D "PROXY_PORT=${proxy_port}"
             -D "ALLOW_DOCKER=${allow_docker}"
             -D "ALLOW_KEYCHAIN=${allow_keychain}"
+            -D "ALLOW_AGENTS_SKILLS_RW=${allow_skills_rw}"
         )
         if [[ "${enable_signpost}" == "1" ]]; then
             sandbox_argv+=(-D "DARWIN_USER_SIGNPOST_DIR=${darwin_user_signpost}")
